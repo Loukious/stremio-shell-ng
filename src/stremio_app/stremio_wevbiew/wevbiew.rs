@@ -1,5 +1,6 @@
 use crate::stremio_app::ipc;
 use native_windows_gui::{self as nwg, PartialUi};
+use once_cell::sync::Lazy;
 use once_cell::unsync::OnceCell;
 use serde_json::json;
 use std::borrow::Cow;
@@ -13,6 +14,8 @@ use urlencoding::decode;
 use webview2::Controller;
 use winapi::shared::windef::HWND;
 use winapi::um::winuser::{GetClientRect, VK_F7, WM_SETFOCUS};
+
+pub static CURRENT_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".to_string()));
 
 #[derive(Default)]
 pub struct WebView {
@@ -125,6 +128,13 @@ impl PartialUi for WebView {
                             }
                             Ok(())
                         }).expect("Cannot add full screen element changed");
+
+                        webview.add_source_changed(move |webview, _args| {
+                            if let Ok(new_src) = webview.get_source() {
+                                *CURRENT_URL.lock().unwrap() = new_src;
+                            }
+                            Ok(())
+                        }).expect("Cannot add source_changed event");
 
                         webview.add_content_loading(move |wv, _| {
                             wv.execute_script(r##"
