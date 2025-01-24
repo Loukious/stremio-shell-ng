@@ -68,6 +68,8 @@ fn create_shareable_mpv(window_handle: HWND) -> Arc<Mpv> {
         }
         set_property!("wid", window_handle as i64);
         set_property!("title", "Stremio");
+        set_property!("config", "yes");
+        set_property!("load-scripts","yes");
         set_property!("terminal", "yes");
         set_property!("msg-level", "all=no,cplayer=debug");
         set_property!("quiet", "yes");
