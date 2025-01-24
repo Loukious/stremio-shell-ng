@@ -223,6 +223,8 @@ pub enum PropVal {
 pub enum MpvCmd {
     Loadfile,
     Stop,
+    Cycle,
+    Seek,
 }
 stringable!(MpvCmd);
 

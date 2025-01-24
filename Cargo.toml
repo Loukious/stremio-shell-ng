@@ -22,7 +22,7 @@ winapi = { version = "0.3.9", features = [
 ] }
 webview2 = "0.1.4"
 webview2-sys = "0.1.1"
-libmpv2 = "4.0.0"
+libmpv2 = "4.1.0"
 libmpv2-sys = "4.0.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -39,7 +39,7 @@ sha2 = "0.10"
 reqwest = { version = "0.12", features = ["stream", "json", "blocking"] }
 rand = "0.8"
 url = { version = "2", features = ["serde"] }
-
+souvlaki = "0.6"
 
 [build-dependencies]
 winres = "0.1"

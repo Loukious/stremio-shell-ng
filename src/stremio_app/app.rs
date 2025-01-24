@@ -1,9 +1,12 @@
+use flume::{Receiver, Sender};
 use native_windows_derive::NwgUi;
 use native_windows_gui as nwg;
 use rand::Rng;
 use serde_json;
+use souvlaki::{MediaControlEvent, MediaControls, MediaPlayback, PlatformConfig};
 use std::{
     cell::RefCell,
+    ffi::c_void,
     io::Read,
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
@@ -14,6 +17,8 @@ use std::{
 };
 use url::Url;
 use winapi::um::{winbase::CREATE_BREAKAWAY_FROM_JOB, winuser::WS_EX_TOPMOST};
+struct SafeHwnd(*mut c_void);
+unsafe impl Send for SafeHwnd {}
 
 use crate::stremio_app::{
     constants::{APP_NAME, UPDATE_ENDPOINT, UPDATE_INTERVAL, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH},
@@ -73,6 +78,58 @@ pub struct MainWindow {
     pub focus_notice: nwg::Notice,
 }
 
+fn run_souvlaki_media_keys(
+    hwnd: *mut c_void,
+    player_channel: Option<(Sender<String>, Receiver<String>)>,
+) {
+    // If the channel is absent, bail out
+    let (player_tx, _player_rx) = match player_channel {
+        Some(pair) => pair,
+        None => return,
+    };
+
+    let mut controls = MediaControls::new(PlatformConfig {
+        dbus_name: "stremio",
+        display_name: "Stremio",
+        hwnd: Some(hwnd),
+    })
+    .expect("Cannot create MediaControls");
+
+    controls
+        .attach(move |event: MediaControlEvent| {
+            eprintln!("Souvlaki event: {:?}", event);
+            match event {
+                MediaControlEvent::Play => {
+                    let _ = player_tx.send(r#"["mpv-command", ["cycle", "pause"]]"#.to_string());
+                }
+                MediaControlEvent::Next => {
+                    let _ = player_tx
+                        .send(r#"["mpv-command", ["seek", "10", "relative"]]"#.to_string());
+                }
+                MediaControlEvent::Previous => {
+                    let _ = player_tx
+                        .send(r#"["mpv-command", ["seek", "-10", "relative"]]"#.to_string());
+                }
+                MediaControlEvent::Stop => {
+                    // Untested
+                    let _ = player_tx.send(r#"["mpv-command", ["stop"]]"#.to_string());
+                }
+                _ => {}
+            }
+        })
+        .expect("Cannot attach media key callback");
+
+    // Possibly set initial metadata
+    controls
+        .set_playback(MediaPlayback::Paused { progress: None })
+        .ok();
+
+    // Keep it alive
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 impl MainWindow {
     fn transmit_window_full_screen_change(&self, full_screen: bool, prevent_close: bool) {
         let web_channel = self.webview.channel.borrow();
@@ -109,6 +166,13 @@ impl MainWindow {
         self.webview.endpoint.set(self.webui_url.clone()).ok();
         self.webview.dev_tools.set(self.dev_tools).ok();
         if let Some(hwnd) = self.window.handle.hwnd() {
+            let player_channel = self.player.channel.borrow().clone();
+            let safe_hwnd = SafeHwnd(hwnd as *mut c_void);
+
+            std::thread::spawn(move || {
+                run_souvlaki_media_keys(safe_hwnd.0, player_channel);
+            });
+            
             if let Ok(mut saved_style) = self.saved_window_style.try_borrow_mut() {
                 saved_style.center_window(hwnd, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT);
             }
