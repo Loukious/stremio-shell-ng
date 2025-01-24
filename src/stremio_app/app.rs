@@ -385,7 +385,7 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                     }
 
                     if type_ == "series" {
-                        state_text = format!("{} (S{}E{})", info.epname, season, episode);
+                        state_text = format!("{} (S{}-E{})", info.epname, season, episode);
                     } else {
                         state_text = info.year.clone();
                     }
