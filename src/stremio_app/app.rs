@@ -110,7 +110,9 @@ pub struct MainWindow {
 fn load_or_create_config() -> Config {
     // Get the path to the configuration file
     let exe_path = env::current_exe().expect("Failed to get executable path");
-    let exe_dir = exe_path.parent().expect("Failed to get executable directory");
+    let exe_dir = exe_path
+        .parent()
+        .expect("Failed to get executable directory");
     let config_path = exe_dir.join("RPCconfig.ini");
 
     // Check if the config file exists, create it if not
@@ -129,7 +131,10 @@ fn load_or_create_config() -> Config {
         default_config
             .write_to_file(&config_path)
             .expect("Failed to create configuration file");
-        println!("Default configuration file created at '{}'", config_path.display());
+        println!(
+            "Default configuration file created at '{}'",
+            config_path.display()
+        );
     }
 
     // Load the configuration file
@@ -378,10 +383,14 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                             app_start_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
                         );
                         small_image_text = Some("Paused".to_string());
-                        small_image =  Some("https://i.imgur.com/eCUJpm9.png".to_string());
+                        small_image = Some("https://i.imgur.com/eCUJpm9.png".to_string());
                     } else {
-                        small_image_text =  Some("Playing".to_string());
-                        small_image = Some("https://raw.githubusercontent.com/Stremio/stremio-web/refs/heads/development/images/icon.png".to_string());
+                        small_image_text = Some("Playing".to_string());
+                        if type_ == "series" {
+                            small_image = Some(info.thumbnail.to_string());
+                        } else {
+                            small_image = Some("https://raw.githubusercontent.com/Stremio/stremio-web/refs/heads/development/images/icon.png".to_string());
+                        }
                     }
 
                     if type_ == "series" {
@@ -464,8 +473,6 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                             Assets::new()
                                 .large_image("https://raw.githubusercontent.com/Stremio/stremio-web/refs/heads/development/images/icon.png")
                                 .large_text("Stremio")
-                                .small_text("Browsing catalog")
-                                .small_image("https://raw.githubusercontent.com/Stremio/stremio-web/refs/heads/development/images/icon.png"),
                         );
 
                 if let Err(e) = drp.set_activity(activity) {
