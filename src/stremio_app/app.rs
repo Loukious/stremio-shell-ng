@@ -292,6 +292,10 @@ fn run_souvlaki_media_keys(
         None => return,
     };
 
+    if hwnd.is_null() {
+        eprintln!("Warning: HWND is null, media keys may not work properly");
+    }
+
     let mut controls = MediaControls::new(PlatformConfig {
         dbus_name: "stremio",
         display_name: "Stremio",
@@ -325,7 +329,7 @@ fn run_souvlaki_media_keys(
 
     // Possibly set initial metadata
     controls
-        .set_playback(MediaPlayback::Paused { progress: None })
+        .set_playback(MediaPlayback::Playing { progress: None })
         .ok();
 
     // Keep it alive
