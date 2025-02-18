@@ -338,8 +338,10 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
     let mut drp =
         DiscordIpcClient::new("997798118185771059").expect("Failed to create Discord IPC client");
 
-    drp.connect().expect("Failed to connect to Discord IPC");
-
+    if let Err(e) = drp.connect() {
+        eprintln!("⚠️ Failed to connect to Discord IPC: {e}. Running without Discord Rich Presence.");
+        return thread::spawn(|| {}); // Exit the thread instead of crashing
+    }
     // Track previous state
     let mut last_url = String::new();
     let mut last_time = 0.0;
