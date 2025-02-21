@@ -6,10 +6,13 @@ use flume::{Receiver, Sender};
 use ini::Ini;
 use native_windows_derive::NwgUi;
 use native_windows_gui as nwg;
+use once_cell::sync::Lazy;
 use rand::Rng;
 use reqwest::blocking::Client;
 use serde_json::{self, Value};
-use souvlaki::{MediaControlEvent, MediaControls, MediaPlayback, PlatformConfig};
+use souvlaki::{
+    MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
+};
 use std::{
     cell::RefCell,
     env,
@@ -29,6 +32,15 @@ use winapi::um::{winbase::CREATE_BREAKAWAY_FROM_JOB, winuser::WS_EX_TOPMOST};
 struct SafeHwnd(*mut c_void);
 unsafe impl Send for SafeHwnd {}
 
+pub static VIDEO_TITLE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".to_string()));
+
+pub static COVER_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".to_string()));
+
+pub static ALBUM: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".to_string()));
+
+pub const ICON_URL: &str =
+    "https://raw.githubusercontent.com/Stremio/stremio-web/refs/heads/development/images/icon.png";
+
 use crate::stremio_app::{
     constants::{
         web_endpoint_with_streaming_server, APP_NAME, UPDATE_ENDPOINT, UPDATE_INTERVAL,
@@ -37,7 +49,7 @@ use crate::stremio_app::{
     ipc::{RPCRequest, RPCResponse},
     splash::SplashImage,
     stremio_player::{
-        player::{CURRENT_TIME, TOTAL_DURATION},
+        player::{CURRENT_TIME, IS_PAUSED, TOTAL_DURATION},
         Player,
     },
     stremio_wevbiew::{wevbiew::CURRENT_URL, WebView},
@@ -307,7 +319,7 @@ fn run_souvlaki_media_keys(
         .attach(move |event: MediaControlEvent| {
             eprintln!("Souvlaki event: {:?}", event);
             match event {
-                MediaControlEvent::Play => {
+                MediaControlEvent::Play | MediaControlEvent::Pause => {
                     let _ = player_tx.send(r#"["mpv-command", ["cycle", "pause"]]"#.to_string());
                 }
                 MediaControlEvent::Next => {
@@ -322,19 +334,76 @@ fn run_souvlaki_media_keys(
                     // Untested
                     let _ = player_tx.send(r#"["mpv-command", ["stop"]]"#.to_string());
                 }
+                MediaControlEvent::SetPosition(pos) => {
+                    let _ = player_tx.send(format!(r#"["mpv-command", ["seek", "{}", "absolute"]]"#, pos.0.as_secs_f64()));
+                }
                 _ => {}
             }
         })
         .expect("Cannot attach media key callback");
 
-    // Possibly set initial metadata
-    controls
-        .set_playback(MediaPlayback::Playing { progress: None })
-        .ok();
+    let mut last_title = String::new();
+    let mut last_album = String::new();
+    let mut last_cover_url = String::new();
+    let mut last_total_duration = 0.0;
+    let mut last_current_time = 0.0;
+    let mut last_is_paused = true;
 
-    // Keep it alive
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        let current_time = *CURRENT_TIME.lock().unwrap();
+        let total_duration = *TOTAL_DURATION.lock().unwrap();
+        let is_paused = *IS_PAUSED.lock().unwrap();
+        let title = VIDEO_TITLE.lock().unwrap().clone();
+        let album_value = ALBUM.lock().unwrap().clone();
+        let cover_url_value = COVER_URL.lock().unwrap().clone();
+
+        // Detect if metadata has changed
+        let metadata_changed = title != last_title
+            || album_value != last_album
+            || cover_url_value != last_cover_url
+            || total_duration != last_total_duration;
+
+        // Detect if playback state has changed
+        let playback_changed = current_time != last_current_time || is_paused != last_is_paused;
+
+        if metadata_changed {
+            let metadata = MediaMetadata {
+                title: Some(&title),
+                duration: Some(Duration::from_secs_f64(total_duration)),
+                album: Some(album_value.as_str()),
+                cover_url: Some(cover_url_value.as_str()),
+                ..Default::default()
+            };
+
+            controls.set_metadata(metadata).ok();
+
+            // Update last known metadata values
+            last_title = title;
+            last_album = album_value;
+            last_cover_url = cover_url_value;
+            last_total_duration = total_duration;
+        }
+
+        if playback_changed {
+            let progress = Some(MediaPosition(Duration::from_secs_f64(current_time)));
+
+            if is_paused {
+                controls
+                    .set_playback(MediaPlayback::Paused { progress })
+                    .ok();
+            } else {
+                controls
+                    .set_playback(MediaPlayback::Playing { progress })
+                    .ok();
+            }
+
+            // Update last known playback values
+            last_current_time = current_time;
+            last_is_paused = is_paused;
+        }
+
+        // Sleep a bit (e.g., 1 second) before updating again
+        thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -343,7 +412,9 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
         DiscordIpcClient::new("997798118185771059").expect("Failed to create Discord IPC client");
 
     if let Err(e) = drp.connect() {
-        eprintln!("⚠️ Failed to connect to Discord IPC: {e}. Running without Discord Rich Presence.");
+        eprintln!(
+            "⚠️ Failed to connect to Discord IPC: {e}. Running without Discord Rich Presence."
+        );
         return thread::spawn(|| {}); // Exit the thread instead of crashing
     }
     // Track previous state
@@ -393,6 +464,8 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
 
                     let large_image_text = format!("{} ({})", info.name, info.year);
                     let large_image = &info.poster;
+                    let mut cover_url = COVER_URL.lock().unwrap();
+                    *cover_url = info.poster.clone();
                     let details = &info.name;
                     let state_text;
                     let small_image_text;
@@ -415,15 +488,23 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                         small_image_text = Some("Playing".to_string());
                         if type_ == "series" {
                             small_image = Some(info.thumbnail.to_string());
+                            let mut album = ALBUM.lock().unwrap();
+                            *album = info.thumbnail.clone();
                         } else {
-                            small_image = Some("https://raw.githubusercontent.com/Stremio/stremio-web/refs/heads/development/images/icon.png".to_string());
+                            small_image = Some(ICON_URL.to_owned());
+                            let mut album = ALBUM.lock().unwrap();
+                            *album = ICON_URL.to_owned();
                         }
                     }
 
                     if type_ == "series" {
                         state_text = format!("{} (S{}-E{})", info.epname, season, episode);
+                        let mut title = VIDEO_TITLE.lock().unwrap();
+                        *title = format!("{} ({}x{})", info.name, episode, season);
                     } else {
                         state_text = info.year.clone();
+                        let mut title = VIDEO_TITLE.lock().unwrap();
+                        *title = info.name.clone();
                     }
 
                     let mut assets = Assets::new()
@@ -496,11 +577,7 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                         .timestamps(Timestamps::new().start(
                             app_start_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
                         ))
-                        .assets(
-                            Assets::new()
-                                .large_image("https://raw.githubusercontent.com/Stremio/stremio-web/refs/heads/development/images/icon.png")
-                                .large_text("Stremio")
-                        );
+                        .assets(Assets::new().large_image(ICON_URL).large_text("Stremio"));
 
                 if let Err(e) = drp.set_activity(activity) {
                     eprintln!("Failed to set Discord activity: {e}");

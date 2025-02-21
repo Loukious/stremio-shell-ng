@@ -41,6 +41,8 @@ pub static CURRENT_TIME: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(0.0));
 
 pub static TOTAL_DURATION: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(0.0));
 
+pub static IS_PAUSED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+
 struct ObserveProperty {
     name: String,
     format: Format,
@@ -460,6 +462,11 @@ fn create_event_thread(
                             *TOTAL_DURATION.lock().unwrap() = dur_secs;
                         }
                     }
+                    if name == "pause" {
+                        if let PropertyData::Flag(pause) = change {
+                            *IS_PAUSED.lock().unwrap() = pause;
+                        }
+                    }
 
                     // Because from_name_value expects `PropertyData`,
                     // just pass `change` directly:
@@ -506,13 +513,19 @@ fn create_message_thread(
                     format: Format::Double,
                 })
                 .expect("cannot send ObserveProperty");
-            mpv.wake_up();
             observe_property_sender
                 .send(ObserveProperty {
                     name: "duration".to_string(),
                     format: Format::Double,
                 })
                 .expect("cannot send ObserveProperty");
+            observe_property_sender
+                .send(ObserveProperty {
+                    name: "pause".to_string(),
+                    format: Format::Flag,
+                })
+                .expect("cannot send ObserveProperty");
+            mpv.wake_up();
         }
 
         // -- Helpers --
