@@ -13,6 +13,7 @@ use serde_json::{self, Value};
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
 };
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::{
     cell::RefCell,
     env,
@@ -411,185 +412,200 @@ fn run_souvlaki_media_keys(
 }
 
 pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<()> {
-    let mut drp =
-        DiscordIpcClient::new("997798118185771059").expect("Failed to create Discord IPC client");
+    thread::spawn(move || {
+        loop {
+            // Use `catch_unwind` to handle panics gracefully
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let mut drp = DiscordIpcClient::new("997798118185771059")
+                    .expect("Failed to create Discord IPC client");
 
-    if let Err(e) = drp.connect() {
-        eprintln!(
-            "⚠️ Failed to connect to Discord IPC: {e}. Running without Discord Rich Presence."
-        );
-        return thread::spawn(|| {}); // Exit the thread instead of crashing
-    }
-    // Track previous state
-    let mut last_url = String::new();
-    let mut last_time = 0.0;
-    let mut video_info: Option<VideoInfo> = None;
-    let mut type_ = String::new();
-    let mut season = String::new();
-    let mut episode = String::new();
-
-    let config = load_or_create_config();
-
-    thread::spawn(move || loop {
-        {
-            thread::sleep(Duration::from_secs(config.refresh_interval));
-            let cur_url = CURRENT_URL.lock().unwrap().clone();
-            let cur_time = *CURRENT_TIME.lock().unwrap();
-
-            if cur_url.starts_with("https://web.stremio.com/#/player") {
-                // If the URL has changed, fetch video info
-                if cur_url != last_url {
-                    let video_id = decode(cur_url.split("/").last().unwrap()).expect("UTF-8");
-                    let (parsed_type, parsed_id, parsed_season, parsed_episode) =
-                        parse_video_id(&video_id);
-
-                    type_ = parsed_type.to_owned();
-                    season = parsed_season.to_owned();
-                    episode = parsed_episode.to_owned();
-
-                    video_info = getvidinfo(&type_, &parsed_id, &season, &episode);
-
-                    // Update last URL
-                    last_url = cur_url.clone();
+                if let Err(e) = drp.connect() {
+                    eprintln!(
+                        "⚠️ Failed to connect to Discord IPC: {e}. Running without Discord Rich Presence."
+                    );
+                    return; // Exit the thread instead of crashing
                 }
 
-                // If video info is available, update the presence
-                if let Some(ref info) = video_info {
-                    let tot_dur = *TOTAL_DURATION.lock().unwrap();
+                // Track previous state
+                let mut last_url = String::new();
+                let mut last_time = 0.0;
+                let mut video_info: Option<VideoInfo> = None;
+                let mut type_ = String::new();
+                let mut season = String::new();
+                let mut episode = String::new();
 
-                    let now_unix = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64;
+                let config = load_or_create_config();
 
-                    let start_timestamp = now_unix - cur_time as i64;
-                    let end_timestamp = start_timestamp + tot_dur as i64;
+                loop {
+                    thread::sleep(Duration::from_secs(config.refresh_interval));
+                    let cur_url = CURRENT_URL.lock().unwrap().clone();
+                    let cur_time = *CURRENT_TIME.lock().unwrap();
 
-                    let large_image_text = format!("{} ({})", info.name, info.year);
-                    let large_image = &info.poster;
-                    let mut cover_url = COVER_URL.lock().unwrap();
-                    *cover_url = info.poster.clone();
-                    let details = &info.name;
-                    let state_text;
-                    let small_image_text;
-                    let small_image;
-                    let mut timestamps =
-                        Timestamps::new().start(start_timestamp).end(end_timestamp);
+                    if cur_url.starts_with("https://web.stremio.com/#/player") {
+                        // If the URL has changed, fetch video info
+                        if cur_url != last_url {
+                            let video_id =
+                                decode(cur_url.split("/").last().unwrap()).expect("UTF-8");
+                            let (parsed_type, parsed_id, parsed_season, parsed_episode) =
+                                parse_video_id(&video_id);
 
-                    // Handle paused state
-                    if cur_time == last_time {
-                        if config.disable_when_paused {
+                            type_ = parsed_type.to_owned();
+                            season = parsed_season.to_owned();
+                            episode = parsed_episode.to_owned();
+
+                            video_info = getvidinfo(&type_, &parsed_id, &season, &episode);
+
+                            // Update last URL
+                            last_url = cur_url.clone();
+                        }
+
+                        // If video info is available, update the presence
+                        if let Some(ref info) = video_info {
+                            let tot_dur = *TOTAL_DURATION.lock().unwrap();
+
+                            let now_unix = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64;
+
+                            let start_timestamp = now_unix - cur_time as i64;
+                            let end_timestamp = start_timestamp + tot_dur as i64;
+
+                            let large_image_text = format!("{} ({})", info.name, info.year);
+                            let large_image = &info.poster;
+                            let mut cover_url = COVER_URL.lock().unwrap();
+                            *cover_url = info.poster.clone();
+                            let details = &info.name;
+                            let state_text;
+                            let small_image_text;
+                            let small_image;
+                            let mut timestamps =
+                                Timestamps::new().start(start_timestamp).end(end_timestamp);
+
+                            // Handle paused state
+                            if cur_time == last_time {
+                                if config.disable_when_paused {
+                                    drp.clear_activity().ok();
+                                    continue;
+                                }
+                                timestamps = Timestamps::new().start(
+                                    app_start_time.duration_since(UNIX_EPOCH).unwrap().as_secs()
+                                        as i64,
+                                );
+                                small_image_text = Some("Paused".to_string());
+                                small_image = Some("https://i.imgur.com/eCUJpm9.png".to_string());
+                            } else {
+                                small_image_text = Some("Playing".to_string());
+                                if type_ == "series" {
+                                    small_image = Some(info.thumbnail.to_string());
+                                    let mut album = ALBUM.lock().unwrap();
+                                    *album = info.thumbnail.clone();
+                                } else {
+                                    small_image = Some(ICON_URL.to_owned());
+                                    let mut album = ALBUM.lock().unwrap();
+                                    *album = ICON_URL.to_owned();
+                                }
+                            }
+
+                            if type_ == "series" {
+                                state_text = format!("{} (S{}-E{})", info.epname, season, episode);
+                                let mut title = VIDEO_TITLE.lock().unwrap();
+                                *title = format!("{} ({}x{})", info.name, episode, season);
+                            } else {
+                                state_text = info.year.clone();
+                                let mut title = VIDEO_TITLE.lock().unwrap();
+                                *title = info.name.clone();
+                            }
+
+                            let mut assets = Assets::new()
+                                .large_image(&large_image)
+                                .large_text(&large_image_text);
+
+                            if let Some(small_text) = &small_image_text {
+                                assets = assets.small_text(small_text);
+                            }
+                            if let Some(small_img) = &small_image {
+                                assets = assets.small_image(small_img);
+                            }
+
+                            // Determine the last segment for IMDb/Stremio links
+                            let last_segment = if cur_url.contains("/series/") {
+                                cur_url
+                                    .split_once("/series/")
+                                    .map(|(_, part)| format!("/series/{}", part))
+                            } else if cur_url.contains("/movie/") {
+                                cur_url
+                                    .split_once("/movie/")
+                                    .map(|(_, part)| format!("/movie/{}", part))
+                            } else {
+                                None
+                            }
+                            .unwrap_or_default();
+
+                            let trimmed_segment = last_segment
+                                .trim_start_matches("/series/")
+                                .trim_start_matches("/movie/");
+                            let imdb_id = trimmed_segment.split('/').next().unwrap_or("");
+                            let imdb_url_str = format!("https://www.imdb.com/title/{}", imdb_id);
+                            let stremio_url_str = if config.link_target == "web" {
+                                format!("https://web.stremio.com/#/detail{}", last_segment)
+                            } else {
+                                format!("stremio:///detail{}", last_segment)
+                            };
+
+                            let mut activity = Activity::new()
+                                .activity_type(ActivityType::Watching)
+                                .state(&state_text)
+                                .details(details)
+                                .timestamps(timestamps)
+                                .assets(assets);
+
+                            // Conditionally add buttons (if configured to show)
+                            if config.show_buttons {
+                                activity = activity.buttons(vec![
+                                    Button::new("View on IMDb", &imdb_url_str),
+                                    Button::new("Open in Stremio", &stremio_url_str),
+                                ]);
+                            }
+
+                            if let Err(e) = drp.set_activity(activity) {
+                                eprintln!("Failed to set Discord activity: {e}");
+                            }
+                        }
+
+                        last_time = cur_time;
+                    } else {
+                        if config.disable_in_menu {
                             drp.clear_activity().ok();
                             continue;
                         }
-                        timestamps = Timestamps::new().start(
-                            app_start_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-                        );
-                        small_image_text = Some("Paused".to_string());
-                        small_image = Some("https://i.imgur.com/eCUJpm9.png".to_string());
-                    } else {
-                        small_image_text = Some("Playing".to_string());
-                        if type_ == "series" {
-                            small_image = Some(info.thumbnail.to_string());
-                            let mut album = ALBUM.lock().unwrap();
-                            *album = info.thumbnail.clone();
-                        } else {
-                            small_image = Some(ICON_URL.to_owned());
-                            let mut album = ALBUM.lock().unwrap();
-                            *album = ICON_URL.to_owned();
+                        let activity = Activity::new()
+                            .activity_type(ActivityType::Watching)
+                            .state("In Menu")
+                            .details("Browsing catalog")
+                            .timestamps(Timestamps::new().start(
+                                app_start_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+                            ))
+                            .assets(Assets::new().large_image(ICON_URL).large_text("Stremio"));
+
+                        if let Err(e) = drp.set_activity(activity) {
+                            eprintln!("Failed to set Discord activity: {e}");
                         }
-                    }
 
-                    if type_ == "series" {
-                        state_text = format!("{} (S{}-E{})", info.epname, season, episode);
-                        let mut title = VIDEO_TITLE.lock().unwrap();
-                        *title = format!("{} ({}x{})", info.name, episode, season);
-                    } else {
-                        state_text = info.year.clone();
-                        let mut title = VIDEO_TITLE.lock().unwrap();
-                        *title = info.name.clone();
-                    }
-
-                    let mut assets = Assets::new()
-                        .large_image(&large_image)
-                        .large_text(&large_image_text);
-
-                    if let Some(small_text) = &small_image_text {
-                        assets = assets.small_text(small_text);
-                    }
-                    if let Some(small_img) = &small_image {
-                        assets = assets.small_image(small_img);
-                    }
-
-                    // Determine the last segment for IMDb/Stremio links
-                    let last_segment = if cur_url.contains("/series/") {
-                        cur_url
-                            .split_once("/series/")
-                            .map(|(_, part)| format!("/series/{}", part))
-                    } else if cur_url.contains("/movie/") {
-                        cur_url
-                            .split_once("/movie/")
-                            .map(|(_, part)| format!("/movie/{}", part))
-                    } else {
-                        None
-                    }
-                    .unwrap_or_default();
-
-                    let trimmed_segment = last_segment
-                        .trim_start_matches("/series/")
-                        .trim_start_matches("/movie/");
-                    let imdb_id = trimmed_segment.split('/').next().unwrap_or("");
-                    let imdb_url_str = format!("https://www.imdb.com/title/{}", imdb_id);
-                    let stremio_url_str = if config.link_target == "web" {
-                        format!("https://web.stremio.com/#/detail{}", last_segment)
-                    } else {
-                        format!("stremio:///detail{}", last_segment)
-                    };
-
-                    let mut activity = Activity::new()
-                        .activity_type(ActivityType::Watching)
-                        .state(&state_text)
-                        .details(details)
-                        .timestamps(timestamps)
-                        .assets(assets);
-
-                    // Conditionally add buttons (if configured to show)
-                    if config.show_buttons {
-                        activity = activity.buttons(vec![
-                            Button::new("View on IMDb", &imdb_url_str),
-                            Button::new("Open in Stremio", &stremio_url_str),
-                        ]);
-                    }
-
-                    if let Err(e) = drp.set_activity(activity) {
-                        eprintln!("Failed to set Discord activity: {e}");
+                        // Clear the last URL and video info
+                        last_url.clear();
+                        video_info = None;
                     }
                 }
+            }));
 
-                last_time = cur_time;
-            } else {
-                if config.disable_in_menu {
-                    drp.clear_activity().ok();
-                    continue;
-                }
-                let activity =
-                    Activity::new()
-                        .activity_type(ActivityType::Watching)
-                        .state("In Menu")
-                        .details("Browsing catalog")
-                        .timestamps(Timestamps::new().start(
-                            app_start_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-                        ))
-                        .assets(Assets::new().large_image(ICON_URL).large_text("Stremio"));
-
-                if let Err(e) = drp.set_activity(activity) {
-                    eprintln!("Failed to set Discord activity: {e}");
-                }
-
-                // Clear the last URL and video info
-                last_url.clear();
-                video_info = None;
+            // Handle the result of the thread
+            if let Err(e) = result {
+                eprintln!("⚠️ Discord RPC thread panicked: {:?}. Restarting...", e);
             }
+
+            // Add a delay before restarting to avoid rapid restart loops
+            thread::sleep(Duration::from_secs(5));
         }
     })
 }
