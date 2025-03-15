@@ -335,7 +335,10 @@ fn run_souvlaki_media_keys(
                     let _ = player_tx.send(r#"["mpv-command", ["stop"]]"#.to_string());
                 }
                 MediaControlEvent::SetPosition(pos) => {
-                    let _ = player_tx.send(format!(r#"["mpv-command", ["seek", "{}", "absolute"]]"#, pos.0.as_secs_f64()));
+                    let _ = player_tx.send(format!(
+                        r#"["mpv-command", ["seek", "{}", "absolute"]]"#,
+                        pos.0.as_secs_f64()
+                    ));
                 }
                 _ => {}
             }
