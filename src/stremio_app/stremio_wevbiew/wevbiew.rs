@@ -10,12 +10,15 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use url::Url;
 use urlencoding::decode;
 use webview2::Controller;
 use winapi::shared::windef::HWND;
 use winapi::um::winuser::{GetClientRect, VK_F7, WM_SETFOCUS};
 
 pub static CURRENT_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".to_string()));
+
+use super::constants::{WARNING_URL, WHITELISTED_HOSTS};
 
 #[derive(Default)]
 pub struct WebView {
@@ -104,6 +107,29 @@ impl PartialUi for WebView {
                     settings.put_are_host_objects_allowed(false).ok();
                     settings.put_are_default_script_dialogs_enabled(false).ok();
 
+                    // Handle window.open and href
+                    webview.add_new_window_requested(move |_webview, event| {
+                        if let Ok(uri) = event.get_uri() {
+                            if let Ok(url) = Url::parse(&uri) {
+                                let is_whitelisted = url.host().is_some_and(|host| {
+                                    WHITELISTED_HOSTS.iter().any(|whitelisted_host| host.to_string().ends_with(whitelisted_host))
+                                });
+
+                                let final_url = if is_whitelisted {
+                                    url.to_string()
+                                } else {
+                                    format!("{}{}", WARNING_URL, urlencoding::encode(url.as_ref()))
+                                };
+
+                                if let Err(e) = open::that(final_url) {
+                                    eprintln!("Failed to open URL: {}", e);
+                                }
+                            }
+                        }
+
+                        Ok(())
+                    })?;
+
                     if let Some(endpoint) = endpoint.get() {
                         if webview
                             .navigate(endpoint.as_str()).is_err() {
@@ -147,23 +173,6 @@ impl PartialUi for WebView {
                                     }
                                     })
                             }catch(e){}
-
-                            window.open = (url) => {
-                                if (typeof url === 'string' && URL.canParse(url))  {
-                                    try {
-                                        const message = {
-                                            id: 1,
-                                            args: ['open-external', url],
-                                        };
-
-                                        window.chrome.webview.postMessage(JSON.stringify(message));
-                                    } catch(e) {
-                                        console.error('Failed to post message');
-                                    }
-                                } else {
-                                    return console.error('Not a valid URL string');
-                                }
-                            };
 
                             try{console.log('Shell JS injected');if(window.self === window.top) {
                                 window.qt={webChannelTransport:{send:window.chrome.webview.postMessage}};
