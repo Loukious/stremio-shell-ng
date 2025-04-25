@@ -2,7 +2,6 @@
 #[macro_use]
 extern crate bitflags;
 use std::{io::Write, path::Path, process::exit};
-use url::Url;
 use whoami::username;
 
 use clap::Parser;
@@ -30,12 +29,6 @@ struct Opt {
     staging: bool,
     #[clap(long, default_value = WEB_ENDPOINT, help = "Override the WebUI URL")]
     webui_url: String,
-    #[clap(long, help = "Ovveride autoupdater endpoint")]
-    autoupdater_endpoint: Option<Url>,
-    #[clap(long, help = "Forces reinstalling current version")]
-    force_update: bool,
-    #[clap(long, help = "Check for RC updates")]
-    release_candidate: bool,
 }
 
 fn main() {
@@ -94,9 +87,6 @@ fn main() {
         webui_url,
         dev_tools: opt.development || opt.dev_tools,
         start_hidden: opt.start_hidden,
-        autoupdater_endpoint: opt.autoupdater_endpoint,
-        force_update: opt.force_update,
-        release_candidate: opt.release_candidate,
         ..Default::default()
     })
     .expect("Failed to build UI");

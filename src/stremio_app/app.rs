@@ -7,7 +7,6 @@ use ini::Ini;
 use native_windows_derive::NwgUi;
 use native_windows_gui as nwg;
 use once_cell::sync::Lazy;
-use rand::Rng;
 use reqwest::blocking::Client;
 use serde_json::{self, Value};
 use souvlaki::{
@@ -25,9 +24,8 @@ use std::{
     str,
     sync::{Arc, Mutex},
     thread,
-    time::{self, Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use url::Url;
 use urlencoding::decode;
 use winapi::um::{winbase::CREATE_BREAKAWAY_FROM_JOB, winuser::WS_EX_TOPMOST};
 struct SafeHwnd(*mut c_void);
@@ -43,7 +41,7 @@ pub const ICON_URL: &str =
     "https://raw.githubusercontent.com/Stremio/stremio-web/refs/heads/development/images/icon.png";
 
 use crate::stremio_app::{
-    constants::{APP_NAME, UPDATE_ENDPOINT, UPDATE_INTERVAL, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH},
+    constants::{APP_NAME, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH},
     ipc::{RPCRequest, RPCResponse},
     splash::SplashImage,
     stremio_player::{
@@ -52,7 +50,6 @@ use crate::stremio_app::{
     },
     stremio_wevbiew::{wevbiew::CURRENT_URL, WebView},
     systray::SystemTray,
-    updater,
     window_helper::WindowStyle,
     PipeServer,
 };
@@ -83,9 +80,6 @@ pub struct MainWindow {
     pub webui_url: String,
     pub dev_tools: bool,
     pub start_hidden: bool,
-    pub autoupdater_endpoint: Option<Url>,
-    pub force_update: bool,
-    pub release_candidate: bool,
     pub autoupdater_setup_file: Arc<Mutex<Option<PathBuf>>>,
     pub saved_window_style: RefCell<WindowStyle>,
     #[nwg_resource]
@@ -752,11 +746,7 @@ impl MainWindow {
         let web_tx_player = web_tx.clone();
         let web_tx_web = web_tx.clone();
         let web_tx_arg = web_tx.clone();
-        let web_tx_upd = web_tx.clone();
         let web_rx = web_rx.clone();
-
-        let (updater_tx, updater_rx) = flume::unbounded::<String>();
-        let updater_tx_web = updater_tx.clone();
 
         let command_clone = self.command.clone();
 
@@ -766,54 +756,6 @@ impl MainWindow {
                 .as_ref()
                 .expect("Cannot initialie the single application IPC"),
         );
-
-        let autoupdater_endpoint = self.autoupdater_endpoint.clone();
-        let force_update = self.force_update;
-        let release_candidate = self.release_candidate;
-        let autoupdater_setup_file = self.autoupdater_setup_file.clone();
-
-        thread::spawn(move || {
-            loop {
-                if let Ok(msg) = updater_rx.recv() {
-                    if msg == "check_for_update" {
-                        break;
-                    }
-                }
-            }
-
-            loop {
-                let current_version = env!("CARGO_PKG_VERSION")
-                    .parse()
-                    .expect("Should always be valid");
-
-                let updater_endpoint = if let Some(ref endpoint) = autoupdater_endpoint {
-                    endpoint.clone()
-                } else {
-                    let mut rng = rand::thread_rng();
-                    let index = rng.gen_range(0..UPDATE_ENDPOINT.len());
-                    let mut url = Url::parse(UPDATE_ENDPOINT[index]).unwrap();
-                    if release_candidate {
-                        url.query_pairs_mut().append_pair("rc", "true");
-                    }
-                    url
-                };
-
-                let updater =
-                    updater::Updater::new(current_version, &updater_endpoint, force_update);
-                match updater.autoupdate() {
-                    Ok(Some(update)) => {
-                        println!("New version ready to install v{}", update.version);
-                        let mut autoupdater_setup_file = autoupdater_setup_file.lock().unwrap();
-                        *autoupdater_setup_file = Some(update.file.clone());
-                        web_tx_upd.send(RPCResponse::update_available()).ok();
-                    }
-                    Ok(None) => println!("No new updates found"),
-                    Err(e) => eprintln!("Failed to fetch updates: {e}"),
-                }
-
-                thread::sleep(time::Duration::from_secs(UPDATE_INTERVAL));
-            }
-        }); // thread
 
         if let Ok(mut listener) = PipeServer::bind(socket_path) {
             let focus_sender = self.focus_notice.sender();
@@ -862,9 +804,6 @@ impl MainWindow {
                         web_tx_web
                             .send(RPCResponse::visibility_change(true, 1, false))
                             .ok();
-                        updater_tx_web
-                            .send("check_for_update".to_owned())
-                            .expect("Failed to send value to updater channel");
 
                         let command_ref = command_clone.clone();
                         if !command_ref.is_empty() {
