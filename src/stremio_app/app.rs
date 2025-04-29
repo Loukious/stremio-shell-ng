@@ -490,6 +490,7 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                                     total_duration,
                                     is_paused,
                                     app_start_time,
+                                    &cur_url,
                                 ),
                                 None => {
                                     eprintln!("⚠️ No video info available");
@@ -569,6 +570,7 @@ fn build_player_activity(
     total_duration: f64,
     is_paused: bool,
     app_start_time: SystemTime,
+    cur_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
@@ -625,14 +627,31 @@ fn build_player_activity(
         .timestamps(timestamps)
         .assets(assets);
 
+    let last_segment = if cur_url.contains("/series/") {
+        cur_url
+            .split_once("/series/")
+            .map(|(_, part)| format!("/series/{}", part))
+    } else if cur_url.contains("/movie/") {
+        cur_url
+            .split_once("/movie/")
+            .map(|(_, part)| format!("/movie/{}", part))
+    } else {
+        None
+    }
+    .unwrap_or_default();
+
+    let trimmed_segment = last_segment
+        .trim_start_matches("/series/")
+        .trim_start_matches("/movie/");
+    let imdb_id = trimmed_segment.split('/').next().unwrap_or("");
+
     // Add buttons if needed (using string references)
     let (imdb_url, stremio_url) = if config.show_buttons {
-        let imdb = format!("https://www.imdb.com/title/{}", 
-            info.poster.split('/').last().unwrap_or(""));
+        let imdb = format!("https://www.imdb.com/title/{}", imdb_id);
         let stremio = if config.link_target == "web" {
-            format!("https://web.stremio.com/#/detail/{}/{}", media_type, info.name)
+            format!("https://web.stremio.com/#/detail{}", last_segment)
         } else {
-            format!("stremio:///detail/{}/{}", media_type, info.name)
+            format!("stremio:///detail{}", last_segment)
         };
         (Some(imdb), Some(stremio))
     } else {
