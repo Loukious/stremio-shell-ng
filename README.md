@@ -1,3 +1,32 @@
+## Stremio shell fork with few extra features
+* Has Discord Rich Presence support
+    * Default look:
+    ![General view](https://i.imgur.com/rcvtzjs.png)
+* With my [Vencord fork](https://github.com/Loukious/Vencord) you can make it look even better:
+    * Enable the "BetterStremioActivity" plugin
+    ![Vencord](https://i.imgur.com/Nwa62Nw.png)
+* Media Keys and Windows Media Overlay support:
+    * Play/Pause
+    * Seek forward/backward
+* Modern architecture:
+    * Both the app and the MPV player are 64-bit
+* Unlocked MPV config:
+    * You can change the MPV config by editing the `mpv.conf` file in the app's data directory
+    * Supports upscaling: 
+        * `vf=d3d11vpp:scale=4:scaling-mode=nvidia:scale=1` for high quality upscaling
+        * `vo=gpu` use the GPU video output
+        * `gpu-context=d3d11` for Direct3D 11 GPU context
+        
+    * Supports lua scripts
+        * You can add lua scripts to the `scripts` directory in the app's data directory
+        * Script example: [To skip intros](https://raw.githubusercontent.com/Loukious/auto_skip_anime_intro/refs/heads/main/auto_skip_anime_intro.lua)
+
+
+
+## Support the fork developer
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/loukious)
+
+
 ## Stremio shell: new gen
 
 A Windows-only shell using WebView2 and MPV
