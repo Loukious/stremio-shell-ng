@@ -493,19 +493,25 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                             }
 
                             match &video_info {
-                                Some(info) => build_player_activity(
-                                    &mut drp,
-                                    &config,
-                                    info,
-                                    &type_,
-                                    &season,
-                                    &episode,
-                                    cur_time,
-                                    total_duration,
-                                    is_paused,
-                                    app_start_time,
-                                    &cur_url,
-                                ),
+                                Some(info) => {
+                                    if config.disable_when_paused && is_paused {
+                                        drp.clear_activity()
+                                    } else {
+                                        build_player_activity(
+                                            &mut drp,
+                                            &config,
+                                            info,
+                                            &type_,
+                                            &season,
+                                            &episode,
+                                            cur_time,
+                                            total_duration,
+                                            is_paused,
+                                            app_start_time,
+                                            &cur_url,
+                                        )
+                                    }
+                                }
                                 None => {
                                     eprintln!("⚠️ No video info available");
                                     continue;
@@ -590,8 +596,12 @@ fn build_player_activity(
         .duration_since(UNIX_EPOCH)?
         .as_secs() as i64;
 
-    let (start, end) = if is_paused || config.disable_when_paused {
-        let start_time = app_start_time.duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let (start, end) = if is_paused {
+        let start_time = if config.disable_when_paused {
+            app_start_time.duration_since(UNIX_EPOCH)?.as_secs() as i64
+        } else {
+            now_unix - current_time as i64
+        };
         (start_time, None)
     } else {
         let start = now_unix - current_time as i64;
