@@ -177,7 +177,6 @@ impl PartialUi for WebView {
                             try{console.log('Shell JS injected');if(window.self === window.top) {
                                 window.qt={webChannelTransport:{send:window.chrome.webview.postMessage}};
                                 window.chrome.webview.addEventListener('message',ev=>window.qt.webChannelTransport.onmessage(ev));
-                                window.onload=()=>{try{initShellComm();}catch(e){window.chrome.webview.postMessage('{"id":1,"args":["app-error","'+e.message+'"]}')}};
                                 }}catch(e){}
                             "##, |_| Ok(())).expect("Cannot add script to webview");
                             Ok(())
