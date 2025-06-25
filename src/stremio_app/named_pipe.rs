@@ -133,7 +133,7 @@ pub struct PipeServer {
 
 fn to_u16s<S: AsRef<OsStr>>(s: S) -> io::Result<Vec<u16>> {
     let mut maybe_result: Vec<u16> = s.as_ref().encode_wide().collect();
-    if maybe_result.iter().any(|&u| u == 0) {
+    if maybe_result.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "strings passed to WinAPI cannot contain NULs",
