@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "stremio-shell-ng"
-version = "5.0.7"
+version = "5.0.8"
 dependencies = [
  "anyhow",
  "bitflags 2.4.2",
