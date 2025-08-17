@@ -201,10 +201,10 @@ pub enum PropKey {
 impl fmt::Display for PropKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Bool(v) => write!(f, "{}", v),
-            Self::Int(v) => write!(f, "{}", v),
-            Self::Fp(v) => write!(f, "{}", v),
-            Self::Str(v) => write!(f, "{}", v),
+            Self::Bool(v) => write!(f, "{v}"),
+            Self::Int(v) => write!(f, "{v}"),
+            Self::Fp(v) => write!(f, "{v}"),
+            Self::Str(v) => write!(f, "{v}"),
         }
     }
 }

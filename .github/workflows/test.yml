@@ -16,12 +16,12 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: stable
-        target: i686-pc-windows-msvc
+        target: x86_64-pc-windows-msvc
         components: rustfmt, clippy
     - name: Lint code format
       run: cargo fmt --all -- --check
     - name: Lint code
       run: cargo clippy --all -- -D warnings
     - name: Test
-      run: cargo test --target i686-pc-windows-msvc
+      run: cargo test --target x86_64-pc-windows-msvc
 

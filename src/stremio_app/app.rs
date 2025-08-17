@@ -796,7 +796,7 @@ impl MainWindow {
                         focus_sender.notice();
                         // ['open-media', url]
                         web_tx_arg.send(RPCResponse::open_media(s.to_string())).ok();
-                        println!("{}", s);
+                        println!("{s}");
                     }
                 }
             });
@@ -843,7 +843,7 @@ impl MainWindow {
                         hide_splash_sender.notice();
                         if let Some(arg) = msg.get_params() {
                             // TODO: Make this modal dialog
-                            eprintln!("Web App Error: {}", arg);
+                            eprintln!("Web App Error: {arg}");
                         }
                     }
                     Some("open-external") => {
@@ -873,7 +873,7 @@ impl MainWindow {
                             autoupdater_setup_mutex.lock().unwrap().clone();
                         match autoupdater_setup_file {
                             Some(file_path) => {
-                                println!("Running the setup at {:?}", file_path);
+                                println!("Running the setup at {file_path:?}");
 
                                 let command = Command::new(file_path)
                                     .args([

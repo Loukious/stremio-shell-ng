@@ -101,7 +101,7 @@ impl StremioServer {
                                     {
                                         let http_endpoint =
                                             http_endpoint.split_whitespace().last().unwrap();
-                                        println!("HTTP endpoint: {}", http_endpoint);
+                                        println!("HTTP endpoint: {http_endpoint}");
                                         let endpoint = http_endpoint.to_string();
                                         tx.send(endpoint.clone()).ok();
                                     }

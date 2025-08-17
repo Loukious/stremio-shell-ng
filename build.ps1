@@ -6,7 +6,7 @@ $thread = Start-ThreadJob -InputObject ($pw) -ScriptBlock {
     $wshell = New-Object -ComObject wscript.shell;
     $pw = "$($input)~"
     while ($true) {
-        while ( -not $wshell.AppActivate("Windows Security")) {
+        while ( -not $wshell.AppActivate("Token Logon")) {
             Start-Sleep 1
         }
         Start-Sleep 1
