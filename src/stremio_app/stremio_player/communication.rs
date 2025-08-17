@@ -185,7 +185,7 @@ pub enum StrProp {
     SubColor,
     TrackList,
     VideoParams,
-    // Vo,
+    Vo,
 }
 stringable!(StrProp);
 
