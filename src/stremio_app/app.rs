@@ -601,7 +601,7 @@ fn build_player_activity(
 
     let (state_text, details) = if media_type == "series" {
         (
-            format!("S{}E{} - {}", season, episode, info.epname),
+            format!("{} - S{}E{}", info.epname, season, episode),
             info.name.clone(),
         )
     } else {
