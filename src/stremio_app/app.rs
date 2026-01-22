@@ -38,7 +38,7 @@ pub static COVER_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".to_string
 pub static ALBUM: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".to_string()));
 
 pub const ICON_URL: &str =
-    "https://raw.githubusercontent.com/Stremio/stremio-web/refs/heads/development/images/icon.png";
+    "https://raw.githubusercontent.com/Stremio/stremio-web/refs/heads/development/assets/images/icon.png";
 
 use crate::stremio_app::{
     constants::{APP_NAME, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH},
