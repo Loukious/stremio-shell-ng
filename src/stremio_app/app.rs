@@ -471,44 +471,72 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                         };
 
                         // Always send activity update (heartbeat)
-                        let activity_result = if cur_url.starts_with("https://web.stremio.com/#/player") {
-                            // Player state handling
-                            if cur_url != last_url {
-                                let video_id = match decode(cur_url.split('/').last().unwrap_or("")) {
-                                    Ok(decoded) => decoded,
-                                    Err(e) => {
-                                        eprintln!("⚠️ URL decoding failed: {e}");
-                                        continue;
-                                    }
-                                };
+                        let is_player = cur_url.contains("/player/");
+                        let is_detail = cur_url.contains("/detail/");
 
-                                let (parsed_type, parsed_id, parsed_season, parsed_episode) = 
-                                    parse_video_id(&video_id);
-                                type_ = parsed_type.to_owned();
-                                season = parsed_season.to_owned();
-                                episode = parsed_episode.to_owned();
-                                
-                                video_info = getvidinfo(&type_, &parsed_id, &season, &parsed_episode);
+                        // Always send activity update (heartbeat)
+                        let activity_result = if is_player || is_detail {
+                            // Content handling
+                            if cur_url != last_url {
+                                type_ = String::new();
+                                season = String::new();
+                                episode = String::new();
+
+                                if is_player {
+                                    let video_id = match decode(cur_url.split('/').last().unwrap_or("")) {
+                                        Ok(decoded) => decoded,
+                                        Err(e) => {
+                                            eprintln!("⚠️ URL decoding failed: {e}");
+                                            continue;
+                                        }
+                                    };
+
+                                    let (parsed_type, parsed_id, parsed_season, parsed_episode) =
+                                        parse_video_id(&video_id);
+                                    type_ = parsed_type.to_owned();
+                                    season = parsed_season.to_owned();
+                                    episode = parsed_episode.to_owned();
+
+                                    video_info = getvidinfo(&type_, &parsed_id, &season, &parsed_episode);
+                                } else if let Some(detail_part) = cur_url.split("/detail/").nth(1) {
+                                    let parts: Vec<&str> = detail_part.split('/').collect();
+                                    if parts.len() >= 2 {
+                                        type_ = parts[0].to_string();
+                                        let id = parts[1];
+                                        video_info = getvidinfo(&type_, id, "", "");
+                                    }
+                                }
                                 last_url = cur_url.clone();
                             }
 
                             match &video_info {
                                 Some(info) => {
-                                    if config.disable_when_paused && is_paused {
-                                        drp.clear_activity()
+                                    if is_player {
+                                        if config.disable_when_paused && is_paused {
+                                            drp.clear_activity()
+                                        } else {
+                                            build_player_activity(
+                                                &mut drp,
+                                                &config,
+                                                info,
+                                                &type_,
+                                                &season,
+                                                &episode,
+                                                cur_time,
+                                                total_duration,
+                                                is_paused,
+                                                app_start_time,
+                                                &cur_url,
+                                            )
+                                        }
                                     } else {
-                                        build_player_activity(
+                                        build_detail_activity(
                                             &mut drp,
                                             &config,
                                             info,
                                             &type_,
-                                            &season,
-                                            &episode,
-                                            cur_time,
-                                            total_duration,
-                                            is_paused,
-                                            app_start_time,
                                             &cur_url,
+                                            app_start_time,
                                         )
                                     }
                                 }
@@ -544,7 +572,7 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                                 Ok(guard) => guard,
                                 Err(_) => continue,
                             };
-                            *title_guard = if type_ == "series" {
+                            *title_guard = if type_ == "series" && !season.is_empty() {
                                 format!("{} ({}x{})", info.name, episode, season)
                             } else {
                                 info.name.clone()
@@ -1206,4 +1234,80 @@ impl MainWindow {
         self.save_window_settings();
         nwg::stop_thread_dispatch();
     }
+}
+
+fn build_detail_activity(
+    drp: &mut DiscordIpcClient,
+    config: &Config,
+    info: &VideoInfo,
+    media_type: &str,
+    cur_url: &str,
+    app_start_time: SystemTime,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = app_start_time; // derived start time or use passed time
+
+    let large_text = format!("{} ({})", info.name, info.year);
+    let assets = Assets::new()
+        .large_image(&info.poster)
+        .large_text(&large_text)
+        .small_image(ICON_URL)
+        .small_text("Stremio");
+
+    let state_text = if media_type == "series" {
+        "Viewing Series"
+    } else {
+        "Viewing Movie"
+    };
+
+    let start_time = app_start_time
+        .duration_since(UNIX_EPOCH)?
+        .as_secs() as i64;
+
+    let mut activity = Activity::new()
+        .activity_type(ActivityType::Watching)
+        .state(state_text)
+        .details(&info.name)
+        .timestamps(Timestamps::new().start(start_time))
+        .assets(assets);
+
+    let last_segment = if cur_url.contains("/series/") {
+        cur_url
+            .split_once("/series/")
+            .map(|(_, part)| format!("/series/{}", part))
+    } else if cur_url.contains("/movie/") {
+        cur_url
+            .split_once("/movie/")
+            .map(|(_, part)| format!("/movie/{}", part))
+    } else {
+        None
+    }
+    .unwrap_or_default();
+
+    let trimmed_segment = last_segment
+        .trim_start_matches("/series/")
+        .trim_start_matches("/movie/");
+    let imdb_id = trimmed_segment.split('/').next().unwrap_or("");
+
+    // Add buttons if needed (using string references)
+    let (imdb_url, stremio_url) = if config.show_buttons && !imdb_id.is_empty() {
+        let imdb = format!("https://www.imdb.com/title/{}", imdb_id);
+        let stremio = if config.link_target == "web" {
+            format!("https://web.stremio.com/#/detail{}", last_segment)
+        } else {
+            format!("stremio:///detail{}", last_segment)
+        };
+        (Some(imdb), Some(stremio))
+    } else {
+        (None, None)
+    };
+
+    if let (Some(imdb), Some(stremio)) = (&imdb_url, &stremio_url) {
+        activity = activity.buttons(vec![
+            Button::new("IMDb", imdb),
+            Button::new("Open in Stremio", stremio),
+        ]);
+    }
+
+    drp.set_activity(activity)?;
+    Ok(())
 }
