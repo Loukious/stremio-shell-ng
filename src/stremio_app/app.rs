@@ -206,7 +206,13 @@ fn load_or_create_config() -> Config {
 }
 
 pub fn getvidinfo(type_: &str, id: &str, season: &str, episode: &str) -> Option<VideoInfo> {
-    let url = format!("https://v3-cinemeta.strem.io/meta/{}/{}.json", type_, id);
+    let (base_url, use_id) = if id.starts_with("kitsu") {
+        ("https://anime-kitsu.strem.fun/meta", id.to_string())
+    } else {
+        ("https://v3-cinemeta.strem.io/meta", id.to_string())
+    };
+
+    let url = format!("{}/{}/{}.json", base_url, type_, use_id);
 
     // Perform the HTTP request
     let client = Client::new();
@@ -247,7 +253,12 @@ pub fn getvidinfo(type_: &str, id: &str, season: &str, episode: &str) -> Option<
             if let Some(videos) = meta.get("videos").and_then(|v| v.as_array()) {
                 for video in videos {
                     if let Some(video_id) = video.get("id").and_then(|v| v.as_str()) {
-                        let expected_id = format!("{}:{}:{}", id, season, episode);
+                        let expected_id = if season.is_empty() {
+                            format!("{}:{}", id, episode)
+                        } else {
+                            format!("{}:{}:{}", id, season, episode)
+                        };
+
                         if video_id == expected_id {
                             if let Some(thumbnail) = video.get("thumbnail").and_then(|t| t.as_str())
                             {
@@ -272,12 +283,50 @@ pub fn getvidinfo(type_: &str, id: &str, season: &str, episode: &str) -> Option<
     Some(video_info)
 }
 
-fn parse_video_id(video_id: &str) -> (&str, &str, &str, &str) {
+fn parse_video_id(video_id: &str) -> (String, String, String, String) {
     let parts: Vec<&str> = video_id.split(':').collect();
-    match parts.len() {
-        1 => ("movie", parts[0], "", ""),              // Movie case
-        3 => ("series", parts[0], parts[1], parts[2]), // Series case
-        _ => ("unknown", "", "", ""),
+    if parts.first() == Some(&"kitsu") {
+        match parts.len() {
+            2 => (
+                "movie".to_string(),
+                format!("{}:{}", parts[0], parts[1]),
+                "".to_string(),
+                "".to_string(),
+            ),
+            3 => (
+                "series".to_string(),
+                format!("{}:{}", parts[0], parts[1]),
+                "".to_string(),
+                parts[2].to_string(),
+            ),
+            _ => (
+                "unknown".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "".to_string(),
+            ),
+        }
+    } else {
+        match parts.len() {
+            1 => (
+                "movie".to_string(),
+                parts[0].to_string(),
+                "".to_string(),
+                "".to_string(),
+            ),
+            3 => (
+                "series".to_string(),
+                parts[0].to_string(),
+                parts[1].to_string(),
+                parts[2].to_string(),
+            ), // Series case
+            _ => (
+                "unknown".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "".to_string(),
+            ),
+        }
     }
 }
 
@@ -479,11 +528,11 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
 
                                     let (parsed_type, parsed_id, parsed_season, parsed_episode) =
                                         parse_video_id(&video_id);
-                                    type_ = parsed_type.to_owned();
-                                    season = parsed_season.to_owned();
-                                    episode = parsed_episode.to_owned();
+                                    type_ = parsed_type;
+                                    season = parsed_season;
+                                    episode = parsed_episode;
 
-                                    video_info = getvidinfo(&type_, &parsed_id, &season, &parsed_episode);
+                                    video_info = getvidinfo(&type_, &parsed_id, &season, &episode);
                                 } else if let Some(detail_part) = cur_url.split("/detail/").nth(1) {
                                     let parts: Vec<&str> = detail_part.split('/').collect();
                                     if parts.len() >= 2 {
@@ -536,7 +585,7 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                             if config.disable_in_menu {
                                 drp.clear_activity()
                             } else {
-                                build_menu_activity(&mut drp, app_start_time)
+                                build_menu_activity(&mut drp, &cur_url, app_start_time)
                             }
                         };
 
@@ -681,26 +730,34 @@ fn build_player_activity(
     let trimmed_segment = last_segment
         .trim_start_matches("/series/")
         .trim_start_matches("/movie/");
-    let imdb_id = trimmed_segment.split('/').next().unwrap_or("");
+    let raw_id = trimmed_segment.split('/').next().unwrap_or("");
+    let content_id_cow = decode(raw_id).unwrap_or(std::borrow::Cow::Borrowed(raw_id));
+    let content_id = content_id_cow.as_ref();
 
     // Add buttons if needed (using string references)
-    let (imdb_url, stremio_url) = if config.show_buttons {
-        let imdb = format!("https://www.imdb.com/title/{}", imdb_id);
+    let (external_url, stremio_url, button_label) = if config.show_buttons {
+        let (label, url) = if content_id.starts_with("kitsu:") {
+            let id_part = content_id.trim_start_matches("kitsu:");
+            ("Kitsu", format!("https://kitsu.app/anime/{}", id_part))
+        } else {
+            ("IMDb", format!("https://www.imdb.com/title/{}", content_id))
+        };
+
         let stremio = if config.link_target == "web" {
             format!("https://web.stremio.com/#/detail{}", last_segment)
         } else {
             format!("stremio:///detail{}", last_segment)
         };
-        (Some(imdb), Some(stremio))
+        (Some(url), Some(stremio), label)
     } else {
-        (None, None)
+        (None, None, "")
     };
 
     // Add buttons if needed
-    if config.show_buttons {
+    if let (Some(external), Some(stremio)) = (&external_url, &stremio_url) {
         activity = activity.buttons(vec![
-            Button::new("IMDb", imdb_url.as_ref().unwrap()),
-            Button::new("Open in Stremio", stremio_url.as_ref().unwrap()),
+            Button::new(button_label, external),
+            Button::new("Open in Stremio", stremio),
         ]);
     }
 
@@ -712,16 +769,32 @@ fn build_player_activity(
 
 fn build_menu_activity(
     drp: &mut DiscordIpcClient,
+    cur_url: &str,
     app_start_time: SystemTime,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = app_start_time
         .duration_since(UNIX_EPOCH)?
         .as_secs() as i64;
+    
+    let base_url = cur_url.split('?').next().unwrap_or(cur_url);
+    let (state, details) = if base_url.ends_with("/settings") {
+        ("Settings", "Changing configuration")
+    } else if base_url.ends_with("/addons") {
+        ("Addons", "Managing addons")
+    } else if base_url.ends_with("/library") {
+        ("Library", "Browsing library")
+    } else if base_url.ends_with("/calendar") {
+        ("Calendar", "Viewing Calendar")
+    } else if base_url.ends_with("/discover") {
+         ("Discover", "Browsing Catalog")
+    } else {
+         ("Browsing", "In Stremio Menu")
+    };
 
     let activity = Activity::new()
         .activity_type(ActivityType::Watching)
-        .state("Browsing Catalog")
-        .details("In Stremio Menu")
+        .state(state)
+        .details(details)
         .timestamps(Timestamps::new().start(start_time))
         .assets(Assets::new().large_image(ICON_URL).large_text("Stremio"));
 
@@ -1071,24 +1144,32 @@ fn build_detail_activity(
     let trimmed_segment = last_segment
         .trim_start_matches("/series/")
         .trim_start_matches("/movie/");
-    let imdb_id = trimmed_segment.split('/').next().unwrap_or("");
+    let raw_id = trimmed_segment.split('/').next().unwrap_or("");
+    let content_id_cow = decode(raw_id).unwrap_or(std::borrow::Cow::Borrowed(raw_id));
+    let content_id = content_id_cow.as_ref();
 
     // Add buttons if needed (using string references)
-    let (imdb_url, stremio_url) = if config.show_buttons && !imdb_id.is_empty() {
-        let imdb = format!("https://www.imdb.com/title/{}", imdb_id);
+    let (external_url, stremio_url, button_label) = if config.show_buttons && !content_id.is_empty() {
+        let (label, url) = if content_id.starts_with("kitsu:") {
+            let id_part = content_id.trim_start_matches("kitsu:");
+            ("Kitsu", format!("https://kitsu.app/anime/{}", id_part))
+        } else {
+            ("IMDb", format!("https://www.imdb.com/title/{}", content_id))
+        };
+
         let stremio = if config.link_target == "web" {
             format!("https://web.stremio.com/#/detail{}", last_segment)
         } else {
             format!("stremio:///detail{}", last_segment)
         };
-        (Some(imdb), Some(stremio))
+        (Some(url), Some(stremio), label)
     } else {
-        (None, None)
+        (None, None, "")
     };
 
-    if let (Some(imdb), Some(stremio)) = (&imdb_url, &stremio_url) {
+    if let (Some(external), Some(stremio)) = (&external_url, &stremio_url) {
         activity = activity.buttons(vec![
-            Button::new("IMDb", imdb),
+            Button::new(button_label, external),
             Button::new("Open in Stremio", stremio),
         ]);
     }
