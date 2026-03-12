@@ -59,26 +59,42 @@ fn propr_change_tokens() {
 
 #[test]
 fn ended_tokens() {
+    let error_tokens: [Token; 12] = [
+        Token::Struct {
+            name: "PlayerEnded",
+            len: 2,
+        },
+        Token::Str("reason"),
+        Token::Str("error"),
+        Token::Str("error"),
+        Token::Some,
+        Token::Struct {
+            name: "PlayerEndedError",
+            len: 2,
+        },
+        Token::Str("message"),
+        Token::Str("Unknown error"),
+        Token::Str("critical"),
+        Token::Bool(true),
+        Token::StructEnd,
+        Token::StructEnd,
+    ];
     let tokens: [Token; 4] = [
         Token::Struct {
             name: "PlayerEnded",
             len: 1,
         },
         Token::Str("reason"),
-        Token::None,
+        Token::Str("quit"),
         Token::StructEnd,
     ];
-    let mut typed_tokens = tokens.clone();
-    typed_tokens[2] = Token::Str("error");
     assert_tokens(
-        &PlayerEnded::from_end_reason(mpv_end_file_reason::Error),
-        &typed_tokens,
+        &PlayerEnded::from_end_reason(mpv_end_file_reason::Error, ""),
+        &error_tokens,
     );
-    let mut typed_tokens = tokens.clone();
-    typed_tokens[2] = Token::Str("quit");
     assert_tokens(
-        &PlayerEnded::from_end_reason(mpv_end_file_reason::Quit),
-        &typed_tokens,
+        &PlayerEnded::from_end_reason(mpv_end_file_reason::Quit, ""),
+        &tokens,
     );
 }
 

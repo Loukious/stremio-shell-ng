@@ -41,9 +41,17 @@ impl PlayerProprChange {
         }
     }
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+struct PlayerEndedError {
+    message: String,
+    critical: bool,
+}
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct PlayerEnded {
     reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<PlayerEndedError>,
 }
 impl PlayerEnded {
     fn string_from_end_reason(data: EndFileReason) -> String {
@@ -53,9 +61,24 @@ impl PlayerEnded {
             _ => "other".to_string(),
         }
     }
-    pub fn from_end_reason(data: EndFileReason) -> Self {
+    pub fn from_end_reason(data: EndFileReason, error: &str) -> Self {
         Self {
             reason: Self::string_from_end_reason(data),
+            error: if data == mpv_end_file_reason::Error {
+                if error.is_empty() {
+                    Some(PlayerEndedError {
+                        message: "Unknown error".to_string(),
+                        critical: true,
+                    })
+                } else {
+                    Some(PlayerEndedError {
+                        message: error.to_string(),
+                        critical: true,
+                    })
+                }
+            } else {
+                None
+            },
         }
     }
 }
