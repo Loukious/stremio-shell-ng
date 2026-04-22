@@ -2,7 +2,7 @@ use crate::stremio_app::constants::{SRV_BUFFER_SIZE, SRV_LOG_SIZE, STREMIO_SERVE
 use native_windows_gui::{self as nwg, PartialUi};
 use std::io::Write;
 use std::{
-    env, fs,
+    env,
     io::Read,
     ops::Deref,
     os::windows::process::CommandExt,
@@ -69,7 +69,6 @@ impl StremioServer {
                 );
             }
             let mut path = env::current_exe()
-                .and_then(fs::canonicalize)
                 .expect("Cannot get the current executable path");
             path.pop();
             let lines = Arc::new(Mutex::new(String::new()));
