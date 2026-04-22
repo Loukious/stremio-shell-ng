@@ -162,6 +162,7 @@ pub enum FpProp {
     SubDelay,
     SubScale,
     CacheBufferingState,
+    DemuxerCacheTime,
     SubPos,
     Speed,
 }
