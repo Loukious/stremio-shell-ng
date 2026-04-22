@@ -86,6 +86,7 @@ struct Config {
     disable_in_menu: bool,
     disable_when_paused: bool,
     refresh_interval: u64,
+    show_small_image: bool,
 }
 
 #[derive(Default, NwgUi)]
@@ -167,7 +168,8 @@ fn load_or_create_config() -> Config {
             .with_section(Some("Activity"))
             .set("disable_in_menu", "false")
             .set("disable_when_paused", "false")
-            .set("refresh_interval", "5");
+            .set("refresh_interval", "5")
+            .set("show_small_image", "true");
 
         default_config
             .write_to_file(&config_path)
@@ -216,6 +218,12 @@ fn load_or_create_config() -> Config {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(5);
 
+    let show_small_image = config
+        .section(Some("Activity"))
+        .and_then(|sec| sec.get("show_small_image"))
+        .map(|value| value == "true")
+        .unwrap_or(true);
+
     // Return the parsed configuration
     Config {
         show_buttons,
@@ -223,6 +231,7 @@ fn load_or_create_config() -> Config {
         disable_in_menu,
         disable_when_paused,
         refresh_interval,
+        show_small_image,
     }
 }
 
@@ -707,6 +716,7 @@ fn build_player_activity(
         .large_image(&poster_url)
         .large_text(&large_text);
 
+    if config.show_small_image {
         let (small_image, small_text) = if is_paused {
             (
                 "https://i.imgur.com/eCUJpm9.png", // Paused icon
@@ -722,6 +732,7 @@ fn build_player_activity(
         assets = assets
             .small_image(small_image)
             .small_text(small_text);
+    }
 
     // Create activity without buttons first
     let mut activity = Activity::new()
@@ -1326,11 +1337,15 @@ fn build_detail_activity(
 
     let large_text = format!("{} ({})", info.name, info.year);
     let poster_url = weserv_contain(&info.poster);
-    let assets = Assets::new()
+    let mut assets = Assets::new()
         .large_image(&poster_url)
-        .large_text(&large_text)
-        .small_image(ICON_URL)
-        .small_text("Stremio");
+        .large_text(&large_text);
+
+    if config.show_small_image {
+        assets = assets
+            .small_image(ICON_URL)
+            .small_text("Stremio");
+    }
 
     let state_text = if media_type == "series" {
         "Viewing Series"
