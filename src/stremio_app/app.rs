@@ -108,7 +108,7 @@ pub struct MainWindow {
     #[nwg_partial(parent: window)]
     #[nwg_events(
         (tray, MousePressLeftUp): [Self::on_show],
-        (tray_exit, OnMenuItemSelected): [nwg::stop_thread_dispatch()],
+        (tray_exit, OnMenuItemSelected): [Self::on_tray_exit],
         (tray_show_hide, OnMenuItemSelected): [Self::on_show_hide],
         (tray_topmost, OnMenuItemSelected): [Self::on_toggle_topmost],
     )]
@@ -125,7 +125,7 @@ pub struct MainWindow {
     #[nwg_events(OnNotice: [Self::on_toggle_fullscreen_notice] )]
     pub toggle_fullscreen_notice: nwg::Notice,
     #[nwg_control]
-    #[nwg_events(OnNotice: [nwg::stop_thread_dispatch()] )]
+    #[nwg_events(OnNotice: [Self::on_tray_exit] )]
     pub quit_notice: nwg::Notice,
     #[nwg_control]
     #[nwg_events(OnNotice: [Self::on_hide_splash_notice] )]
@@ -133,6 +133,87 @@ pub struct MainWindow {
     #[nwg_control]
     #[nwg_events(OnNotice: [Self::on_focus_notice] )]
     pub focus_notice: nwg::Notice,
+}
+
+fn save_window_state(hwnd: winapi::shared::windef::HWND, style: &WindowStyle) {
+    let (x, y, w, h, maximized) = if style.full_screen {
+        // When fullscreen, WindowStyle stores the pre-fullscreen geometry
+        (style.pos.0, style.pos.1, style.size.0, style.size.1, false)
+    } else {
+        unsafe {
+            let mut wp: winapi::um::winuser::WINDOWPLACEMENT = std::mem::zeroed();
+            wp.length = std::mem::size_of::<winapi::um::winuser::WINDOWPLACEMENT>() as u32;
+            if winapi::um::winuser::GetWindowPlacement(hwnd, &mut wp) == 0 {
+                return;
+            }
+            (
+                wp.rcNormalPosition.left,
+                wp.rcNormalPosition.top,
+                wp.rcNormalPosition.right - wp.rcNormalPosition.left,
+                wp.rcNormalPosition.bottom - wp.rcNormalPosition.top,
+                wp.showCmd == winapi::um::winuser::SW_SHOWMAXIMIZED as u32,
+            )
+        }
+    };
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            let config_path = parent.join("RPCconfig.ini");
+            let mut config = Ini::load_from_file(&config_path).unwrap_or_else(|_| Ini::new());
+            config.with_section(Some("Window"))
+                .set("x", x.to_string())
+                .set("y", y.to_string())
+                .set("w", w.to_string())
+                .set("h", h.to_string())
+                .set("maximized", if maximized { "true" } else { "false" })
+                .set("fullscreen", if style.full_screen { "true" } else { "false" });
+            let _ = config.write_to_file(&config_path);
+        }
+    }
+}
+
+/// Returns (restored_ok, was_fullscreen)
+fn load_window_state(hwnd: winapi::shared::windef::HWND, start_hidden: bool) -> (bool, bool) {
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return (false, false),
+    };
+    let config_path = match exe_path.parent() {
+        Some(p) => p.join("RPCconfig.ini"),
+        None => return (false, false),
+    };
+    let config = match Ini::load_from_file(&config_path) {
+        Ok(c) => c,
+        Err(_) => return (false, false),
+    };
+    let sec = match config.section(Some("Window")) {
+        Some(s) => s,
+        None => return (false, false),
+    };
+    let x: i32 = match sec.get("x").and_then(|v| v.parse().ok()) { Some(v) => v, None => return (false, false) };
+    let y: i32 = match sec.get("y").and_then(|v| v.parse().ok()) { Some(v) => v, None => return (false, false) };
+    let w: i32 = match sec.get("w").and_then(|v| v.parse().ok()) { Some(v) => v, None => return (false, false) };
+    let h: i32 = match sec.get("h").and_then(|v| v.parse().ok()) { Some(v) => v, None => return (false, false) };
+    let maximized = sec.get("maximized").map(|v| v == "true").unwrap_or(false);
+    let fullscreen = sec.get("fullscreen").map(|v| v == "true").unwrap_or(false);
+
+    unsafe {
+        let mut wp: winapi::um::winuser::WINDOWPLACEMENT = std::mem::zeroed();
+        wp.length = std::mem::size_of::<winapi::um::winuser::WINDOWPLACEMENT>() as u32;
+        wp.showCmd = if start_hidden {
+            winapi::um::winuser::SW_HIDE as u32
+        } else if maximized {
+            winapi::um::winuser::SW_SHOWMAXIMIZED as u32
+        } else {
+            winapi::um::winuser::SW_SHOWNORMAL as u32
+        };
+        wp.rcNormalPosition.left = x;
+        wp.rcNormalPosition.top = y;
+        wp.rcNormalPosition.right = x + w;
+        wp.rcNormalPosition.bottom = y + h;
+        winapi::um::winuser::SetWindowPlacement(hwnd, &wp);
+    }
+    (true, fullscreen)
 }
 
 fn load_or_create_config() -> Config {
@@ -868,7 +949,20 @@ impl MainWindow {
             });
 
             if let Ok(mut saved_style) = self.saved_window_style.try_borrow_mut() {
-                saved_style.center_window(hwnd, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT);
+                let (restored, was_fullscreen) = load_window_state(hwnd, self.start_hidden);
+                if restored {
+                    unsafe {
+                        let mut rect = std::mem::zeroed();
+                        winapi::um::winuser::GetWindowRect(hwnd, &mut rect);
+                        saved_style.pos = (rect.left, rect.top);
+                        saved_style.size = (rect.right - rect.left, rect.bottom - rect.top);
+                    }
+                    if was_fullscreen && !self.start_hidden {
+                        saved_style.toggle_full_screen(hwnd);
+                    }
+                } else {
+                    saved_style.center_window(hwnd, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT);
+                }
             }
 
             // Make the title bar follow the Windows dark/light theme and
@@ -1175,7 +1269,16 @@ impl MainWindow {
             self.on_show();
         }
     }
+    fn on_tray_exit(&self) {
+        if let Some(hwnd) = self.window.handle.hwnd() {
+            save_window_state(hwnd, &self.saved_window_style.borrow());
+        }
+        nwg::stop_thread_dispatch();
+    }
     fn on_quit(&self, data: &nwg::EventData) {
+        if let Some(hwnd) = self.window.handle.hwnd() {
+            save_window_state(hwnd, &self.saved_window_style.borrow());
+        }
         if let nwg::EventData::OnWindowClose(data) = data {
             data.close(false);
         }
