@@ -290,7 +290,11 @@ fn create_message_thread(
                     set_property(name, value, &mpv);
                 }
                 InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Str(value))) => {
-                    let value = if name.to_string() == "vo" {
+                    let value = if name.to_string() == "sub-ass-override" && value == "strip" {
+                        // Map "strip" to "scale". This perfectly preserves ASS styles and positioning 
+                        // but allows the subtitles to be scaled up/down.
+                        "scale".to_string()
+                    } else if name.to_string() == "vo" {
                         let mut value = value;
                         if !value.is_empty() && !value.ends_with(',') {
                             value.push(',');
