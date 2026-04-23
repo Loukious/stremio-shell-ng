@@ -7,4 +7,5 @@ pub const WINDOW_MIN_WIDTH: i32 = 1000;
 pub const WINDOW_MIN_HEIGHT: i32 = 600;
 pub const STREMIO_SERVER_DEV_MODE: &str = "STREMIO_SERVER_DEV_MODE";
 pub const SRV_BUFFER_SIZE: usize = 1024;
+pub const SERVER_IPC_KEY: &str = "SERVER_IPC_KEY";
 pub const SRV_LOG_SIZE: usize = 20;

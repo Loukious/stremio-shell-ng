@@ -1,3 +1,4 @@
+use crate::stremio_app::constants::SERVER_IPC_KEY;
 use crate::stremio_app::ipc;
 use native_windows_gui::{self as nwg, PartialUi};
 use once_cell::sync::Lazy;
@@ -163,6 +164,11 @@ impl PartialUi for WebView {
                         }).expect("Cannot add source_changed event");
 
                         webview.add_content_loading(move |wv, _| {
+                            wv.execute_script(format!(
+                                    "window.stremio_server_ipc_key='{}'",
+                                    std::env::var(SERVER_IPC_KEY).unwrap_or_default()
+                            ).as_str(), |_| Ok(())
+                            ).expect("Cannot add SERVER_IPC_KEY to webview");
                             wv.execute_script(r##"
                             try{
                                 /* Disable context menus */

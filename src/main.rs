@@ -8,7 +8,9 @@ use clap::Parser;
 use native_windows_gui::{self as nwg, NativeUi};
 mod stremio_app;
 use crate::stremio_app::{
-    constants::{DEV_ENDPOINT, IPC_PATH, STA_ENDPOINT, STREMIO_SERVER_DEV_MODE, WEB_ENDPOINT},
+    constants::{
+        DEV_ENDPOINT, IPC_PATH, SERVER_IPC_KEY, STA_ENDPOINT, STREMIO_SERVER_DEV_MODE, WEB_ENDPOINT,
+    },
     MainWindow, PipeClient,
 };
 
@@ -29,6 +31,12 @@ struct Opt {
     staging: bool,
     #[clap(long, default_value = WEB_ENDPOINT, help = "Override the WebUI URL")]
     webui_url: String,
+    #[clap(
+        long,
+        default_value = "",
+        help = "Secret key for communication with the server. By default it is randomly generrated on startup"
+    )]
+    server_ipc_key: String,
 }
 
 fn main() {
@@ -44,6 +52,15 @@ fn main() {
     nwg::enable_visual_styles();
 
     let opt = Opt::parse();
+
+    std::env::set_var(
+        SERVER_IPC_KEY,
+        if opt.server_ipc_key.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            opt.server_ipc_key.clone()
+        },
+    );
 
     let command = match opt.command {
         Some(file) => {
