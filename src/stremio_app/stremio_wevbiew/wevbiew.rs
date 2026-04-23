@@ -95,9 +95,9 @@ impl PartialUi for WebView {
                         if let Ok(controller2) = controller.get_controller2() {
                             controller2
                                 .put_default_background_color(webview2_sys::Color {
-                                    r: 255,
-                                    g: 255,
-                                    b: 255,
+                                    r: 0,
+                                    g: 0,
+                                    b: 0,
                                     a: 0,
                                 })
                                 .ok();
