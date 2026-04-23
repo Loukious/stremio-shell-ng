@@ -61,21 +61,14 @@ impl PlayerEnded {
             _ => "other".to_string(),
         }
     }
-    pub fn from_end_reason(data: EndFileReason, error: &str) -> Self {
+    pub fn from_end_reason(data: EndFileReason) -> Self {
         Self {
             reason: Self::string_from_end_reason(data),
             error: if data == mpv_end_file_reason::Error {
-                if error.is_empty() {
-                    Some(PlayerEndedError {
-                        message: "Unknown error".to_string(),
-                        critical: true,
-                    })
-                } else {
-                    Some(PlayerEndedError {
-                        message: error.to_string(),
-                        critical: true,
-                    })
-                }
+                Some(PlayerEndedError {
+                    message: "Unknown error".to_string(),
+                    critical: false,
+                })
             } else {
                 None
             },

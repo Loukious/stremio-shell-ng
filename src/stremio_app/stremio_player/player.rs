@@ -113,20 +113,11 @@ fn create_event_thread(
             }
 
             // -1.0 means to block and wait for an event.
-            let (event, error) = match event_context.wait_event(-1.) {
-                Some(Ok(event)) => (event, ""),
+            let event = match event_context.wait_event(-1.) {
+                Some(Ok(event)) => event,
                 Some(Err(error)) => {
-                    if let libmpv2::Error::Raw(e) = error {
-                        (
-                            Event::EndFile(
-                                libmpv2_sys::mpv_end_file_reason_MPV_END_FILE_REASON_ERROR,
-                            ),
-                            libmpv2_sys::mpv_error_str(e),
-                        )
-                    } else {
-                        eprintln!("Unhandled event error: {error:?}");
-                        continue;
-                    }
+                    eprintln!("Event errored: {error:?}");
+                    continue;
                 }
                 None => continue,
             };
@@ -163,7 +154,7 @@ fn create_event_thread(
                 }
                 Event::EndFile(reason) => PlayerResponse(
                     "mpv-event-ended",
-                    PlayerEvent::End(PlayerEnded::from_end_reason(reason, error)),
+                    PlayerEvent::End(PlayerEnded::from_end_reason(reason)),
                 ),
                 Event::Shutdown => {
                     break;
