@@ -13,8 +13,8 @@ use std::{
 use winapi::shared::windef::HWND;
 
 use crate::stremio_app::stremio_player::{
-    CmdVal, InMsg, InMsgArgs, InMsgFn, PlayerEnded, PlayerEvent, PlayerProprChange, PlayerResponse,
-    PropKey, PropVal,
+    CmdVal, InMsg, InMsgArgs, InMsgFn, MpvCmd, PlayerEnded, PlayerEvent, PlayerProprChange,
+    PlayerResponse, PropKey, PropVal,
 };
 
 pub static CURRENT_TIME: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(0.0));
@@ -22,6 +22,14 @@ pub static CURRENT_TIME: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(0.0));
 pub static TOTAL_DURATION: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(0.0));
 
 pub static IS_PAUSED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+
+/// The actual video stream URL passed to `loadfile` (not the Stremio page URL).
+pub static CURRENT_STREAM_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+
+/// Global player command sender — allows the sync client (and other subsystems)
+/// to inject mpv commands without going through the webview pipeline.
+/// Populated once during `on_init`.
+pub static PLAYER_CMD_TX: Lazy<Mutex<Option<Sender<String>>>> = Lazy::new(|| Mutex::new(None));
 
 struct ObserveProperty {
     name: String,
@@ -282,7 +290,7 @@ fn create_message_thread(
                 }
                 InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Str(value))) => {
                     let value = if name.to_string() == "sub-ass-override" && value == "strip" {
-                        // Map "strip" to "scale". This perfectly preserves ASS styles and positioning 
+                        // Map "strip" to "scale". This perfectly preserves ASS styles and positioning
                         // but allows the subtitles to be scaled up/down.
                         "scale".to_string()
                     } else if name.to_string() == "vo" {
@@ -298,6 +306,19 @@ fn create_message_thread(
                     set_property(name, value, &mpv);
                 }
                 InMsg(InMsgFn::MpvCommand, InMsgArgs::Cmd(cmd)) => {
+                    // Capture the actual stream URL when loadfile is issued
+                    match &cmd {
+                        CmdVal::Double(MpvCmd::Loadfile, url)
+                        | CmdVal::Tripple(MpvCmd::Loadfile, url, ..)
+                        | CmdVal::Quadruple(MpvCmd::Loadfile, url, ..)
+                        | CmdVal::Quintuple(MpvCmd::Loadfile, url, ..) => {
+                            if let Ok(mut stream_url) = CURRENT_STREAM_URL.lock() {
+                                *stream_url = url.clone();
+                                println!("📺 Stream URL captured: {}", url);
+                            }
+                        }
+                        _ => {}
+                    }
                     send_command(cmd);
                 }
                 msg => {

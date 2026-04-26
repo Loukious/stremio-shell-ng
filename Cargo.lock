@@ -1294,6 +1294,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
 name = "pathdiff"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1788,10 +1794,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "steamworks"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0974cb1b6b5588f788a3edcb7e6e5e964388ae9d317c723b1009d2699790f66d"
+dependencies = [
+ "bitflags 2.11.1",
+ "paste",
+ "steamworks-sys",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "steamworks-sys"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae139f051204a4af015d4f0ed3a1f7a51020d03a44c7cf249168c543d88131e9"
+
+[[package]]
 name = "stremio-shell-ng"
 version = "5.0.20"
 dependencies = [
  "anyhow",
+ "base64",
  "bitflags 2.11.1",
  "chrono",
  "clap",
@@ -1813,6 +1838,7 @@ dependencies = [
  "serde_test",
  "sha2",
  "souvlaki",
+ "steamworks",
  "url",
  "urlencoding",
  "uuid 1.23.1",

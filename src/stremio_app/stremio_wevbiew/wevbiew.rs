@@ -18,6 +18,8 @@ use winapi::shared::windef::HWND;
 use winapi::um::winuser::{GetClientRect, VK_F7, WM_SETFOCUS};
 
 pub static CURRENT_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".to_string()));
+pub static WEB_CMD_TX: Lazy<Mutex<Option<flume::Sender<String>>>> = Lazy::new(|| Mutex::new(None));
+pub const WEBVIEW_EXEC_SCRIPT_PREFIX: &str = "__stremio_shell_exec_script__:";
 
 use super::constants::{WARNING_URL, WHITELISTED_HOSTS};
 
@@ -184,6 +186,33 @@ impl PartialUi for WebView {
                                 window.qt={webChannelTransport:{send:window.chrome.webview.postMessage}};
                                 window.chrome.webview.addEventListener('message',ev=>window.qt.webChannelTransport.onmessage(ev));
                                 }}catch(e){}
+
+                            try{
+                                if(window.self === window.top && !window.__stremioShellRouteReporterInstalled) {
+                                    window.__stremioShellRouteReporterInstalled = true;
+                                    const reportRoute = () => {
+                                        try {
+                                            window.chrome.webview.postMessage(JSON.stringify({
+                                                id: 1,
+                                                args: ["shell-route-changed", window.location.href]
+                                            }));
+                                        } catch(e) {}
+                                    };
+                                    const wrapHistory = (name) => {
+                                        const original = window.history[name];
+                                        window.history[name] = function() {
+                                            const result = original.apply(this, arguments);
+                                            setTimeout(reportRoute, 0);
+                                            return result;
+                                        };
+                                    };
+                                    wrapHistory('pushState');
+                                    wrapHistory('replaceState');
+                                    window.addEventListener('popstate', reportRoute);
+                                    window.addEventListener('hashchange', reportRoute);
+                                    reportRoute();
+                                }
+                            }catch(e){}
                             "##, |_| Ok(())).expect("Cannot add script to webview");
                             Ok(())
                         }).expect("Cannot add content loading");
@@ -258,7 +287,11 @@ impl PartialUi for WebView {
                 let webview = controller.get_webview().expect("Cannot get vebview");
                 let mut message_queue = message_queue.lock().unwrap();
                 for msg in message_queue.drain(..) {
-                    webview.post_web_message_as_string(msg.as_str()).ok();
+                    if let Some(script) = msg.strip_prefix(WEBVIEW_EXEC_SCRIPT_PREFIX) {
+                        webview.execute_script(script, |_| Ok(())).ok();
+                    } else {
+                        webview.post_web_message_as_string(msg.as_str()).ok();
+                    }
                 }
             }
         }

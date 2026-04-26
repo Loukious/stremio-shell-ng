@@ -1,5 +1,7 @@
 use discord_rich_presence::{
-    activity::{Activity, ActivityType, Assets, Button, Timestamps},
+    activity::{
+        Activity, ActivityType, Assets, Button, Party, Secrets, StatusDisplayType, Timestamps,
+    },
     DiscordIpc, DiscordIpcClient,
 };
 use flume::{Receiver, Sender};
@@ -15,6 +17,7 @@ use souvlaki::{
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::{
     cell::RefCell,
+    collections::VecDeque,
     env,
     ffi::c_void,
     io::Read,
@@ -40,6 +43,27 @@ pub static ALBUM: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".to_string()))
 pub const ICON_URL: &str =
     "https://raw.githubusercontent.com/Stremio/stremio-web/refs/heads/development/assets/images/icon.png";
 
+// ── Lobby / Watch-Party state ──────────────────────────────────────────
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LobbyRole {
+    None,
+    Host,
+    Guest,
+}
+
+/// Unique party ID for the current lobby (empty = no active lobby)
+pub static LOBBY_PARTY_ID: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+/// Opaque join secret shared via Discord RPC
+pub static LOBBY_JOIN_SECRET: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+/// Current number of members in the lobby (including the host)
+pub static LOBBY_MEMBER_COUNT: Lazy<Mutex<i32>> = Lazy::new(|| Mutex::new(0));
+/// Maximum lobby size
+pub static LOBBY_MAX_SIZE: Lazy<Mutex<i32>> = Lazy::new(|| Mutex::new(8));
+/// Host-authored member list for the active watch party.
+pub static LOBBY_MEMBERS: Lazy<Mutex<Vec<crate::stremio_app::sync_protocol::LobbyMember>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+/// Whether this app owns the lobby or joined someone else's lobby.
+pub static LOBBY_ROLE: Lazy<Mutex<LobbyRole>> = Lazy::new(|| Mutex::new(LobbyRole::None));
 use crate::stremio_app::{
     constants::{APP_NAME, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH},
     ipc::{RPCRequest, RPCResponse},
@@ -79,6 +103,61 @@ struct Config {
     disable_when_paused: bool,
     refresh_interval: u64,
     show_small_image: bool,
+    lobby_max_size: i32,
+}
+
+#[derive(Debug, Clone)]
+struct LobbyPresence {
+    party_id: String,
+    join_secret: String,
+    member_count: i32,
+    max_size: i32,
+}
+
+impl LobbyPresence {
+    fn others_text(&self) -> Option<String> {
+        let others = self.member_count.saturating_sub(1);
+        match others {
+            0 => None,
+            1 => Some("with 1 other".to_string()),
+            n => Some(format!("with {n} others")),
+        }
+    }
+}
+
+fn lobby_presence(config: &Config) -> Option<LobbyPresence> {
+    let party_id = LOBBY_PARTY_ID.lock().map(|p| p.clone()).unwrap_or_default();
+    if party_id.is_empty() {
+        return None;
+    }
+
+    let join_secret = LOBBY_JOIN_SECRET
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    let member_count = LOBBY_MEMBER_COUNT.lock().map(|c| *c).unwrap_or(1).max(1);
+    let max_size = LOBBY_MAX_SIZE
+        .lock()
+        .map(|m| *m)
+        .unwrap_or(config.lobby_max_size)
+        .max(member_count);
+
+    Some(LobbyPresence {
+        party_id,
+        join_secret,
+        member_count,
+        max_size,
+    })
+}
+
+fn send_webview_script(script: &str) {
+    use crate::stremio_app::stremio_wevbiew::wevbiew::{WEBVIEW_EXEC_SCRIPT_PREFIX, WEB_CMD_TX};
+
+    if let Ok(tx) = WEB_CMD_TX.lock() {
+        if let Some(tx) = tx.as_ref() {
+            let _ = tx.send(format!("{WEBVIEW_EXEC_SCRIPT_PREFIX}{script}"));
+        }
+    }
 }
 
 #[derive(Default, NwgUi)]
@@ -109,6 +188,9 @@ pub struct MainWindow {
     #[nwg_events(
         (tray, MousePressLeftUp): [Self::on_show],
         (tray_exit, OnMenuItemSelected): [Self::on_tray_exit],
+        (tray_start_watch_party, OnMenuItemSelected): [Self::on_start_watch_party],
+        (tray_end_watch_party, OnMenuItemSelected): [Self::on_end_watch_party],
+        (tray_leave_watch_party, OnMenuItemSelected): [Self::on_leave_watch_party],
         (tray_show_hide, OnMenuItemSelected): [Self::on_show_hide],
         (tray_topmost, OnMenuItemSelected): [Self::on_toggle_topmost],
     )]
@@ -133,6 +215,10 @@ pub struct MainWindow {
     #[nwg_control]
     #[nwg_events(OnNotice: [Self::on_focus_notice] )]
     pub focus_notice: nwg::Notice,
+    #[nwg_control]
+    #[nwg_events(OnNotice: [Self::on_sync_notice] )]
+    pub sync_notice: nwg::Notice,
+    pub sync_events: Arc<Mutex<VecDeque<crate::stremio_app::steam_sync::SyncUiEvent>>>,
 }
 
 fn save_window_state(hwnd: winapi::shared::windef::HWND, style: &WindowStyle) {
@@ -160,13 +246,17 @@ fn save_window_state(hwnd: winapi::shared::windef::HWND, style: &WindowStyle) {
         if let Some(parent) = exe_path.parent() {
             let config_path = parent.join("RPCconfig.ini");
             let mut config = Ini::load_from_file(&config_path).unwrap_or_else(|_| Ini::new());
-            config.with_section(Some("Window"))
+            config
+                .with_section(Some("Window"))
                 .set("x", x.to_string())
                 .set("y", y.to_string())
                 .set("w", w.to_string())
                 .set("h", h.to_string())
                 .set("maximized", if maximized { "true" } else { "false" })
-                .set("fullscreen", if style.full_screen { "true" } else { "false" });
+                .set(
+                    "fullscreen",
+                    if style.full_screen { "true" } else { "false" },
+                );
             let _ = config.write_to_file(&config_path);
         }
     }
@@ -190,10 +280,22 @@ fn load_window_state(hwnd: winapi::shared::windef::HWND, start_hidden: bool) -> 
         Some(s) => s,
         None => return (false, false),
     };
-    let x: i32 = match sec.get("x").and_then(|v| v.parse().ok()) { Some(v) => v, None => return (false, false) };
-    let y: i32 = match sec.get("y").and_then(|v| v.parse().ok()) { Some(v) => v, None => return (false, false) };
-    let w: i32 = match sec.get("w").and_then(|v| v.parse().ok()) { Some(v) => v, None => return (false, false) };
-    let h: i32 = match sec.get("h").and_then(|v| v.parse().ok()) { Some(v) => v, None => return (false, false) };
+    let x: i32 = match sec.get("x").and_then(|v| v.parse().ok()) {
+        Some(v) => v,
+        None => return (false, false),
+    };
+    let y: i32 = match sec.get("y").and_then(|v| v.parse().ok()) {
+        Some(v) => v,
+        None => return (false, false),
+    };
+    let w: i32 = match sec.get("w").and_then(|v| v.parse().ok()) {
+        Some(v) => v,
+        None => return (false, false),
+    };
+    let h: i32 = match sec.get("h").and_then(|v| v.parse().ok()) {
+        Some(v) => v,
+        None => return (false, false),
+    };
     let maximized = sec.get("maximized").map(|v| v == "true").unwrap_or(false);
     let fullscreen = sec.get("fullscreen").map(|v| v == "true").unwrap_or(false);
 
@@ -237,6 +339,9 @@ fn load_or_create_config() -> Config {
             .set("disable_when_paused", "false")
             .set("refresh_interval", "5")
             .set("show_small_image", "true");
+        default_config
+            .with_section(Some("Lobby"))
+            .set("lobby_max_size", "8");
 
         default_config
             .write_to_file(&config_path)
@@ -291,7 +396,14 @@ fn load_or_create_config() -> Config {
         .map(|value| value == "true")
         .unwrap_or(true);
 
-    // Return the parsed configuration
+    let lobby_max_size = config
+        .section(Some("Lobby"))
+        .and_then(|sec| sec.get("lobby_max_size"))
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(8)
+        .max(2)
+        .min(16);
+
     Config {
         show_buttons,
         link_target,
@@ -299,6 +411,7 @@ fn load_or_create_config() -> Config {
         disable_when_paused,
         refresh_interval,
         show_small_image,
+        lobby_max_size,
     }
 }
 
@@ -543,7 +656,10 @@ fn run_souvlaki_media_keys(
     }
 }
 
-pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<()> {
+pub fn spawn_discordrpc_loop(
+    app_start_time: SystemTime,
+    _auto_host_lobby: bool,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let config = load_or_create_config();
         let retry_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -553,13 +669,14 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let mut drp = DiscordIpcClient::new("997798118185771059");
 
-                loop {  // Connection maintenance loop
+                loop {
+                    // Connection maintenance loop
                     // Attempt connection
                     match drp.connect() {
                         Ok(_) => {
                             current_retry.store(0, std::sync::atomic::Ordering::SeqCst);
                             println!("✅ Connected to Discord IPC");
-                        },
+                        }
                         Err(e) => {
                             eprintln!("⚠️ Connection failed: {e}");
                             thread::sleep(Duration::from_secs(5));
@@ -573,7 +690,8 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                     let mut season = String::new();
                     let mut episode = String::new();
 
-                    loop {  // Activity update loop
+                    loop {
+                        // Activity update loop
                         let sleep_time = Duration::from_secs(config.refresh_interval);
                         thread::sleep(sleep_time);
 
@@ -584,12 +702,9 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                             IS_PAUSED.lock(),
                             TOTAL_DURATION.lock(),
                         ) {
-                            (Ok(url), Ok(time), Ok(paused), Ok(duration)) => (
-                                url.clone(),
-                                *time,
-                                *paused,
-                                *duration,
-                            ),
+                            (Ok(url), Ok(time), Ok(paused), Ok(duration)) => {
+                                (url.clone(), *time, *paused, *duration)
+                            }
                             _ => {
                                 eprintln!("⚠️ Failed to lock state mutexes");
                                 continue;
@@ -609,13 +724,14 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                                 episode = String::new();
 
                                 if is_player {
-                                    let video_id = match decode(cur_url.split('/').last().unwrap_or("")) {
-                                        Ok(decoded) => decoded,
-                                        Err(e) => {
-                                            eprintln!("⚠️ URL decoding failed: {e}");
-                                            continue;
-                                        }
-                                    };
+                                    let video_id =
+                                        match decode(cur_url.split('/').last().unwrap_or("")) {
+                                            Ok(decoded) => decoded,
+                                            Err(e) => {
+                                                eprintln!("⚠️ URL decoding failed: {e}");
+                                                continue;
+                                            }
+                                        };
 
                                     let (parsed_type, parsed_id, parsed_season, parsed_episode) =
                                         parse_video_id(&video_id);
@@ -639,7 +755,9 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                                 Some(info) => {
                                     if is_player {
                                         if config.disable_when_paused && is_paused {
-                                            drp.clear_activity().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                                            drp.clear_activity().map_err(|e| {
+                                                Box::new(e) as Box<dyn std::error::Error>
+                                            })
                                         } else {
                                             build_player_activity(
                                                 &mut drp,
@@ -674,7 +792,8 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                         } else {
                             // Non-player state handling
                             if config.disable_in_menu {
-                                drp.clear_activity().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                                drp.clear_activity()
+                                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
                             } else {
                                 build_menu_activity(&mut drp, &cur_url, app_start_time)
                             }
@@ -714,10 +833,10 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                                 ICON_URL.to_string()
                             };
                         }
-                    }  // End activity update loop
+                    } // End activity update loop
 
                     let _ = drp.close();
-                }  // End connection loop
+                } // End connection loop
             }));
 
             // Handle panics and connection failures
@@ -746,9 +865,7 @@ fn build_player_activity(
     app_start_time: SystemTime,
     cur_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs() as i64;
+    let now_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
     let (start, end) = if is_paused {
         let start_time = if config.disable_when_paused {
@@ -767,7 +884,10 @@ fn build_player_activity(
         timestamps = timestamps.end(end);
     }
 
-    let (activity_name, details, state_text) = if media_type == "series" {
+    let lobby = lobby_presence(config);
+    let lobby_text = lobby.as_ref().and_then(LobbyPresence::others_text);
+
+    let (activity_name, details, mut state_text) = if media_type == "series" {
         (
             info.name.clone(),
             info.epname.clone(),
@@ -776,6 +896,13 @@ fn build_player_activity(
     } else {
         (info.name.clone(), info.name.clone(), info.year.clone())
     };
+    if let Some(text) = &lobby_text {
+        state_text = if state_text.is_empty() {
+            text.clone()
+        } else {
+            format!("{state_text} • {text}")
+        };
+    }
 
     let large_text = format!("{} ({})", info.name, info.year);
     let poster_url = weserv_contain(&info.poster);
@@ -787,26 +914,21 @@ fn build_player_activity(
         let (small_image, small_text) = if is_paused {
             (
                 "https://i.imgur.com/eCUJpm9.png", // Paused icon
-                "Paused"
+                "Paused",
             )
         } else {
-            (
-                ICON_URL,
-                "Playing"
-            )
+            (ICON_URL, "Playing")
         };
-    
-        assets = assets
-            .small_image(small_image)
-            .small_text(small_text);
-    }
 
+        assets = assets.small_image(small_image).small_text(small_text);
+    }
     // Create activity without buttons first
     let mut activity = Activity::new()
         .activity_type(ActivityType::Watching)
         .name(&activity_name)
         .details(&details)
         .state(&state_text)
+        .status_display_type(StatusDisplayType::Details)
         .timestamps(timestamps)
         .assets(assets);
 
@@ -849,29 +971,51 @@ fn build_player_activity(
         (None, None, "")
     };
 
-    // Add buttons if needed
-    if let (Some(external), Some(stremio)) = (&external_url, &stremio_url) {
-        activity = activity.buttons(vec![
-            Button::new(button_label, external),
-            Button::new("Open in Stremio", stremio),
-        ]);
+    // ── Build Buttons ──
+    // Discord allows up to 2 buttons.
+    let mut buttons = Vec::new();
+
+    // 1. External Link (IMDb/Kitsu)
+    if config.show_buttons {
+        if let Some(external) = external_url {
+            buttons.push(Button::new(button_label, external));
+        }
+    }
+
+    // 2. Open in Stremio / Join Watch Party
+    if let Some(lobby) = &lobby {
+        if !lobby.join_secret.is_empty() {
+            buttons.push(Button::new("Join Watch Party", &lobby.join_secret));
+        }
+    } else if config.show_buttons {
+        if let Some(stremio) = stremio_url {
+            buttons.push(Button::new("Open in Stremio", stremio));
+        }
+    }
+
+    if !buttons.is_empty() {
+        activity = activity.buttons(buttons);
+    }
+
+    if let Some(lobby) = &lobby {
+        activity = activity.party(
+            Party::new()
+                .id(&lobby.party_id)
+                .size([lobby.member_count, lobby.max_size]),
+        );
     }
 
     drp.set_activity(activity)?;
     Ok(())
 }
 
-
-
 fn build_menu_activity(
     drp: &mut DiscordIpcClient,
     cur_url: &str,
     app_start_time: SystemTime,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let start_time = app_start_time
-        .duration_since(UNIX_EPOCH)?
-        .as_secs() as i64;
-    
+    let start_time = app_start_time.duration_since(UNIX_EPOCH)?.as_secs() as i64;
+
     let base_url = cur_url.split('?').next().unwrap_or(cur_url);
     let (state, details) = if base_url.ends_with("/settings") {
         ("Settings", "Changing configuration")
@@ -882,9 +1026,9 @@ fn build_menu_activity(
     } else if base_url.ends_with("/calendar") {
         ("Calendar", "Viewing Calendar")
     } else if base_url.ends_with("/discover") {
-         ("Discover", "Browsing Catalog")
+        ("Discover", "Browsing Catalog")
     } else {
-         ("Browsing", "In Stremio Menu")
+        ("Browsing", "In Stremio Menu")
     };
 
     let activity = Activity::new()
@@ -968,18 +1112,21 @@ impl MainWindow {
             // Make the title bar follow the Windows dark/light theme and
             // use Mica backdrop on Windows 11 for a modern translucent look.
             unsafe {
-                use winapi::um::dwmapi::{DwmSetWindowAttribute, DwmExtendFrameIntoClientArea};
-                use winapi::um::uxtheme::MARGINS;
-                use winapi::um::winreg::{RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_CURRENT_USER};
                 use winapi::shared::minwindef::{DWORD, HKEY};
+                use winapi::um::dwmapi::{DwmExtendFrameIntoClientArea, DwmSetWindowAttribute};
+                use winapi::um::uxtheme::MARGINS;
                 use winapi::um::winnt::KEY_READ;
+                use winapi::um::winreg::{
+                    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER,
+                };
 
                 // Read the system dark/light mode from the registry
                 let mut is_dark = true; // default to dark
-                let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
-                    .encode_utf16().collect();
-                let value_name: Vec<u16> = "AppsUseLightTheme\0"
-                    .encode_utf16().collect();
+                let subkey: Vec<u16> =
+                    "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+                        .encode_utf16()
+                        .collect();
+                let value_name: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
                 let mut hkey: HKEY = std::ptr::null_mut();
                 if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) == 0 {
                     let mut data: DWORD = 0;
@@ -991,7 +1138,8 @@ impl MainWindow {
                         std::ptr::null_mut(),
                         &mut data as *mut DWORD as *mut u8,
                         &mut data_size,
-                    ) == 0 {
+                    ) == 0
+                    {
                         // AppsUseLightTheme: 0 = dark, 1 = light
                         is_dark = data == 0;
                     }
@@ -1008,7 +1156,10 @@ impl MainWindow {
                     std::mem::size_of::<i32>() as u32,
                 );
                 if hr != 0 {
-                    eprintln!("[DWM] DwmSetWindowAttribute(IMMERSIVE_DARK_MODE) failed: 0x{:08X}", hr);
+                    eprintln!(
+                        "[DWM] DwmSetWindowAttribute(IMMERSIVE_DARK_MODE) failed: 0x{:08X}",
+                        hr
+                    );
                 }
 
                 // DWMWA_SYSTEMBACKDROP_TYPE (attribute 38) — Windows 11 22H2+
@@ -1022,7 +1173,10 @@ impl MainWindow {
                     std::mem::size_of::<i32>() as u32,
                 );
                 if hr != 0 {
-                    eprintln!("[DWM] DwmSetWindowAttribute(SYSTEMBACKDROP_TYPE) failed: 0x{:08X}", hr);
+                    eprintln!(
+                        "[DWM] DwmSetWindowAttribute(SYSTEMBACKDROP_TYPE) failed: 0x{:08X}",
+                        hr
+                    );
                 }
 
                 // Extend the frame into the client area — required for Mica
@@ -1041,11 +1195,21 @@ impl MainWindow {
             }
         }
 
-        let app_start_time = SystemTime::now();
-        spawn_discordrpc_loop(app_start_time);
-
-        self.window.set_visible(!self.start_hidden);
-        self.tray.tray_show_hide.set_checked(!self.start_hidden);
+        let sync_notice_sender = self.sync_notice.sender();
+        let sync_events_queue = self.sync_events.clone();
+        let (sync_event_tx, sync_event_rx) = flume::unbounded();
+        crate::stremio_app::steam_sync::set_ui_event_sender(sync_event_tx);
+        thread::spawn(move || loop {
+            match sync_event_rx.recv() {
+                Ok(event) => {
+                    if let Ok(mut events) = sync_events_queue.lock() {
+                        events.push_back(event);
+                    }
+                    sync_notice_sender.notice();
+                }
+                Err(_) => break,
+            }
+        });
 
         let player_channel = self.player.channel.borrow();
         let (player_tx, player_rx) = player_channel
@@ -1054,6 +1218,12 @@ impl MainWindow {
         let player_tx = player_tx.clone();
         let player_rx = player_rx.clone();
 
+        // Make the player command sender available globally for the sync client
+        use crate::stremio_app::stremio_player::player::PLAYER_CMD_TX;
+        if let Ok(mut tx_global) = PLAYER_CMD_TX.lock() {
+            *tx_global = Some(player_tx.clone());
+        }
+
         let web_channel = self.webview.channel.borrow();
         let (web_tx, web_rx) = web_channel
             .as_ref()
@@ -1061,7 +1231,21 @@ impl MainWindow {
         let web_tx_player = web_tx.clone();
         let web_tx_web = web_tx.clone();
         let web_tx_arg = web_tx.clone();
+
+        use crate::stremio_app::stremio_wevbiew::wevbiew::WEB_CMD_TX;
+        if let Ok(mut tx_global) = WEB_CMD_TX.lock() {
+            *tx_global = Some(web_tx.clone());
+        }
+
         let web_rx = web_rx.clone();
+
+        let app_start_time = SystemTime::now();
+        let auto_host_lobby = !self.command.starts_with("stremio://sync/");
+        spawn_discordrpc_loop(app_start_time, auto_host_lobby);
+        self.update_watch_party_menu();
+
+        self.window.set_visible(!self.start_hidden);
+        self.tray.tray_show_hide.set_checked(!self.start_hidden);
 
         let command_clone = self.command.clone();
 
@@ -1080,8 +1264,17 @@ impl MainWindow {
                     stream.read_to_end(&mut buf).ok();
                     if let Ok(s) = str::from_utf8(&buf) {
                         focus_sender.notice();
-                        // ['open-media', url]
-                        web_tx_arg.send(RPCResponse::open_media(s.to_string())).ok();
+                        let s_str = s.to_string();
+                        if s_str.starts_with("stremio://sync/") {
+                            use crate::stremio_app::steam_sync;
+                            match steam_sync::connect_to_host(&s_str) {
+                                Ok(_) => println!("✅ Sync client connected!"),
+                                Err(e) => eprintln!("⚠️ Failed to connect: {e}"),
+                            }
+                        } else {
+                            // ['open-media', url]
+                            web_tx_arg.send(RPCResponse::open_media(s_str)).ok();
+                        }
                         println!("{s}");
                     }
                 }
@@ -1114,6 +1307,37 @@ impl MainWindow {
                     }
                     Some("win-set-visibility") => toggle_fullscreen_sender.notice(),
                     Some("quit") => quit_sender.notice(),
+                    Some("shell-route-changed") => {
+                        if let Some(url) = msg.get_params().and_then(|arg| arg.as_str()) {
+                            if let Ok(mut current_url) = CURRENT_URL.lock() {
+                                *current_url = url.to_string();
+                            }
+                        }
+                    }
+                    Some("shell-watch-party-leave") => {
+                        if let Err(e) = crate::stremio_app::steam_sync::leave_lobby() {
+                            eprintln!("⚠️ Failed to leave watch party: {e}");
+                        }
+                    }
+                    Some("shell-watch-party-kick") => {
+                        let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
+                        if role == LobbyRole::Host {
+                            let steam_id = msg.get_params().and_then(|arg| {
+                                let value = arg.get("steamId")?;
+                                value
+                                    .as_str()
+                                    .and_then(|id| id.parse::<u64>().ok())
+                                    .or_else(|| value.as_u64())
+                            });
+                            if let Some(steam_id) = steam_id {
+                                if let Err(e) =
+                                    crate::stremio_app::steam_sync::kick_member(steam_id)
+                                {
+                                    eprintln!("⚠️ Failed to remove watch party member: {e}");
+                                }
+                            }
+                        }
+                    }
                     Some("app-ready") => {
                         hide_splash_sender.notice();
                         web_tx_web
@@ -1122,7 +1346,15 @@ impl MainWindow {
 
                         let command_ref = command_clone.clone();
                         if !command_ref.is_empty() {
-                            web_tx_web.send(RPCResponse::open_media(command_ref)).ok();
+                            if command_ref.starts_with("stremio://sync/") {
+                                use crate::stremio_app::steam_sync;
+                                match steam_sync::connect_to_host(&command_ref) {
+                                    Ok(_) => println!("✅ Sync client connected!"),
+                                    Err(e) => eprintln!("⚠️ Failed to connect: {e}"),
+                                }
+                            } else {
+                                web_tx_web.send(RPCResponse::open_media(command_ref)).ok();
+                            }
                         }
                     }
                     Some("app-error") => {
@@ -1234,6 +1466,372 @@ impl MainWindow {
             }
         }
     }
+    fn on_sync_notice(&self) {
+        let events = if let Ok(mut queue) = self.sync_events.lock() {
+            queue.drain(..).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        for event in events {
+            self.show_sync_event(event);
+        }
+        self.update_watch_party_menu();
+    }
+    fn show_sync_event(&self, event: crate::stremio_app::steam_sync::SyncUiEvent) {
+        use crate::stremio_app::steam_sync::SyncUiEvent;
+
+        let (title, text, flags) = match event {
+            SyncUiEvent::HostStarted => (
+                "Watch Party",
+                "Your watch party is ready. Friends can join from Discord.".to_string(),
+                nwg::TrayNotificationFlags::INFO_ICON,
+            ),
+            SyncUiEvent::JoinedHost => (
+                "Watch Party",
+                "Joined the watch party. Playback will sync with the host.".to_string(),
+                nwg::TrayNotificationFlags::INFO_ICON,
+            ),
+            SyncUiEvent::LobbyUpdated {
+                member_count,
+                max_size,
+            } => (
+                "Watch Party",
+                format!("Watch party {member_count}/{max_size}"),
+                nwg::TrayNotificationFlags::INFO_ICON,
+            ),
+            SyncUiEvent::GuestJoined { name, member_count } => (
+                "Watch Party",
+                format!("{name} joined. {member_count} people are in the watch party."),
+                nwg::TrayNotificationFlags::INFO_ICON,
+            ),
+            SyncUiEvent::GuestLeft { name, member_count } => (
+                "Watch Party",
+                format!("{name} left. {member_count} people remain in the watch party."),
+                nwg::TrayNotificationFlags::INFO_ICON,
+            ),
+            SyncUiEvent::HostLeft { reason } => (
+                "Watch Party Ended",
+                reason,
+                nwg::TrayNotificationFlags::WARNING_ICON,
+            ),
+            SyncUiEvent::LeftLobby => (
+                "Watch Party",
+                "Left the watch party.".to_string(),
+                nwg::TrayNotificationFlags::INFO_ICON,
+            ),
+            SyncUiEvent::Error { message } => (
+                "Watch Party Error",
+                message,
+                nwg::TrayNotificationFlags::ERROR_ICON,
+            ),
+        };
+
+        println!("Watch party UI event: {title}: {text}");
+        self.tray.tray.show(&text, Some(title), Some(flags), None);
+        self.flash_watch_party_notice();
+        self.update_watch_party_menu();
+        self.update_watch_party_overlay(Some(title), Some(&text));
+    }
+    fn flash_watch_party_notice(&self) {
+        if let Some(hwnd) = self.window.handle.hwnd() {
+            unsafe {
+                use winapi::um::winuser::{
+                    FlashWindowEx, FLASHWINFO, FLASHW_TIMERNOFG, FLASHW_TRAY,
+                };
+
+                let mut info = FLASHWINFO {
+                    cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                    hwnd,
+                    dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+                    uCount: 3,
+                    dwTimeout: 0,
+                };
+                FlashWindowEx(&mut info);
+            }
+        }
+    }
+    fn update_watch_party_menu(&self) {
+        let party_id = LOBBY_PARTY_ID.lock().map(|p| p.clone()).unwrap_or_default();
+        let member_count = LOBBY_MEMBER_COUNT.lock().map(|c| *c).unwrap_or(0);
+        let max_size = LOBBY_MAX_SIZE.lock().map(|m| *m).unwrap_or(8);
+        let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
+
+        if party_id.is_empty() || member_count <= 0 {
+            self.window.set_text(APP_NAME);
+            self.tray.tray_start_watch_party.set_enabled(true);
+            self.tray.tray_end_watch_party.set_enabled(false);
+            self.tray.tray_watch_party_status.set_enabled(false);
+            self.tray.tray_leave_watch_party.set_enabled(false);
+            self.tray.tray.set_tip("Stremio");
+        } else {
+            let role_label = match role {
+                LobbyRole::Host => "Hosting",
+                LobbyRole::Guest => "Joined",
+                LobbyRole::None => "Watch party",
+            };
+            let party_text = format!("{role_label} watch party {member_count}/{max_size}");
+
+            self.window.set_text(&format!("{APP_NAME} - {party_text}"));
+            self.tray.tray_start_watch_party.set_enabled(false);
+            self.tray
+                .tray_end_watch_party
+                .set_enabled(role == LobbyRole::Host);
+            self.tray.tray_watch_party_status.set_enabled(false);
+            self.tray
+                .tray_leave_watch_party
+                .set_enabled(role != LobbyRole::Host);
+            self.tray
+                .tray
+                .set_tip(&format!("Stremio - Watch party {member_count}/{max_size}"));
+        }
+        self.update_watch_party_overlay(None, None);
+    }
+    fn on_start_watch_party(&self) {
+        let party_id = LOBBY_PARTY_ID.lock().map(|p| p.clone()).unwrap_or_default();
+        if !party_id.is_empty() {
+            self.update_watch_party_menu();
+            return;
+        }
+
+        let config = load_or_create_config();
+        let party_id = format!("stremio-{}", uuid::Uuid::new_v4());
+        match crate::stremio_app::steam_sync::start_host_lobby(
+            party_id.clone(),
+            config.lobby_max_size,
+        ) {
+            Ok(join_secret) => {
+                if let Ok(mut pid) = LOBBY_PARTY_ID.lock() {
+                    *pid = party_id;
+                }
+                if let Ok(mut secret) = LOBBY_JOIN_SECRET.lock() {
+                    *secret = join_secret;
+                }
+                if let Ok(mut cnt) = LOBBY_MEMBER_COUNT.lock() {
+                    *cnt = 1;
+                }
+                if let Ok(mut max) = LOBBY_MAX_SIZE.lock() {
+                    *max = config.lobby_max_size;
+                }
+                self.update_watch_party_menu();
+                self.update_watch_party_overlay(
+                    Some("Watch Party"),
+                    Some("Your watch party is ready. Friends can join from Discord."),
+                );
+            }
+            Err(e) => {
+                self.tray.tray.show(
+                    &format!("Could not start watch party: {e}"),
+                    Some("Watch Party Error"),
+                    Some(nwg::TrayNotificationFlags::ERROR_ICON),
+                    None,
+                );
+                self.update_watch_party_overlay(Some("Watch Party Error"), Some(&e));
+                self.update_watch_party_menu();
+            }
+        }
+    }
+    fn on_end_watch_party(&self) {
+        let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
+        if role != LobbyRole::Host {
+            self.update_watch_party_menu();
+            return;
+        }
+
+        if let Err(e) = crate::stremio_app::steam_sync::leave_lobby() {
+            self.tray.tray.show(
+                &format!("Could not end watch party: {e}"),
+                Some("Watch Party Error"),
+                Some(nwg::TrayNotificationFlags::ERROR_ICON),
+                None,
+            );
+        }
+        self.update_watch_party_menu();
+    }
+    fn update_watch_party_overlay(&self, event_title: Option<&str>, event_text: Option<&str>) {
+        let party_id = LOBBY_PARTY_ID.lock().map(|p| p.clone()).unwrap_or_default();
+        let member_count = LOBBY_MEMBER_COUNT.lock().map(|c| *c).unwrap_or(0);
+        let max_size = LOBBY_MAX_SIZE.lock().map(|m| *m).unwrap_or(8);
+        let members = LOBBY_MEMBERS.lock().map(|m| m.clone()).unwrap_or_default();
+        let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
+        let active = !party_id.is_empty() && member_count > 0;
+        let role_label = match role {
+            LobbyRole::Host => "Hosting",
+            LobbyRole::Guest => "Joined",
+            LobbyRole::None => "Watch party",
+        };
+        let can_leave = active && role != LobbyRole::Host;
+        let badge = if active {
+            format!("{role_label} watch party {member_count}/{max_size}")
+        } else {
+            String::new()
+        };
+
+        let payload = serde_json::json!({
+            "active": active,
+            "badge": badge,
+            "canLeave": can_leave,
+            "canKick": active && role == LobbyRole::Host,
+            "members": members.iter().map(|member| {
+                serde_json::json!({
+                    "steamId": member.steam_id.to_string(),
+                    "name": member.name,
+                    "isHost": member.is_host,
+                })
+            }).collect::<Vec<_>>(),
+            "eventTitle": event_title,
+            "eventText": event_text,
+        });
+        let script = r##"(function() {
+                const state = __STREMIO_WATCH_PARTY_STATE__;
+                const id = "stremio-shell-watch-party";
+                let el = document.getElementById(id);
+                if (!state.active) {
+                    if (el) el.remove();
+                    return;
+                }
+                if (!el) {
+                    el = document.createElement("div");
+                    el.id = id;
+                    document.documentElement.appendChild(el);
+                }
+                if (!el.querySelector('[data-role="panel"]')) {
+                    el.style.cssText = [
+                        "position:fixed",
+                        "left:50%",
+                        "top:0",
+                        "transform:translateX(-50%)",
+                        "z-index:2147483647",
+                        "width:min(420px,calc(100vw - 40px))",
+                        "height:142px",
+                        "pointer-events:none"
+                    ].join(";");
+                    el.innerHTML = `
+                        <div data-role="hotspot" style="position:absolute;left:50%;top:0;transform:translateX(-50%);width:270px;height:30px;pointer-events:auto"></div>
+                        <div data-role="panel" style="
+                            position:absolute;
+                            left:50%;
+                            top:12px;
+                            transform:translate(-50%,-10px);
+                            width:100%;
+                            box-sizing:border-box;
+                            opacity:0;
+                            transition:opacity .16s ease,transform .16s ease;
+                            pointer-events:none;
+                            font:13px/1.35 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
+                            color:#f5f7fb;
+                            background:linear-gradient(135deg,rgba(19,22,34,.82),rgba(30,22,52,.74));
+                            border:1px solid rgba(142,105,255,.28);
+                            box-shadow:0 18px 60px rgba(0,0,0,.34),0 0 28px rgba(126,87,255,.12) inset;
+                            backdrop-filter:blur(18px);
+                            border-radius:8px;
+                            padding:11px 12px;
+                            overflow:hidden">
+                            <div style="display:flex;gap:10px;align-items:flex-start">
+                                <div style="width:9px;height:9px;border-radius:50%;background:#8b5cf6;box-shadow:0 0 12px rgba(139,92,246,.9);margin-top:5px;flex:0 0 auto"></div>
+                                <div style="min-width:0;flex:1">
+                                    <div data-role="badge" style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+                                    <div data-role="event" style="margin-top:3px;color:rgba(226,232,240,.78);overflow-wrap:anywhere"></div>
+                                </div>
+                                <button data-role="leave" style="display:none;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(255,255,255,.08);color:#f8fafc;padding:6px 9px;font:inherit;cursor:pointer;flex:0 0 auto">Leave</button>
+                            </div>
+                            <div data-role="members" style="display:grid;grid-template-columns:1fr;gap:5px;margin-top:10px;max-height:86px;overflow:auto"></div>
+                        </div>
+                    `;
+                    const panel = el.querySelector('[data-role="panel"]');
+                    const show = () => {
+                        panel.style.opacity = "1";
+                        panel.style.transform = "translate(-50%,0)";
+                        panel.style.pointerEvents = "auto";
+                    };
+                    const hide = () => {
+                        if (el.matches(":hover")) return;
+                        panel.style.opacity = "0";
+                        panel.style.transform = "translate(-50%,-10px)";
+                        panel.style.pointerEvents = "none";
+                    };
+                    el.querySelector('[data-role="hotspot"]').addEventListener("mouseenter", show);
+                    panel.addEventListener("mouseenter", show);
+                    el.addEventListener("mouseleave", () => setTimeout(hide, 120));
+                    el.__stremioWatchPartyShow = show;
+                    el.__stremioWatchPartyHide = hide;
+                    el.querySelector('[data-role="leave"]').addEventListener("click", () => {
+                        try {
+                            window.chrome.webview.postMessage(JSON.stringify({
+                                id: 1,
+                                args: ["shell-watch-party-leave"]
+                            }));
+                        } catch (_) {}
+                    });
+                }
+                el.querySelector('[data-role="badge"]').textContent = state.badge || "Watch party active";
+                const event = el.querySelector('[data-role="event"]');
+                const message = [state.eventTitle, state.eventText].filter(Boolean).join(": ");
+                event.textContent = message || "Playback sync is active.";
+                const leave = el.querySelector('[data-role="leave"]');
+                leave.style.display = state.canLeave ? "block" : "none";
+                const members = el.querySelector('[data-role="members"]');
+                members.innerHTML = "";
+                (state.members || []).forEach((member) => {
+                    const row = document.createElement("div");
+                    row.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;color:rgba(241,245,249,.9)";
+                    const dot = document.createElement("div");
+                    dot.style.cssText = `width:6px;height:6px;border-radius:50%;flex:0 0 auto;background:${member.isHost ? "#8b5cf6" : "#38bdf8"}`;
+                    const name = document.createElement("div");
+                    name.textContent = `${member.name || "Unknown"}${member.isHost ? " - Host" : ""}`;
+                    name.style.cssText = "min-width:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+                    row.appendChild(dot);
+                    row.appendChild(name);
+                    if (state.canKick && !member.isHost) {
+                        const kick = document.createElement("button");
+                        kick.textContent = "Remove";
+                        kick.style.cssText = "border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(239,68,68,.16);color:#fecaca;padding:4px 7px;font:inherit;cursor:pointer;flex:0 0 auto";
+                        kick.addEventListener("click", () => {
+                            try {
+                                window.chrome.webview.postMessage(JSON.stringify({
+                                    id: 1,
+                                    args: ["shell-watch-party-kick", { steamId: String(member.steamId) }]
+                                }));
+                            } catch (_) {}
+                        });
+                        row.appendChild(kick);
+                    }
+                    members.appendChild(row);
+                });
+                if (message && el.__stremioWatchPartyShow) {
+                    el.__stremioWatchPartyShow();
+                    clearTimeout(el.__stremioWatchPartyTimer);
+                    el.__stremioWatchPartyTimer = setTimeout(() => {
+                        if (el.__stremioWatchPartyHide) el.__stremioWatchPartyHide();
+                    }, 4200);
+                }
+            })();"##
+        .replace("__STREMIO_WATCH_PARTY_STATE__", &payload.to_string());
+
+        send_webview_script(&script);
+    }
+    fn on_leave_watch_party(&self) {
+        let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
+        if role == LobbyRole::Host {
+            self.tray.tray.show(
+                "The host keeps the watch party open. Guests can leave from their side.",
+                Some("Watch Party"),
+                Some(nwg::TrayNotificationFlags::INFO_ICON),
+                None,
+            );
+            return;
+        }
+
+        if let Err(e) = crate::stremio_app::steam_sync::leave_lobby() {
+            self.tray.tray.show(
+                &format!("Could not leave watch party: {e}"),
+                Some("Watch Party Error"),
+                Some(nwg::TrayNotificationFlags::ERROR_ICON),
+                None,
+            );
+        }
+        self.update_watch_party_menu();
+    }
     fn on_toggle_topmost(&self) {
         if let Some(hwnd) = self.window.handle.hwnd() {
             if let Ok(mut saved_style) = self.saved_window_style.try_borrow_mut() {
@@ -1305,9 +1903,7 @@ fn build_detail_activity(
         .large_text(&large_text);
 
     if config.show_small_image {
-        assets = assets
-            .small_image(ICON_URL)
-            .small_text("Stremio");
+        assets = assets.small_image(ICON_URL).small_text("Stremio");
     }
 
     let state_text = if media_type == "series" {
@@ -1316,9 +1912,16 @@ fn build_detail_activity(
         "Viewing Movie"
     };
 
-    let start_time = app_start_time
-        .duration_since(UNIX_EPOCH)?
-        .as_secs() as i64;
+    let start_time = app_start_time.duration_since(UNIX_EPOCH)?.as_secs() as i64;
+
+    // ── Pre-read lobby state (must outlive `activity`) ──
+    let lobby_party_id = LOBBY_PARTY_ID.lock().map(|p| p.clone()).unwrap_or_default();
+    let lobby_join_secret = LOBBY_JOIN_SECRET
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    let lobby_member_count = LOBBY_MEMBER_COUNT.lock().map(|c| *c).unwrap_or(1);
+    let lobby_max_size = LOBBY_MAX_SIZE.lock().map(|m| *m).unwrap_or(8);
 
     let mut activity = Activity::new()
         .activity_type(ActivityType::Watching)
@@ -1349,7 +1952,8 @@ fn build_detail_activity(
     let content_id = content_id_cow.as_ref();
 
     // Add buttons if needed (using string references)
-    let (external_url, stremio_url, button_label) = if config.show_buttons && !content_id.is_empty() {
+    let (external_url, stremio_url, button_label) = if config.show_buttons && !content_id.is_empty()
+    {
         let (label, url) = if content_id.starts_with("kitsu:") {
             let id_part = content_id.trim_start_matches("kitsu:");
             ("Kitsu", format!("https://kitsu.app/anime/{}", id_part))
@@ -1368,10 +1972,23 @@ fn build_detail_activity(
     };
 
     if let (Some(external), Some(stremio)) = (&external_url, &stremio_url) {
-        activity = activity.buttons(vec![
-            Button::new(button_label, external),
-            Button::new("Open in Stremio", stremio),
-        ]);
+        if lobby_party_id.is_empty() {
+            activity = activity.buttons(vec![
+                Button::new(button_label, external),
+                Button::new("Open in Stremio", stremio),
+            ]);
+        }
+    }
+
+    // ── Attach lobby party + join secret ──
+    if !lobby_party_id.is_empty() {
+        activity = activity
+            .party(
+                Party::new()
+                    .id(&lobby_party_id)
+                    .size([lobby_member_count, lobby_max_size]),
+            )
+            .secrets(Secrets::new().join(&lobby_join_secret));
     }
 
     drp.set_activity(activity)?;
