@@ -102,4 +102,7 @@ impl RPCResponse {
     pub fn open_media(url: String) -> String {
         Self::response_message(Some(json!(["open-media", url])))
     }
+    pub fn update_available() -> String {
+        Self::response_message(Some(json!(["autoupdater-show-notif"])))
+    }
 }

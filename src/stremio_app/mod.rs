@@ -8,6 +8,7 @@ pub use ipc::RPCResponse;
 pub mod named_pipe;
 pub mod splash;
 pub mod systray;
+pub mod updater;
 pub mod window_helper;
 pub use named_pipe::{PipeClient, PipeServer};
 pub mod constants;

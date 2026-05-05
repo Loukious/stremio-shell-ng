@@ -65,7 +65,7 @@ pub static LOBBY_MEMBERS: Lazy<Mutex<Vec<crate::stremio_app::sync_protocol::Lobb
 /// Whether this app owns the lobby or joined someone else's lobby.
 pub static LOBBY_ROLE: Lazy<Mutex<LobbyRole>> = Lazy::new(|| Mutex::new(LobbyRole::None));
 use crate::stremio_app::{
-    constants::{APP_NAME, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH},
+    constants::{APP_NAME, UPDATE_ENDPOINT, UPDATE_INTERVAL, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH},
     ipc::{RPCRequest, RPCResponse},
     splash::SplashImage,
     stremio_player::{
@@ -74,6 +74,7 @@ use crate::stremio_app::{
     },
     stremio_wevbiew::{wevbiew::CURRENT_URL, WebView},
     systray::SystemTray,
+    updater,
     window_helper::WindowStyle,
     PipeServer,
 };
@@ -1231,6 +1232,7 @@ impl MainWindow {
         let web_tx_player = web_tx.clone();
         let web_tx_web = web_tx.clone();
         let web_tx_arg = web_tx.clone();
+        let web_tx_upd = web_tx.clone();
 
         use crate::stremio_app::stremio_wevbiew::wevbiew::WEB_CMD_TX;
         if let Ok(mut tx_global) = WEB_CMD_TX.lock() {
@@ -1238,6 +1240,8 @@ impl MainWindow {
         }
 
         let web_rx = web_rx.clone();
+        let (updater_tx, updater_rx) = flume::unbounded::<String>();
+        let updater_tx_web = updater_tx.clone();
 
         let app_start_time = SystemTime::now();
         let auto_host_lobby = !self.command.starts_with("stremio://sync/");
@@ -1280,6 +1284,37 @@ impl MainWindow {
                 }
             });
         }
+
+        let autoupdater_setup_file = self.autoupdater_setup_file.clone();
+        thread::spawn(move || {
+            while let Ok(msg) = updater_rx.recv() {
+                if msg == "check_for_update" {
+                    break;
+                }
+            }
+
+            loop {
+                let current_version = env!("CARGO_PKG_VERSION")
+                    .parse()
+                    .expect("Should always be valid");
+                let updater_endpoint =
+                    url::Url::parse(UPDATE_ENDPOINT).expect("Should always be a valid URL");
+                let updater = updater::Updater::new(current_version, &updater_endpoint);
+
+                match updater.autoupdate() {
+                    Ok(Some(update)) => {
+                        println!("New version ready to install v{}", update.version);
+                        let mut autoupdater_setup_file = autoupdater_setup_file.lock().unwrap();
+                        *autoupdater_setup_file = Some(update.file.clone());
+                        web_tx_upd.send(RPCResponse::update_available()).ok();
+                    }
+                    Ok(None) => println!("No new updates found"),
+                    Err(e) => eprintln!("Failed to fetch updates: {e}"),
+                }
+
+                thread::sleep(Duration::from_secs(UPDATE_INTERVAL));
+            }
+        });
 
         // Read message from player
         thread::spawn(move || loop {
@@ -1343,6 +1378,9 @@ impl MainWindow {
                         web_tx_web
                             .send(RPCResponse::visibility_change(true, 1, false))
                             .ok();
+                        updater_tx_web
+                            .send("check_for_update".to_owned())
+                            .expect("Failed to send value to updater channel");
 
                         let command_ref = command_clone.clone();
                         if !command_ref.is_empty() {

@@ -1,0 +1,128 @@
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+};
+
+use anyhow::{anyhow, Context};
+use semver::{Version, VersionReq};
+use serde::Deserialize;
+use url::Url;
+
+#[derive(Debug, Clone)]
+pub struct Update {
+    pub version: Version,
+    pub file: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct Updater {
+    pub current_version: Version,
+    pub next_version: VersionReq,
+    pub endpoint: Url,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    prerelease: bool,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: Url,
+}
+
+impl Updater {
+    pub fn new(current_version: Version, updater_endpoint: &Url) -> Self {
+        Self {
+            next_version: VersionReq::parse(&format!(">{current_version}"))
+                .expect("Version is type-safe"),
+            current_version,
+            endpoint: updater_endpoint.clone(),
+        }
+    }
+
+    pub fn autoupdate(&self) -> Result<Option<Update>, anyhow::Error> {
+        println!("Fetching updates for v{}", self.current_version);
+        println!("Using updater endpoint {}", &self.endpoint);
+
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("stremio-shell-ng")
+            .build()?;
+        let release = client
+            .get(self.endpoint.clone())
+            .send()?
+            .error_for_status()?
+            .json::<GitHubRelease>()?;
+
+        let version = Version::parse(release.tag_name.trim_start_matches('v'))?;
+        if release.prerelease || !version.pre.is_empty() {
+            println!("Skipping prerelease v{version}");
+            return Ok(None);
+        }
+
+        if !self.next_version.matches(&version) {
+            println!("No new releases found that match {}", self.next_version);
+            return Ok(None);
+        }
+
+        let installer = release
+            .assets
+            .iter()
+            .find(|asset| {
+                let name = asset.name.to_ascii_lowercase();
+                name.ends_with(".exe") && name.contains("setup")
+            })
+            .or_else(|| {
+                release
+                    .assets
+                    .iter()
+                    .find(|asset| asset.name.to_ascii_lowercase().ends_with(".exe"))
+            })
+            .context("No Windows installer asset found in the latest GitHub release")?;
+
+        let temp_dir = std::env::temp_dir();
+        let dest = temp_dir.join(&installer.name);
+        println!(
+            "Downloading {} to {}",
+            installer.browser_download_url,
+            dest.display()
+        );
+
+        let mut installer_response = client
+            .get(installer.browser_download_url.clone())
+            .send()?
+            .error_for_status()?;
+        let size = installer_response.content_length();
+        let mut downloaded: u64 = 0;
+
+        let mut chunk = [0u8; 8192];
+        let mut file = std::fs::File::create(&dest)?;
+        loop {
+            let chunk_size = installer_response.read(&mut chunk)?;
+            if chunk_size == 0 {
+                break;
+            }
+            file.write_all(&chunk[..chunk_size])?;
+            if let Some(size) = size {
+                downloaded += chunk_size as u64;
+                print!("\rProgress: {}%", downloaded * 100 / size);
+            } else {
+                print!(".");
+            }
+            std::io::stdout().flush().ok();
+        }
+        println!();
+
+        if !dest.exists() {
+            return Err(anyhow!("Installer download did not produce a file"));
+        }
+
+        Ok(Some(Update {
+            version,
+            file: dest,
+        }))
+    }
+}
