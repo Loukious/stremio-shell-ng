@@ -2,6 +2,8 @@
 * Has Discord Rich Presence support
     * Default look:
     ![General view](https://i.imgur.com/jBWs2PC.png)
+* Watch Party support through Steam networking
+    * See the [Watch Party Guide](wiki/watch-party.md) for hosting, joining, and troubleshooting
 * Media Keys and Windows Media Overlay support:
     * Play/Pause
     * Seek forward/backward
