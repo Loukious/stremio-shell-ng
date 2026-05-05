@@ -70,9 +70,12 @@ impl PartialUi for WebView {
         let tx_fs = tx_web.clone();
         data.channel = RefCell::new(Some((tx, rx_web)));
 
-        let parent = parent.expect("No parent window").into();
+        let parent = parent.ok_or_else(|| nwg::NwgError::no_parent("WebView"))?;
+        let parent = parent.into();
 
-        let hwnd = parent.hwnd().expect("Cannot obtain window handle");
+        let hwnd = parent
+            .hwnd()
+            .ok_or_else(|| nwg::NwgError::control_create("Cannot obtain WebView window handle"))?;
         nwg::Notice::builder()
             .parent(parent)
             .build(&mut data.notice)
