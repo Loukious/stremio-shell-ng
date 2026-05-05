@@ -1041,9 +1041,9 @@ checksum = "7fc7aa29613bd6a620df431842069224d8bc9011086b1db4c0e0cd47fa03ec9a"
 
 [[package]]
 name = "libmpv2"
-version = "4.1.0"
+version = "5.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e0c3802b4bb1a18adbf5659b078ce24cb8e16c79ff695557f4e10af2a44722a"
+checksum = "88dc8432d3de09ed6e343488d6b208467db6801fb41971a1f726fa2248302fe5"
 dependencies = [
  "libmpv2-sys",
 ]
@@ -1793,9 +1793,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "steamworks"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0974cb1b6b5588f788a3edcb7e6e5e964388ae9d317c723b1009d2699790f66d"
+checksum = "5ff29921f6a7e8c85b0c971ec3c42002b9f535e3b8f4358cb22911d43709739a"
 dependencies = [
  "bitflags 2.11.1",
  "paste",

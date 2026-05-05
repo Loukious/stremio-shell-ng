@@ -30,7 +30,6 @@ impl PlayerProprChange {
                     serde_json::Value::String(s.to_string())
                 }
             }
-            PropertyData::Node(_) => unimplemented!("`PropertyData::Node` is not supported"),
         }
     }
     pub fn from_name_value(name: String, value: PropertyData) -> Self {

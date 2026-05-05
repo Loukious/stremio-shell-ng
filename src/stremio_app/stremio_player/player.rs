@@ -2,7 +2,7 @@ use crate::stremio_app::ipc;
 use crate::stremio_app::RPCResponse;
 use flume::{Receiver, Sender};
 use libmpv2::events::PropertyData;
-use libmpv2::{events::Event, events::EventContext, Format, Mpv, SetData};
+use libmpv2::{events::Event, Format, Mpv, SetData};
 use native_windows_gui::{self as nwg, PartialUi};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
@@ -74,7 +74,7 @@ impl PartialUi for Player {
     }
 }
 
-fn create_shareable_mpv(window_handle: HWND) -> Arc<Mpv> {
+fn create_shareable_mpv(window_handle: HWND) -> Arc<Mutex<Mpv>> {
     let mpv = Mpv::with_initializer(|initializer| {
         macro_rules! set_property {
             ($name:literal, $value:expr) => {
@@ -98,76 +98,79 @@ fn create_shareable_mpv(window_handle: HWND) -> Arc<Mpv> {
         // set_property!("vo", "gpu-next,");
         Ok(())
     });
-    Arc::new(mpv.expect("cannot build MPV"))
+    Arc::new(Mutex::new(mpv.expect("cannot build MPV")))
 }
 
 fn create_event_thread(
-    mpv: Arc<Mpv>,
+    mpv: Arc<Mutex<Mpv>>,
     observe_property_receiver: Receiver<ObserveProperty>,
     rpc_response_sender: Sender<String>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut event_context = EventContext::new(mpv.ctx);
-        event_context
+        mpv.lock()
+            .expect("MPV lock is poisoned")
             .disable_deprecated_events()
             .expect("failed to disable deprecated MPV events");
 
         loop {
             // Drain newly observed properties
             for ObserveProperty { name, format } in observe_property_receiver.drain() {
-                event_context
+                mpv.lock()
+                    .expect("MPV lock is poisoned")
                     .observe_property(&name, format, 0)
                     .expect("failed to observe MPV property");
             }
 
-            // -1.0 means to block and wait for an event.
-            let event = match event_context.wait_event(-1.) {
-                Some(Ok(event)) => event,
-                Some(Err(error)) => {
-                    eprintln!("Event errored: {error:?}");
-                    continue;
-                }
-                None => continue,
-            };
+            let player_response = {
+                let mut mpv = mpv.lock().expect("MPV lock is poisoned");
+                let event = match mpv.wait_event(0.1) {
+                    Some(Ok(event)) => event,
+                    Some(Err(error)) => {
+                        eprintln!("Event errored: {error:?}");
+                        continue;
+                    }
+                    None => continue,
+                };
 
-            let player_response = match event {
-                Event::PropertyChange { name, change, .. } => {
-                    // `change` is a plain `PropertyData`, not an Option
-                    if name == "time-pos" {
-                        // If it's a Double, print it
-                        if let PropertyData::Double(pos_secs) = change {
-                            *CURRENT_TIME.lock().unwrap() = pos_secs;
+                match event {
+                    Event::PropertyChange { name, change, .. } => {
+                        // `change` is a plain `PropertyData`, not an Option
+                        if name == "time-pos" {
+                            // If it's a Double, print it
+                            if let PropertyData::Double(pos_secs) = change {
+                                *CURRENT_TIME.lock().unwrap() = pos_secs;
+                            }
                         }
-                    }
-                    if name == "duration" {
-                        if let PropertyData::Double(dur_secs) = change {
-                            *TOTAL_DURATION.lock().unwrap() = dur_secs;
+                        if name == "duration" {
+                            if let PropertyData::Double(dur_secs) = change {
+                                *TOTAL_DURATION.lock().unwrap() = dur_secs;
+                            }
                         }
-                    }
-                    if name == "pause" {
-                        if let PropertyData::Flag(pause) = change {
-                            *IS_PAUSED.lock().unwrap() = pause;
+                        if name == "pause" {
+                            if let PropertyData::Flag(pause) = change {
+                                *IS_PAUSED.lock().unwrap() = pause;
+                            }
                         }
-                    }
 
-                    // Because from_name_value expects `PropertyData`,
-                    // just pass `change` directly:
-                    PlayerResponse(
-                        "mpv-prop-change",
-                        PlayerEvent::PropChange(PlayerProprChange::from_name_value(
-                            name.to_string(),
-                            change,
-                        )),
-                    )
+                        // Because from_name_value expects `PropertyData`,
+                        // just pass `change` directly:
+                        PlayerResponse(
+                            "mpv-prop-change",
+                            PlayerEvent::PropChange(PlayerProprChange::from_name_value(
+                                name.to_string(),
+                                change,
+                            )),
+                        )
+                    }
+                    Event::EndFile(reason) => PlayerResponse(
+                        "mpv-event-ended",
+                        PlayerEvent::End(PlayerEnded::from_end_reason(reason)),
+                    ),
+                    Event::Shutdown => {
+                        break;
+                    }
+                    _ => continue,
                 }
-                Event::EndFile(reason) => PlayerResponse(
-                    "mpv-event-ended",
-                    PlayerEvent::End(PlayerEnded::from_end_reason(reason)),
-                ),
-                Event::Shutdown => {
-                    break;
-                }
-                _ => continue,
             };
 
             rpc_response_sender
@@ -178,7 +181,7 @@ fn create_event_thread(
 }
 
 fn create_message_thread(
-    mpv: Arc<Mpv>,
+    mpv: Arc<Mutex<Mpv>>,
     observe_property_sender: Sender<ObserveProperty>,
     in_msg_receiver: Receiver<String>,
 ) -> JoinHandle<()> {
@@ -202,7 +205,7 @@ fn create_message_thread(
                     format: Format::Flag,
                 })
                 .expect("cannot send ObserveProperty");
-            mpv.wake_up();
+            mpv.lock().expect("MPV lock is poisoned").wake_up();
         }
 
         // -- Helpers --
@@ -211,49 +214,45 @@ fn create_message_thread(
             observe_property_sender
                 .send(ObserveProperty { name, format })
                 .expect("cannot send ObserveProperty");
-            mpv.wake_up();
+            mpv.lock().expect("MPV lock is poisoned").wake_up();
         };
 
         let send_command = |cmd: CmdVal| {
-            let a1;
-            let a2;
-            let a3;
-            let a4;
+            let args: Vec<String>;
             let (name, args) = match cmd {
                 CmdVal::Quintuple(name, arg1, arg2, arg3, arg4) => {
-                    a1 = format!(r#""{arg1}""#);
-                    a2 = format!(r#""{arg2}""#);
-                    a3 = format!(r#""{arg3}""#);
-                    a4 = format!(r#""{arg4}""#);
-                    (
-                        name,
-                        vec![a1.as_ref(), a2.as_ref(), a3.as_ref(), a4.as_ref()],
-                    )
+                    args = vec![arg1, arg2, arg3, arg4];
+                    (name, args.iter().map(String::as_str).collect::<Vec<_>>())
                 }
                 CmdVal::Quadruple(name, arg1, arg2, arg3) => {
-                    a1 = format!(r#""{arg1}""#);
-                    a2 = format!(r#""{arg2}""#);
-                    a3 = format!(r#""{arg3}""#);
-                    (name, vec![a1.as_ref(), a2.as_ref(), a3.as_ref()])
+                    args = vec![arg1, arg2, arg3];
+                    (name, args.iter().map(String::as_str).collect::<Vec<_>>())
                 }
                 CmdVal::Tripple(name, arg1, arg2) => {
-                    a1 = format!(r#""{arg1}""#);
-                    a2 = format!(r#""{arg2}""#);
-                    (name, vec![a1.as_ref(), a2.as_ref()])
+                    args = vec![arg1, arg2];
+                    (name, args.iter().map(String::as_str).collect::<Vec<_>>())
                 }
                 CmdVal::Double(name, arg1) => {
-                    a1 = format!(r#""{arg1}""#);
-                    (name, vec![a1.as_ref()])
+                    args = vec![arg1];
+                    (name, args.iter().map(String::as_str).collect::<Vec<_>>())
                 }
                 CmdVal::Single((name,)) => (name, vec![]),
             };
-            if let Err(error) = mpv.command(&name.to_string(), &args) {
+            if let Err(error) = mpv
+                .lock()
+                .expect("MPV lock is poisoned")
+                .command(&name.to_string(), &args)
+            {
                 eprintln!("failed to execute MPV command: '{error:#}'")
             }
         };
 
-        fn set_property(name: impl ToString, value: impl SetData, mpv: &Mpv) {
-            if let Err(error) = mpv.set_property(&name.to_string(), value) {
+        fn set_property(name: impl ToString, value: impl SetData, mpv: &Arc<Mutex<Mpv>>) {
+            if let Err(error) = mpv
+                .lock()
+                .expect("MPV lock is poisoned")
+                .set_property(&name.to_string(), value)
+            {
                 eprintln!("cannot set MPV property: '{error:#}'")
             }
         }
