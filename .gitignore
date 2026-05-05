@@ -1,3 +1,4 @@
 /target
-/stremio*.exe
-/libmpv-2.dll
+bin/libmpv-2.dll
+/bin/backup
+StremioSetup*.exe
