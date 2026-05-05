@@ -1519,16 +1519,18 @@ impl MainWindow {
     fn show_sync_event(&self, event: crate::stremio_app::steam_sync::SyncUiEvent) {
         use crate::stremio_app::steam_sync::SyncUiEvent;
 
-        let (title, text, flags) = match event {
+        let (title, text, flags, show_dialog) = match event {
             SyncUiEvent::HostStarted => (
                 "Watch Party",
                 "Your watch party is ready. Friends can join from Discord.".to_string(),
                 nwg::TrayNotificationFlags::INFO_ICON,
+                false,
             ),
             SyncUiEvent::JoinedHost => (
                 "Watch Party",
                 "Joined the watch party. Playback will sync with the host.".to_string(),
                 nwg::TrayNotificationFlags::INFO_ICON,
+                false,
             ),
             SyncUiEvent::LobbyUpdated {
                 member_count,
@@ -1537,31 +1539,37 @@ impl MainWindow {
                 "Watch Party",
                 format!("Watch party {member_count}/{max_size}"),
                 nwg::TrayNotificationFlags::INFO_ICON,
+                false,
             ),
             SyncUiEvent::GuestJoined { name, member_count } => (
                 "Watch Party",
                 format!("{name} joined. {member_count} people are in the watch party."),
                 nwg::TrayNotificationFlags::INFO_ICON,
+                false,
             ),
             SyncUiEvent::GuestLeft { name, member_count } => (
                 "Watch Party",
                 format!("{name} left. {member_count} people remain in the watch party."),
                 nwg::TrayNotificationFlags::INFO_ICON,
+                false,
             ),
             SyncUiEvent::HostLeft { reason } => (
                 "Watch Party Ended",
                 reason,
                 nwg::TrayNotificationFlags::WARNING_ICON,
+                false,
             ),
             SyncUiEvent::LeftLobby => (
                 "Watch Party",
                 "Left the watch party.".to_string(),
                 nwg::TrayNotificationFlags::INFO_ICON,
+                false,
             ),
             SyncUiEvent::Error { message } => (
                 "Watch Party Error",
                 message,
                 nwg::TrayNotificationFlags::ERROR_ICON,
+                true,
             ),
         };
 
@@ -1570,6 +1578,9 @@ impl MainWindow {
         self.flash_watch_party_notice();
         self.update_watch_party_menu();
         self.update_watch_party_overlay(Some(title), Some(&text));
+        if show_dialog {
+            nwg::modal_error_message(self.window.handle, title, &text);
+        }
     }
     fn flash_watch_party_notice(&self) {
         if let Some(hwnd) = self.window.handle.hwnd() {
@@ -1699,12 +1710,16 @@ impl MainWindow {
         let can_leave = active && role != LobbyRole::Host;
         let badge = if active {
             format!("{role_label} watch party {member_count}/{max_size}")
+        } else if let Some(title) = event_title {
+            title.to_string()
         } else {
             String::new()
         };
+        let visible = active || event_title.is_some() || event_text.is_some();
 
         let payload = serde_json::json!({
             "active": active,
+            "visible": visible,
             "badge": badge,
             "canLeave": can_leave,
             "canKick": active && role == LobbyRole::Host,
@@ -1722,7 +1737,7 @@ impl MainWindow {
                 const state = __STREMIO_WATCH_PARTY_STATE__;
                 const id = "stremio-shell-watch-party";
                 let el = document.getElementById(id);
-                if (!state.active) {
+                if (!state.visible) {
                     if (el) el.remove();
                     return;
                 }
@@ -1800,10 +1815,10 @@ impl MainWindow {
                         } catch (_) {}
                     });
                 }
-                el.querySelector('[data-role="badge"]').textContent = state.badge || "Watch party active";
+                el.querySelector('[data-role="badge"]').textContent = state.badge || "Watch Party";
                 const event = el.querySelector('[data-role="event"]');
                 const message = [state.eventTitle, state.eventText].filter(Boolean).join(": ");
-                event.textContent = message || "Playback sync is active.";
+                event.textContent = message || (state.active ? "Playback sync is active." : "");
                 const leave = el.querySelector('[data-role="leave"]');
                 leave.style.display = state.canLeave ? "block" : "none";
                 const members = el.querySelector('[data-role="members"]');

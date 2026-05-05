@@ -176,12 +176,13 @@ pub fn start_host_lobby(party_id: String, max_size: i32) -> Result<String, Strin
 
 pub fn connect_to_host(join_secret: &str) -> Result<(), String> {
     let secret = decode_steam_join_secret(join_secret)?;
+    let tx = ensure_runtime()?;
+
     set_lobby_identity(&secret.party_id, join_secret);
     set_lobby_counts(1, 0);
     set_lobby_members(Vec::new());
     set_lobby_role(LobbyRole::Guest);
 
-    let tx = ensure_runtime()?;
     let (reply_tx, reply_rx) = flume::bounded(1);
 
     tx.send(RuntimeCommand::JoinHost {
@@ -213,45 +214,37 @@ fn ensure_runtime() -> Result<Sender<RuntimeCommand>, String> {
     }
 
     let (tx, rx) = flume::unbounded();
+    let (init_tx, init_rx) = flume::bounded(1);
     thread::Builder::new()
         .name("steam-sync-runtime".to_string())
-        .spawn(move || run_runtime(rx))
+        .spawn(move || run_runtime(rx, init_tx))
         .map_err(|e| format!("failed to spawn Steam sync runtime: {e}"))?;
+
+    match init_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(e) => return Err(format!("timed out initializing Steam sync runtime: {e}")),
+    }
+
     *guard = Some(tx.clone());
 
     Ok(tx)
 }
 
-fn run_runtime(rx: Receiver<RuntimeCommand>) {
+fn run_runtime(rx: Receiver<RuntimeCommand>, init_tx: Sender<Result<(), String>>) {
     let client = match steamworks::Client::init_app(STEAM_SYNC_APP_ID) {
         Ok(client) => client,
         Err(e) => {
-            eprintln!("Steam sync unavailable: {e:?}");
-            for command in rx.iter() {
-                match command {
-                    RuntimeCommand::StartHost { reply, .. } => {
-                        let message = format!("Steam API init failed: {e:?}");
-                        emit_ui_event(SyncUiEvent::Error {
-                            message: message.clone(),
-                        });
-                        let _ = reply.send(Err(message));
-                    }
-                    RuntimeCommand::JoinHost { reply, .. } => {
-                        let message = format!("Steam API init failed: {e:?}");
-                        emit_ui_event(SyncUiEvent::Error {
-                            message: message.clone(),
-                        });
-                        let _ = reply.send(Err(message));
-                    }
-                    RuntimeCommand::Kick { .. } => emit_ui_event(SyncUiEvent::Error {
-                        message: format!("Steam API init failed: {e:?}"),
-                    }),
-                    RuntimeCommand::Leave => emit_ui_event(SyncUiEvent::LeftLobby),
-                }
-            }
+            let message = steam_init_error_message(&e);
+            eprintln!("Steam sync unavailable: {message}");
+            emit_ui_event(SyncUiEvent::Error {
+                message: message.clone(),
+            });
+            let _ = init_tx.send(Err(message));
             return;
         }
     };
+    let _ = init_tx.send(Ok(()));
 
     client.networking_utils().init_relay_network_access();
 
@@ -314,6 +307,23 @@ fn run_runtime(rx: Receiver<RuntimeCommand>) {
         update_session_policy(&session_policy, &mode);
 
         thread::sleep(Duration::from_millis(30));
+    }
+}
+
+fn steam_init_error_message(error: &steamworks::SteamAPIInitError) -> String {
+    match error {
+        steamworks::SteamAPIInitError::NoSteamClient(_) => {
+            "Steam is not running. Open Steam, sign in, then try starting the watch party again."
+                .to_string()
+        }
+        steamworks::SteamAPIInitError::VersionMismatch(_) => {
+            "Steam needs to update before watch parties can use Steam networking. Update or restart Steam, then try again."
+                .to_string()
+        }
+        steamworks::SteamAPIInitError::FailedGeneric(_) => {
+            "Steam networking could not be initialized. Make sure Steam is open and signed in, then try again."
+                .to_string()
+        }
     }
 }
 
