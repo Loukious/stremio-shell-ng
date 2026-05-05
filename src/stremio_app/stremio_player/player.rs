@@ -134,11 +134,11 @@ impl PartialUi for Player {
     ) -> Result<(), nwg::NwgError> {
         // @TODO replace all `expect`s with proper error handling?
 
+        let parent = parent.ok_or_else(|| nwg::NwgError::no_parent("Player"))?;
         let window_handle = parent
-            .expect("no parent window")
             .into()
             .hwnd()
-            .expect("cannot obtain window handle");
+            .ok_or_else(|| nwg::NwgError::control_create("Cannot obtain player window handle"))?;
 
         let (in_msg_sender, in_msg_receiver) = flume::unbounded();
         let (rpc_response_sender, rpc_response_receiver) = flume::unbounded();
