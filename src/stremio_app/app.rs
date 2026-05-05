@@ -961,41 +961,42 @@ fn build_menu_activity(
 
 impl MainWindow {
     fn transmit_window_visibility_change(&self) {
-        if let (Ok(web_channel), Ok(style)) = (
-            self.webview.channel.try_borrow(),
-            self.saved_window_style.try_borrow(),
-        ) {
-            let (web_tx, _) = web_channel
-                .as_ref()
-                .expect("Cannont obtain communication channel for the Web UI");
-            let web_tx_app = web_tx.clone();
-            web_tx_app
-                .send(RPCResponse::visibility_change(
-                    self.window.visible(),
-                    style.full_screen as u32,
-                    style.full_screen,
-                ))
-                .ok();
-        } else {
-            eprintln!("Cannot obtain communication channel or window style");
-        }
+        let Ok(web_channel) = self.webview.channel.try_borrow() else {
+            return;
+        };
+        let Ok(style) = self.saved_window_style.try_borrow() else {
+            return;
+        };
+        let Some((web_tx, _)) = web_channel.as_ref() else {
+            return;
+        };
+
+        let web_tx_app = web_tx.clone();
+        web_tx_app
+            .send(RPCResponse::visibility_change(
+                self.window.visible(),
+                style.full_screen as u32,
+                style.full_screen,
+            ))
+            .ok();
     }
     fn transmit_window_state_change(&self) {
-        if let (Some(hwnd), Ok(web_channel), Ok(style)) = (
-            self.window.handle.hwnd(),
-            self.webview.channel.try_borrow(),
-            self.saved_window_style.try_borrow(),
-        ) {
-            let state = style.clone().get_window_state(hwnd);
-            drop(style);
-            let (web_tx, _) = web_channel
-                .as_ref()
-                .expect("Cannont obtain communication channel for the Web UI");
-            let web_tx_app = web_tx.clone();
-            web_tx_app.send(RPCResponse::state_change(state)).ok();
-        } else {
-            eprintln!("Cannot obtain window handle or communication channel");
-        }
+        let Some(hwnd) = self.window.handle.hwnd() else {
+            return;
+        };
+        let Ok(web_channel) = self.webview.channel.try_borrow() else {
+            return;
+        };
+        let Ok(style) = self.saved_window_style.try_borrow() else {
+            return;
+        };
+        let Some((web_tx, _)) = web_channel.as_ref() else {
+            return;
+        };
+
+        let state = style.clone().get_window_state(hwnd);
+        let web_tx_app = web_tx.clone();
+        web_tx_app.send(RPCResponse::state_change(state)).ok();
     }
     fn on_init(&self) {
         let webui_url =
@@ -1130,9 +1131,15 @@ impl MainWindow {
         });
 
         let player_channel = self.player.channel.borrow();
-        let (player_tx, player_rx) = player_channel
-            .as_ref()
-            .expect("Cannont obtain communication channel for the Player");
+        let Some((player_tx, player_rx)) = player_channel.as_ref() else {
+            nwg::modal_error_message(
+                self.window.handle,
+                "Stremio Startup Error",
+                "Cannot initialize the player communication channel. Stremio will close.",
+            );
+            nwg::stop_thread_dispatch();
+            return;
+        };
         let player_tx = player_tx.clone();
         let player_rx = player_rx.clone();
 
@@ -1143,9 +1150,15 @@ impl MainWindow {
         }
 
         let web_channel = self.webview.channel.borrow();
-        let (web_tx, web_rx) = web_channel
-            .as_ref()
-            .expect("Cannont obtain communication channel for the Web UI");
+        let Some((web_tx, web_rx)) = web_channel.as_ref() else {
+            nwg::modal_error_message(
+                self.window.handle,
+                "Stremio Startup Error",
+                "Cannot initialize the Web UI communication channel. Stremio will close.",
+            );
+            nwg::stop_thread_dispatch();
+            return;
+        };
         let web_tx_player = web_tx.clone();
         let web_tx_web = web_tx.clone();
         let web_tx_arg = web_tx.clone();
