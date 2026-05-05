@@ -1,10 +1,7 @@
 ## Stremio shell fork with few extra features
 * Has Discord Rich Presence support
     * Default look:
-    ![General view](https://i.imgur.com/rcvtzjs.png)
-* With my [Vencord fork](https://github.com/Loukious/Vencord) you can make it look even better:
-    * Enable the "BetterStremioActivity" plugin
-    ![Vencord](https://i.imgur.com/Nwa62Nw.png)
+    ![General view](https://i.imgur.com/jBWs2PC.png)
 * Media Keys and Windows Media Overlay support:
     * Play/Pause
     * Seek forward/backward
@@ -13,7 +10,7 @@
 * Unlocked MPV config:
     * You can change the MPV config by editing the `mpv.conf` file in the app's data directory
     * Supports upscaling: 
-        * `vf=d3d11vpp:scale=4:scaling-mode=nvidia:scale=1` for high quality upscaling
+        * `vf=d3d11vpp:scale=4:scaling-mode=nvidia` for high quality upscaling
         * `vo=gpu` use the GPU video output
         * `gpu-context=d3d11` for Direct3D 11 GPU context
         
