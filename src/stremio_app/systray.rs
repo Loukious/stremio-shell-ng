@@ -20,8 +20,6 @@ pub struct SystemTray {
     pub tray_start_watch_party: nwg::MenuItem,
     #[nwg_control(parent: tray_menu, text: "End watch party", disabled: true)]
     pub tray_end_watch_party: nwg::MenuItem,
-    #[nwg_control(parent: tray_menu, text: "Watch party active", disabled: true)]
-    pub tray_watch_party_status: nwg::MenuItem,
     #[nwg_control(parent: tray_menu, text: "&Leave watch party")]
     pub tray_leave_watch_party: nwg::MenuItem,
     #[nwg_control(parent: tray_menu, text: "&Quit")]
