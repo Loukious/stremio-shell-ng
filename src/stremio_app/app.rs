@@ -1561,7 +1561,6 @@ impl MainWindow {
             self.window.set_text(APP_NAME);
             self.tray.tray_start_watch_party.set_enabled(true);
             self.tray.tray_end_watch_party.set_enabled(false);
-            self.tray.tray_watch_party_status.set_enabled(false);
             self.tray.tray_leave_watch_party.set_enabled(false);
             self.tray.tray.set_tip("Stremio");
         } else {
@@ -1577,7 +1576,6 @@ impl MainWindow {
             self.tray
                 .tray_end_watch_party
                 .set_enabled(role == LobbyRole::Host);
-            self.tray.tray_watch_party_status.set_enabled(false);
             self.tray
                 .tray_leave_watch_party
                 .set_enabled(role != LobbyRole::Host);
