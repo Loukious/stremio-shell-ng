@@ -20,6 +20,8 @@
     * Supports lua scripts
         * You can add lua scripts to the `scripts` directory in the app's data directory
         * Script example: [To skip intros](https://raw.githubusercontent.com/Loukious/auto_skip_anime_intro/refs/heads/main/auto_skip_anime_intro.lua)
+* IntroDB and TheIntroDB support
+* Auto-chapter skipping based on chapter titles (configurable keywords in `RPCconfig.ini`)
 
 
 
