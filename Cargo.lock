@@ -1811,7 +1811,7 @@ checksum = "ae139f051204a4af015d4f0ed3a1f7a51020d03a44c7cf249168c543d88131e9"
 
 [[package]]
 name = "stremio-shell-ng"
-version = "5.0.21-rc1"
+version = "5.0.21-rc2"
 dependencies = [
  "anyhow",
  "base64",
