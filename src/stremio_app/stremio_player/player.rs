@@ -25,6 +25,12 @@ pub static IS_PAUSED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
 pub static IS_FILE_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
+/// Current chapter index as reported by mpv (or -1 if unknown / no chapters).
+pub static CURRENT_CHAPTER: Lazy<Mutex<i64>> = Lazy::new(|| Mutex::new(-1));
+
+/// Current chapter title (from `chapter-metadata/by-key/title`).
+pub static CURRENT_CHAPTER_TITLE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+
 /// The actual video stream URL passed to `loadfile` (not the Stremio page URL).
 pub static CURRENT_STREAM_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 
@@ -140,6 +146,8 @@ fn create_event_thread(
                         *TOTAL_DURATION.lock().unwrap() = 0.0;
                         *IS_PAUSED.lock().unwrap() = true;
                         *IS_FILE_LOADED.lock().unwrap() = false;
+                        *CURRENT_CHAPTER.lock().unwrap() = -1;
+                        *CURRENT_CHAPTER_TITLE.lock().unwrap() = String::new();
                         continue;
                     }
                     Event::FileLoaded => {
@@ -162,6 +170,20 @@ fn create_event_thread(
                         if name == "pause" {
                             if let PropertyData::Flag(pause) = change {
                                 *IS_PAUSED.lock().unwrap() = pause;
+                            }
+                        }
+
+                        if name == "chapter" {
+                            if let PropertyData::Int64(chapter_idx) = change {
+                                *CURRENT_CHAPTER.lock().unwrap() = chapter_idx;
+                            }
+                        }
+                        if name == "chapter-metadata/by-key/title" {
+                            match change {
+                                PropertyData::Str(ref s) | PropertyData::OsdStr(ref s) => {
+                                    *CURRENT_CHAPTER_TITLE.lock().unwrap() = s.to_string();
+                                }
+                                _ => {}
                             }
                         }
 
@@ -219,6 +241,20 @@ fn create_message_thread(
                 .send(ObserveProperty {
                     name: "pause".to_string(),
                     format: Format::Flag,
+                })
+                .expect("cannot send ObserveProperty");
+
+            // Chapter information (used for chapter-based intro/outro skipping).
+            observe_property_sender
+                .send(ObserveProperty {
+                    name: "chapter".to_string(),
+                    format: Format::Int64,
+                })
+                .expect("cannot send ObserveProperty");
+            observe_property_sender
+                .send(ObserveProperty {
+                    name: "chapter-metadata/by-key/title".to_string(),
+                    format: Format::String,
                 })
                 .expect("cannot send ObserveProperty");
             mpv.lock().expect("MPV lock is poisoned").wake_up();

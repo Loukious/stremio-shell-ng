@@ -240,6 +240,7 @@ pub enum PropVal {
 #[display(style = "kebab-case")]
 #[serde(untagged)]
 pub enum MpvCmd {
+    Add,
     Loadfile,
     Stop,
     Cycle,
