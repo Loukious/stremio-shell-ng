@@ -1,6 +1,6 @@
 [package]
 name = "stremio-shell-ng"
-version = "5.0.21-rc2"
+version = "5.0.21-rc3"
 edition = "2018"
 
 [dependencies]
