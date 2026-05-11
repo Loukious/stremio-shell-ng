@@ -14,9 +14,8 @@
     * You can change the MPV config by editing the `mpv.conf` file in the app's data directory (by default this is the same folder as `stremio-shell-ng.exe`, e.g. `%LOCALAPPDATA%\Programs\Stremio`)
     * NVIDIA Smooth Motion (RTX 40/50) guide: [Enable Smooth Motion (frame interpolation)](wiki/nvidia-smooth-motion.md)
     * Video upscaling (d3d11vpp / VSR scaling) guide: [Enable upscaling](wiki/vsr-upscaling.md)
-        
     * Supports lua scripts
-        * You can add lua scripts to the `scripts` directory in the app's data directory
+        * You can add lua scripts to the `scripts` directory in mpv's data directory (by default it's in `%appdata%\mpv\scripts`)
         * Script example: [To skip intros](https://raw.githubusercontent.com/Loukious/auto_skip_anime_intro/refs/heads/main/auto_skip_anime_intro.lua)
 * IntroDB and TheIntroDB support
 * Auto-chapter skipping based on chapter titles (configurable keywords in `RPCconfig.ini`)
