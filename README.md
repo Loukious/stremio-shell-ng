@@ -13,10 +13,7 @@
 * Unlocked MPV config:
     * You can change the MPV config by editing the `mpv.conf` file in the app's data directory (by default this is the same folder as `stremio-shell-ng.exe`, e.g. `%LOCALAPPDATA%\Programs\Stremio`)
     * NVIDIA Smooth Motion (RTX 40/50) guide: [Enable Smooth Motion (frame interpolation)](wiki/nvidia-smooth-motion.md)
-    * Supports upscaling: 
-        * `vf=d3d11vpp:scale=4:scaling-mode=nvidia` for high quality upscaling
-        * `vo=gpu` use the GPU video output
-        * `gpu-context=d3d11` for Direct3D 11 GPU context
+    * Video upscaling (d3d11vpp / VSR scaling) guide: [Enable upscaling](wiki/vsr-upscaling.md)
         
     * Supports lua scripts
         * You can add lua scripts to the `scripts` directory in the app's data directory
