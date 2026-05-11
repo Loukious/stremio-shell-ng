@@ -11,7 +11,8 @@
 * Modern architecture:
     * Both the app and the MPV player are 64-bit
 * Unlocked MPV config:
-    * You can change the MPV config by editing the `mpv.conf` file in the app's data directory
+    * You can change the MPV config by editing the `mpv.conf` file in the app's data directory (by default this is the same folder as `stremio-shell-ng.exe`, e.g. `%LOCALAPPDATA%\Programs\Stremio`)
+    * NVIDIA Smooth Motion (RTX 40/50) guide: [Enable Smooth Motion (frame interpolation)](wiki/nvidia-smooth-motion.md)
     * Supports upscaling: 
         * `vf=d3d11vpp:scale=4:scaling-mode=nvidia` for high quality upscaling
         * `vo=gpu` use the GPU video output
