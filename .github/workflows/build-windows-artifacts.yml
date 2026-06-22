@@ -53,6 +53,47 @@ jobs:
         shell: pwsh
         run: choco install innosetup --yes --no-progress
 
+      - name: Install Inno Setup translations
+        shell: pwsh
+        run: |
+          $languageDir = Join-Path "${env:ProgramFiles(x86)}" "Inno Setup 6\Languages"
+          $languages = @(
+            "Armenian",
+            "BrazilianPortuguese",
+            "Bulgarian",
+            "Catalan",
+            "Corsican",
+            "Czech",
+            "Danish",
+            "Dutch",
+            "Finnish",
+            "French",
+            "German",
+            "Hebrew",
+            "Icelandic",
+            "Italian",
+            "Japanese",
+            "Norwegian",
+            "Polish",
+            "Portuguese",
+            "Russian",
+            "Slovak",
+            "Slovenian",
+            "Spanish",
+            "Turkish",
+            "Ukrainian"
+          )
+
+          foreach ($language in $languages) {
+            $target = Join-Path $languageDir "$language.isl"
+            if (Test-Path -LiteralPath $target) {
+              continue
+            }
+
+            $url = "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/$language.isl"
+            curl.exe --fail --location --silent --show-error --output $target $url
+          }
+
       - name: Build shell
         shell: pwsh
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
