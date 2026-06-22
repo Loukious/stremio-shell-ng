@@ -164,19 +164,8 @@ Name: "assoctorrent"; Description: "Associate {#MyAppName} with .torrent files"
 [Files]
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 Source: "{#MyAppExeLocation}"; DestDir: "{app}"; Flags: ignoreversion signonce
-Source: "{#SourcePath}..\libmpv-2.dll"; DestDir: "{app}"; Flags: ignoreversion signonce
-Source: "{#SourcePath}..\bin\ffmpeg.exe"; DestDir: "{app}"; Flags: ignoreversion signonce
-Source: "{#SourcePath}..\bin\ffprobe.exe"; DestDir: "{app}"; Flags: ignoreversion signonce
+Source: "{#SourcePath}..\bin\libmpv-2.dll"; DestDir: "{app}"; Flags: ignoreversion signonce
 Source: "{#SourcePath}..\bin\stremio-runtime.exe"; DestDir: "{app}"; Flags: ignoreversion signonce
-Source: "{#SourcePath}..\server.js"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}..\bin\avcodec-58.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}..\bin\avdevice-58.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}..\bin\avfilter-7.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}..\bin\avformat-58.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}..\bin\avutil-56.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}..\bin\postproc-55.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}..\bin\swresample-3.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}..\bin\swscale-5.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}..\bin\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}..\bin\vcruntime140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
 
