@@ -43,6 +43,8 @@ pub static TOTAL_DURATION: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(0.0));
 
 pub static IS_PAUSED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
+pub static IS_FILE_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+
 /// The actual video stream URL passed to `loadfile` (not the Stremio page URL).
 pub static CURRENT_STREAM_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 
@@ -457,6 +459,17 @@ fn create_event_thread(
             };
 
             let player_response = match event {
+                Event::StartFile => {
+                    *CURRENT_TIME.lock().unwrap() = 0.0;
+                    *TOTAL_DURATION.lock().unwrap() = 0.0;
+                    *IS_PAUSED.lock().unwrap() = true;
+                    *IS_FILE_LOADED.lock().unwrap() = false;
+                    continue;
+                }
+                Event::FileLoaded => {
+                    *IS_FILE_LOADED.lock().unwrap() = true;
+                    continue;
+                }
                 Event::PropertyChange { name, change, .. } => {
                     // `change` is a plain `PropertyData`, not an Option
                     if name == "time-pos" {
@@ -486,10 +499,13 @@ fn create_event_thread(
                         )),
                     )
                 }
-                Event::EndFile(reason) => PlayerResponse(
-                    "mpv-event-ended",
-                    PlayerEvent::End(PlayerEnded::from_end_reason(reason)),
-                ),
+                Event::EndFile(reason) => {
+                    *IS_FILE_LOADED.lock().unwrap() = false;
+                    PlayerResponse(
+                        "mpv-event-ended",
+                        PlayerEvent::End(PlayerEnded::from_end_reason(reason)),
+                    )
+                }
                 Event::Shutdown => {
                     break;
                 }
