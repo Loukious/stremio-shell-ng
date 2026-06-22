@@ -97,7 +97,7 @@ impl StremioServer {
                                     break;
                                 }
                             };
-                            std::io::stdout().write_all(&buffer).ok();
+                            std::io::stdout().write_all(&buffer[..on]).ok();
                             let string_data = String::from_utf8_lossy(&buffer[..on]);
                             {
                                 let lines = &mut *out_lines.lock().unwrap();
@@ -140,9 +140,8 @@ impl StremioServer {
                                     break;
                                 }
                             };
-                            std::io::stderr().write_all(&buffer).ok();
+                            std::io::stderr().write_all(&buffer[..en]).ok();
                             let string_data = String::from_utf8_lossy(&buffer[..en]);
-                            // eprint!("{:?}", &buffer);
                             {
                                 let lines = &mut *err_lines.lock().unwrap();
                                 *lines += string_data.deref();
