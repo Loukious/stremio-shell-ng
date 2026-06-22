@@ -1,8 +1,11 @@
 use crate::stremio_app::ipc;
 use crate::stremio_app::RPCResponse;
 use flume::{Receiver, Sender};
+use libmpv2::events::PropertyData;
 use libmpv2::{events::Event, Format, Mpv, SetData};
 use native_windows_gui::{self as nwg, PartialUi};
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
 use std::{
     mem, ptr,
     sync::{
@@ -33,6 +36,10 @@ use crate::stremio_app::stremio_player::{
     CmdVal, InMsg, InMsgArgs, InMsgFn, PlayerEnded, PlayerEvent, PlayerProprChange, PlayerResponse,
     PropKey, PropVal,
 };
+
+pub static CURRENT_TIME: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(0.0));
+
+pub static TOTAL_DURATION: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(0.0));
 
 struct ObserveProperty {
     name: String,
@@ -169,6 +176,8 @@ fn create_mpv(window_handle: HWND) -> Mpv {
         set_property!("wid", window_handle as i64);
         set_property!("title", "Stremio");
         set_property!("audio-client-name", "Stremio");
+        set_property!("config", "yes");
+        set_property!("load-scripts", "yes");
         set_property!("terminal", "yes");
         #[cfg(debug_assertions)]
         set_property!("msg-level", "all=no,cplayer=debug");
@@ -420,13 +429,12 @@ fn create_event_thread(
             .disable_deprecated_events()
             .expect("failed to disable deprecated MPV events");
 
-        // -- Event handler loop --
-
         loop {
+            // Drain newly observed properties
             for ObserveProperty { name, format } in observe_property_receiver.drain() {
                 mpv_event_client
                     .observe_property(&name, format, 0)
-                    .expect("failed to observer MPV property");
+                    .expect("failed to observe MPV property");
             }
 
             let event = match mpv_event_client.wait_event(0.1) {
@@ -435,19 +443,34 @@ fn create_event_thread(
                     eprintln!("Event errored: {error:?}");
                     continue;
                 }
-                // dummy event received (may be created on a wake up call or on timeout)
                 None => continue,
             };
 
-            // even if you don't do anything with the events, it is still necessary to empty the event loop
             let player_response = match event {
-                Event::PropertyChange { name, change, .. } => PlayerResponse(
-                    "mpv-prop-change",
-                    PlayerEvent::PropChange(PlayerProprChange::from_name_value(
-                        name.to_string(),
-                        change,
-                    )),
-                ),
+                Event::PropertyChange { name, change, .. } => {
+                    // `change` is a plain `PropertyData`, not an Option
+                    if name == "time-pos" {
+                        // If it's a Double, print it
+                        if let PropertyData::Double(pos_secs) = change {
+                            *CURRENT_TIME.lock().unwrap() = pos_secs;
+                        }
+                    }
+                    if name == "duration" {
+                        if let PropertyData::Double(dur_secs) = change {
+                            *TOTAL_DURATION.lock().unwrap() = dur_secs;
+                        }
+                    }
+
+                    // Because from_name_value expects `PropertyData`,
+                    // just pass `change` directly:
+                    PlayerResponse(
+                        "mpv-prop-change",
+                        PlayerEvent::PropChange(PlayerProprChange::from_name_value(
+                            name.to_string(),
+                            change,
+                        )),
+                    )
+                }
                 Event::EndFile(reason) => PlayerResponse(
                     "mpv-event-ended",
                     PlayerEvent::End(PlayerEnded::from_end_reason(reason)),
@@ -476,6 +499,22 @@ fn create_message_thread(
     in_msg_receiver: Receiver<String>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        {
+            observe_property_sender
+                .send(ObserveProperty {
+                    name: "time-pos".to_string(),
+                    format: Format::Double,
+                })
+                .expect("cannot send ObserveProperty");
+            mpv.wake_up();
+            observe_property_sender
+                .send(ObserveProperty {
+                    name: "duration".to_string(),
+                    format: Format::Double,
+                })
+                .expect("cannot send ObserveProperty");
+        }
+
         // -- Helpers --
 
         let observe_property = |name: String, format: Format| {
