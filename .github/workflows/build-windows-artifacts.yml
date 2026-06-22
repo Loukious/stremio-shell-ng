@@ -118,6 +118,7 @@ jobs:
           name: StremioSetup-${{ matrix.arch }}
           path: ${{ matrix.setup_glob }}
           if-no-files-found: error
+          retention-days: 1
 
       - name: Upload portable zip
         uses: actions/upload-artifact@v4
@@ -125,3 +126,4 @@ jobs:
           name: StremioRPCPortable-${{ matrix.arch }}
           path: artifacts\StremioRPCPortable.zip
           if-no-files-found: error
+          retention-days: 1
