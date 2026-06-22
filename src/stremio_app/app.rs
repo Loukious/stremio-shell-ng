@@ -9,7 +9,6 @@ use ini::Ini;
 use native_windows_derive::NwgUi;
 use native_windows_gui as nwg;
 use once_cell::sync::Lazy;
-use rand::Rng;
 use reqwest::blocking::Client;
 use serde_json::{self, Value};
 use souvlaki::{
@@ -1158,7 +1157,6 @@ impl MainWindow {
         }
 
         let web_rx = web_rx.clone();
-
         let (updater_tx, updater_rx) = flume::unbounded::<String>();
         let updater_tx_web = updater_tx.clone();
 
@@ -1184,7 +1182,6 @@ impl MainWindow {
 
         let autoupdater_endpoint = self.autoupdater_endpoint.clone();
         let force_update = self.force_update;
-        let release_candidate = self.release_candidate;
         let autoupdater_setup_file = self.autoupdater_setup_file.clone();
 
         thread::spawn(move || {
@@ -1201,18 +1198,9 @@ impl MainWindow {
                     .parse()
                     .expect("Should always be valid");
 
-                let updater_endpoint = if let Some(ref endpoint) = autoupdater_endpoint {
-                    endpoint.clone()
-                } else {
-                    let mut rng = rand::thread_rng();
-                    let index = rng.gen_range(0..UPDATE_ENDPOINT.len());
-                    let mut url = Url::parse(UPDATE_ENDPOINT[index]).unwrap();
-                    url.query_pairs_mut().append_pair("arch", env!("ARCH"));
-                    if release_candidate {
-                        url.query_pairs_mut().append_pair("rc", "true");
-                    }
-                    url
-                };
+                let updater_endpoint = autoupdater_endpoint
+                    .clone()
+                    .unwrap_or_else(|| Url::parse(UPDATE_ENDPOINT).expect("valid updater URL"));
 
                 let updater =
                     updater::Updater::new(current_version, &updater_endpoint, force_update);
