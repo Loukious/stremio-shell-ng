@@ -2,6 +2,8 @@
 /stremio*.exe
 /libmpv-2.dll
 /bin/libmpv-2.dll
+/bin-arm64/libmpv-2.dll
+/mpv-*/libmpv-2.dll
 /bin/backup
 StremioSetup*.exe
 *.zip
