@@ -1440,6 +1440,7 @@ impl MainWindow {
 
         let autoupdater_endpoint = self.autoupdater_endpoint.clone();
         let force_update = self.force_update;
+        let release_candidate = self.release_candidate;
         let autoupdater_setup_file = self.autoupdater_setup_file.clone();
 
         thread::spawn(move || {
@@ -1460,8 +1461,12 @@ impl MainWindow {
                     .clone()
                     .unwrap_or_else(|| Url::parse(UPDATE_ENDPOINT).expect("valid updater URL"));
 
-                let updater =
-                    updater::Updater::new(current_version, &updater_endpoint, force_update);
+                let updater = updater::Updater::new(
+                    current_version,
+                    &updater_endpoint,
+                    force_update,
+                    release_candidate,
+                );
                 match updater.autoupdate() {
                     Ok(Some(update)) => {
                         println!("New version ready to install v{}", update.version);
