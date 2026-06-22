@@ -59,6 +59,8 @@ steamworks = "0.13"
 [build-dependencies]
 winres = "0.1"
 chrono = "0.4.22"
-zip = "4.6.1"
+roxmltree = "0.21"
+sevenz-rust2 = "0.21"
+ureq = "3"
 [dev-dependencies]
 serde_test = "1.0.*"
