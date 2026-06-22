@@ -3,6 +3,10 @@ name = "stremio-shell-ng"
 version = "5.0.23"
 edition = "2018"
 
+[features]
+default = ["steam-sync"]
+steam-sync = ["steamworks"]
+
 [dependencies]
 once_cell = "1.19"
 native-windows-gui = { git = "https://github.com/Stremio/native-windows-gui", features = [
@@ -54,7 +58,7 @@ uuid = { version = "1", features = ["v4"] }
 souvlaki = "0.8"
 discord-rich-presence = "1.1.0"
 rust-ini = "0.21"
-steamworks = "0.13"
+steamworks = { version = "0.13", optional = true }
 
 [build-dependencies]
 winres = "0.1"

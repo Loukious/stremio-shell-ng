@@ -55,7 +55,9 @@ fn main() {
         .unwrap_or_else(|err| panic!("failed to prepare libmpv: {}", err));
     copy_runtime_dll(&libmpv_dll, "libmpv-2.dll");
 
-    copy_steam_runtime_dll();
+    if env::var_os("CARGO_FEATURE_STEAM_SYNC").is_some() {
+        copy_steam_runtime_dll();
+    }
 }
 
 fn prepare_libmpv(
