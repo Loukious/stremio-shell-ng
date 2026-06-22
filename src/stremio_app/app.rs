@@ -64,6 +64,13 @@ use crate::stremio_app::{
 use super::discord::DiscordRpc;
 use super::stremio_server::StremioServer;
 
+fn weserv_contain(url: &str) -> String {
+    format!(
+        "https://images.weserv.nl/?url={}&w=1024&h=1024&fit=contain",
+        urlencoding::encode(url)
+    )
+}
+
 #[derive(Debug, Default)]
 pub struct VideoInfo {
     pub poster: String,
@@ -468,13 +475,7 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
         loop {
             let current_retry = retry_count.clone();
             let result = catch_unwind(AssertUnwindSafe(|| {
-                let mut drp = match DiscordIpcClient::new("997798118185771059") {
-                    Ok(client) => client,
-                    Err(e) => {
-                        eprintln!("⚠️ Failed to create Discord client: {e}");
-                        return;
-                    }
-                };
+                let mut drp = DiscordIpcClient::new("997798118185771059");
 
                 loop {  // Connection maintenance loop
                     // Attempt connection
@@ -562,7 +563,7 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                                 Some(info) => {
                                     if is_player {
                                         if config.disable_when_paused && is_paused {
-                                            drp.clear_activity()
+                                            drp.clear_activity().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
                                         } else {
                                             build_player_activity(
                                                 &mut drp,
@@ -597,7 +598,7 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                         } else {
                             // Non-player state handling
                             if config.disable_in_menu {
-                                drp.clear_activity()
+                                drp.clear_activity().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
                             } else {
                                 build_menu_activity(&mut drp, &cur_url, app_start_time)
                             }
@@ -622,7 +623,7 @@ pub fn spawn_discordrpc_loop(app_start_time: SystemTime) -> thread::JoinHandle<(
                                 Err(_) => continue,
                             };
                             *title_guard = if type_ == "series" && !season.is_empty() {
-                                format!("{} ({}x{})", info.name, episode, season)
+                                format!("{} (S{}E{})", info.epname, season, episode)
                             } else {
                                 info.name.clone()
                             };
@@ -690,18 +691,20 @@ fn build_player_activity(
         timestamps = timestamps.end(end);
     }
 
-    let (state_text, details) = if media_type == "series" {
+    let (activity_name, details, state_text) = if media_type == "series" {
         (
-            format!("{} - S{}E{}", info.epname, season, episode),
             info.name.clone(),
+            info.epname.clone(),
+            format!("S{}E{}", season, episode),
         )
     } else {
-        (info.year.clone(), info.name.clone())
+        (info.name.clone(), info.name.clone(), info.year.clone())
     };
 
     let large_text = format!("{} ({})", info.name, info.year);
+    let poster_url = weserv_contain(&info.poster);
     let mut assets = Assets::new()
-        .large_image(&info.poster)
+        .large_image(&poster_url)
         .large_text(&large_text);
 
         let (small_image, small_text) = if is_paused {
@@ -711,7 +714,7 @@ fn build_player_activity(
             )
         } else {
             (
-                if media_type == "series" { &info.thumbnail } else { ICON_URL },
+                ICON_URL,
                 "Playing"
             )
         };
@@ -723,8 +726,9 @@ fn build_player_activity(
     // Create activity without buttons first
     let mut activity = Activity::new()
         .activity_type(ActivityType::Watching)
-        .state(&state_text)
+        .name(&activity_name)
         .details(&details)
+        .state(&state_text)
         .timestamps(timestamps)
         .assets(assets);
 
@@ -807,8 +811,9 @@ fn build_menu_activity(
 
     let activity = Activity::new()
         .activity_type(ActivityType::Watching)
-        .state(state)
+        .name("Stremio")
         .details(details)
+        .state(state)
         .timestamps(Timestamps::new().start(start_time))
         .assets(Assets::new().large_image(ICON_URL).large_text("Stremio"));
 
@@ -1320,8 +1325,9 @@ fn build_detail_activity(
     let _ = app_start_time; // derived start time or use passed time
 
     let large_text = format!("{} ({})", info.name, info.year);
+    let poster_url = weserv_contain(&info.poster);
     let assets = Assets::new()
-        .large_image(&info.poster)
+        .large_image(&poster_url)
         .large_text(&large_text)
         .small_image(ICON_URL)
         .small_text("Stremio");
@@ -1338,8 +1344,9 @@ fn build_detail_activity(
 
     let mut activity = Activity::new()
         .activity_type(ActivityType::Watching)
-        .state(state_text)
+        .name(&info.name)
         .details(&info.name)
+        .state(state_text)
         .timestamps(Timestamps::new().start(start_time))
         .assets(assets);
 
