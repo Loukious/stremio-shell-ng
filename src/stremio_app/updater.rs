@@ -6,12 +6,10 @@ use std::{
 use anyhow::{anyhow, Context};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use url::Url;
 
 #[derive(Debug, Clone)]
 pub struct Update {
-    /// The new version that we update to
     pub version: Version,
     pub file: PathBuf,
 }
@@ -25,25 +23,16 @@ pub struct Updater {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateResponse {
-    version_desc: Url,
-    version: String,
+struct GitHubRelease {
+    tag_name: String,
+    prerelease: bool,
+    assets: Vec<GitHubAsset>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileItem {
-    // name: String,
-    pub url: Url,
-    pub checksum: String,
-    os: String,
-}
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Descriptor {
-    version: String,
-    files: Vec<FileItem>,
+struct GitHubAsset {
+    name: String,
+    browser_download_url: Url,
 }
 
 impl Updater {
@@ -57,62 +46,69 @@ impl Updater {
         }
     }
 
-    /// Fetches the latest update from the update server.
     pub fn autoupdate(&self) -> Result<Option<Update>, anyhow::Error> {
-        // Check for updates
         println!("Fetching updates for v{}", self.current_version);
         println!("Using updater endpoint {}", self.endpoint);
-        let update_response =
-            reqwest::blocking::get(self.endpoint.clone())?.json::<UpdateResponse>()?;
-        let update_descriptor =
-            reqwest::blocking::get(update_response.version_desc)?.json::<Descriptor>()?;
 
-        if update_response.version != update_descriptor.version {
-            return Err(anyhow!("Mismatched update versions"));
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("stremio-shell-ng")
+            .build()?;
+        let release = client
+            .get(self.endpoint.clone())
+            .send()?
+            .error_for_status()?
+            .json::<GitHubRelease>()?;
+
+        let version = Version::parse(release.tag_name.trim_start_matches('v'))?;
+        if release.prerelease || !version.pre.is_empty() {
+            println!("Skipping prerelease v{version}");
+            return Ok(None);
         }
-        let installer = update_descriptor
-            .files
-            .iter()
-            .find(|file_item| file_item.os == std::env::consts::OS)
-            .context("No update for this OS")?;
-        let version = Version::parse(update_descriptor.version.as_str())?;
+
         if !self.force_update && !self.next_version.matches(&version) {
-            return Err(anyhow!(
-                "No new releases found that match the requirement of `{}`",
-                self.next_version
-            ));
+            println!("No new releases found newer than v{}", self.current_version);
+            return Ok(None);
         }
-        println!("Found update v{version}");
 
-        let file_name = std::path::Path::new(installer.url.path())
-            .file_name()
-            .context("Invalid file name")?
-            .to_str()
-            .context("The path is not valid UTF-8")?
-            .to_string();
-        let temp_dir = std::env::temp_dir();
-        let dest = temp_dir.join(file_name);
+        let installer = release
+            .assets
+            .iter()
+            .find(|asset| {
+                let name = asset.name.to_ascii_lowercase();
+                name.ends_with(".exe") && name.contains("setup")
+            })
+            .or_else(|| {
+                release
+                    .assets
+                    .iter()
+                    .find(|asset| asset.name.to_ascii_lowercase().ends_with(".exe"))
+            })
+            .context("No Windows installer asset found in the latest GitHub release")?;
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        // Download the new setup file
-        let mut installer_response = reqwest::blocking::get(installer.url.clone())?;
+        let dest = std::env::temp_dir().join(&installer.name);
+        println!(
+            "Downloading {} to {}",
+            installer.browser_download_url,
+            dest.display()
+        );
+
+        let mut installer_response = client
+            .get(installer.browser_download_url.clone())
+            .send()?
+            .error_for_status()?;
         let size = installer_response.content_length();
-        let mut downloaded: u64 = 0;
-        let mut sha256 = Sha256::new();
-
-        println!("Downloading {} to {}", installer.url, dest.display());
-
+        let mut downloaded = 0u64;
         let mut chunk = [0u8; 8192];
         let mut file = std::fs::File::create(&dest)?;
+
         loop {
             let chunk_size = installer_response.read(&mut chunk)?;
             if chunk_size == 0 {
                 break;
             }
-            sha256.update(&chunk[..chunk_size]);
             file.write_all(&chunk[..chunk_size])?;
+            downloaded += chunk_size as u64;
             if let Some(size) = size {
-                downloaded += chunk_size as u64;
                 print!("\rProgress: {}%", downloaded * 100 / size);
             } else {
                 print!(".");
@@ -120,17 +116,23 @@ impl Updater {
             std::io::stdout().flush().ok();
         }
         println!();
-        let actual_sha256 = format!("{:x}", sha256.finalize());
-        if actual_sha256 != installer.checksum {
-            std::fs::remove_file(dest)?;
-            return Err(anyhow::anyhow!("Checksum verification failed"));
-        }
-        println!("Checksum verified.");
 
-        let update = Some(Update {
+        if downloaded == 0 {
+            std::fs::remove_file(&dest).ok();
+            return Err(anyhow!("Installer download was empty"));
+        }
+        if let Some(size) = size {
+            if downloaded != size {
+                std::fs::remove_file(&dest).ok();
+                return Err(anyhow!(
+                    "Incomplete installer download: expected {size} bytes, received {downloaded}"
+                ));
+            }
+        }
+
+        Ok(Some(Update {
             version,
             file: dest,
-        });
-        Ok(update)
+        }))
     }
 }
