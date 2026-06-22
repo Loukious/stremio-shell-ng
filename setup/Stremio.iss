@@ -164,10 +164,12 @@ Name: "assoctorrent"; Description: "Associate {#MyAppName} with .torrent files"
 [Files]
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 Source: "{#MyAppExeLocation}"; DestDir: "{app}"; Flags: ignoreversion signonce
+Source: "{#SourcePath}..\target\x86_64-pc-windows-msvc\release\steam_api64.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}..\bin\libmpv-2.dll"; DestDir: "{app}"; Flags: ignoreversion signonce
 Source: "{#SourcePath}..\bin\stremio-runtime.exe"; DestDir: "{app}"; Flags: ignoreversion signonce
 Source: "{#SourcePath}..\bin\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}..\bin\vcruntime140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}..\RPCconfig.ini"; DestDir: "{app}"; Flags: ignoreversion
 
 
 [Registry]
