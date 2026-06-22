@@ -1,6 +1,7 @@
 use crate::stremio_app::app::{LobbyRole, LOBBY_ROLE};
 use crate::stremio_app::stremio_player::player::{
-    CURRENT_TIME, IS_FILE_LOADED, IS_PAUSED, PLAYER_CMD_TX, TOTAL_DURATION,
+    CURRENT_CHAPTER, CURRENT_CHAPTER_TITLE, CURRENT_TIME, IS_FILE_LOADED, IS_PAUSED, PLAYER_CMD_TX,
+    TOTAL_DURATION,
 };
 use crate::stremio_app::stremio_wevbiew::wevbiew::CURRENT_URL;
 use anyhow::Context;
@@ -22,6 +23,12 @@ pub struct IntroSkipConfig {
     pub skip_intro: bool,
     pub skip_recap: bool,
     pub skip_outro: bool,
+
+    /// Chapter-title keyword lists (case-insensitive substring matches).
+    /// Loaded from `[AutoSkipChapters] intro/recap/outro` in `RPCconfig.ini`.
+    pub chapter_intro_words: Vec<String>,
+    pub chapter_recap_words: Vec<String>,
+    pub chapter_outro_words: Vec<String>,
 
     /// Optional IntroDB (introdb.app) API key.
     /// Reads do not require this, but we send it if provided.
@@ -180,6 +187,8 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
     let mut current_segments: Option<Vec<SkipSegment>> = None;
     let mut skipped_segments: HashSet<SegmentKey> = HashSet::new();
 
+    let mut last_skipped_chapter: Option<i64> = None;
+
     let mut next_resolve_at = Instant::now();
 
     // Session caches
@@ -207,6 +216,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
             current_media = None;
             current_segments = None;
             skipped_segments.clear();
+            last_skipped_chapter = None;
             next_resolve_at = Instant::now();
         }
 
@@ -254,7 +264,47 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
             IS_FILE_LOADED.lock().map(|v| *v).unwrap_or(false),
         );
 
+        let (chapter_idx, chapter_title) = (
+            CURRENT_CHAPTER.lock().map(|v| *v).unwrap_or(-1),
+            CURRENT_CHAPTER_TITLE
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_default(),
+        );
+
         if paused || !file_loaded {
+            continue;
+        }
+
+        // --- Chapter-based skipping ---
+        // Some files include named chapters like "Opening", "Logo", "Credits".
+        // When detected, jump to the next chapter.
+        if chapter_idx >= 0
+            && Some(chapter_idx) != last_skipped_chapter
+            && !chapter_title.trim().is_empty()
+        {
+            let t = chapter_title.trim().to_lowercase();
+            if let Some((kind, matched)) = segment_kind_from_chapter_title(&t, &config) {
+                if send_add_chapter(1) {
+                    last_skipped_chapter = Some(chapter_idx);
+                    println!(
+                        "⏭️ AutoSkip chapter {}: '{}' (chapter #{}, matched '{}')",
+                        kind.label(),
+                        chapter_title,
+                        chapter_idx,
+                        matched
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // --- Segment-based skipping (IntroDB / TheIntroDB) ---
+        let Some(segments) = current_segments.as_ref() else {
+            continue;
+        };
+
+        if segments.is_empty() {
             continue;
         }
 
@@ -888,6 +938,53 @@ fn send_seek_absolute(target_sec: f64) -> bool {
     }
 
     false
+}
+
+fn send_add_chapter(delta: i64) -> bool {
+    let cmd = format!(r#"["mpv-command",["add","chapter","{}"]]"#, delta);
+
+    if let Ok(guard) = PLAYER_CMD_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            return tx.send(cmd).is_ok();
+        }
+    }
+
+    false
+}
+
+fn segment_kind_from_chapter_title<'a>(
+    title_lower: &str,
+    config: &'a IntroSkipConfig,
+) -> Option<(SegmentKind, &'a str)> {
+    if config.skip_intro {
+        if let Some(matched) = find_matching_keyword(title_lower, &config.chapter_intro_words) {
+            return Some((SegmentKind::Intro, matched));
+        }
+    }
+
+    if config.skip_recap {
+        if let Some(matched) = find_matching_keyword(title_lower, &config.chapter_recap_words) {
+            return Some((SegmentKind::Recap, matched));
+        }
+    }
+
+    if config.skip_outro {
+        if let Some(matched) = find_matching_keyword(title_lower, &config.chapter_outro_words) {
+            return Some((SegmentKind::Outro, matched));
+        }
+    }
+
+    None
+}
+
+fn find_matching_keyword<'a>(
+    haystack_lower: &str,
+    keywords_lower: &'a [String],
+) -> Option<&'a str> {
+    keywords_lower
+        .iter()
+        .find(|k| !k.is_empty() && haystack_lower.contains(k.as_str()))
+        .map(|k| k.as_str())
 }
 
 fn extract_video_id_from_url(cur_url: &str) -> Option<String> {
