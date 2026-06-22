@@ -5,16 +5,14 @@ use libmpv2::events::PropertyData;
 use libmpv2::{events::Event, Format, Mpv, SetData};
 use native_windows_gui::{self as nwg, PartialUi};
 use once_cell::sync::Lazy;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
 use std::sync::Mutex;
-use std::{
-    mem, ptr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread::{self, JoinHandle},
-    time::Duration,
-};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+use std::{mem, ptr};
 use winapi::shared::{
     minwindef::{DWORD, UINT},
     windef::{HMONITOR, HWND},
@@ -43,7 +41,18 @@ pub static TOTAL_DURATION: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(0.0));
 
 pub static IS_PAUSED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
+pub static CURRENT_VOLUME: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(100.0));
+
+pub static CACHED_PLAYER_PROPS: Lazy<Mutex<HashMap<String, Value>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 pub static IS_FILE_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+
+pub static STOP_COMMAND_IN_FLIGHT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+
+pub static MPV_VERSION: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+
+pub static FFMPEG_VERSION: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
 /// Current chapter index as reported by mpv (or -1 if unknown / no chapters).
 pub static CURRENT_CHAPTER: Lazy<Mutex<i64>> = Lazy::new(|| Mutex::new(-1));
@@ -54,15 +63,14 @@ pub static CURRENT_CHAPTER_TITLE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(
 /// The actual video stream URL passed to `loadfile` (not the Stremio page URL).
 pub static CURRENT_STREAM_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 
-/// Global player command sender — allows the sync client (and other subsystems)
+/// Global player command sender. Allows the sync client (and other subsystems)
 /// to inject mpv commands without going through the webview pipeline.
 /// Populated once during `on_init`.
 pub static PLAYER_CMD_TX: Lazy<Mutex<Option<Sender<String>>>> = Lazy::new(|| Mutex::new(None));
 
-struct ObserveProperty {
-    name: String,
-    format: Format,
-}
+const LOADFILE_START_TIMEOUT: Duration = Duration::from_secs(20);
+const DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2: u32 = 15;
+const DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR: u32 = 2;
 
 #[link(name = "user32")]
 extern "system" {
@@ -82,9 +90,6 @@ extern "system" {
     fn DisplayConfigGetDeviceInfo(request_packet: *mut DISPLAYCONFIG_DEVICE_INFO_HEADER) -> LONG;
 }
 
-const DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2: u32 = 15;
-const DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR: u32 = 2;
-
 #[repr(C)]
 struct DisplayconfigGetAdvancedColorInfo2 {
     header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
@@ -92,28 +97,6 @@ struct DisplayconfigGetAdvancedColorInfo2 {
     color_encoding: u32,
     bits_per_color_channel: u32,
     active_color_mode: u32,
-}
-
-fn with_gpu_next_fallback(vo: String) -> String {
-    let mut outputs = vo
-        .split(',')
-        .filter(|output| !output.is_empty())
-        .map(String::from)
-        .collect::<Vec<String>>();
-
-    let has_gpu_next = outputs.iter().any(|output| output == "gpu-next");
-    let has_gpu = outputs.iter().any(|output| output == "gpu");
-
-    if outputs.is_empty() {
-        outputs.push("gpu-next".to_string());
-        outputs.push("gpu".to_string());
-    } else if has_gpu_next && !has_gpu {
-        outputs.push("gpu".to_string());
-    } else if has_gpu && !has_gpu_next {
-        outputs.push("gpu-next".to_string());
-    }
-
-    format!("{},", outputs.join(","))
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -127,6 +110,103 @@ enum DisplayOutputMode {
 struct DisplayOutputState {
     mode: DisplayOutputMode,
     scale_percent: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadState {
+    Idle,
+    Loading,
+    Loaded,
+    Stopping,
+}
+
+struct PlayerController {
+    observed_properties: HashSet<String>,
+    state: LoadState,
+    current_url: String,
+    pending_loadfile: Option<CmdVal>,
+    active_loadfile: Option<ActiveLoadfile>,
+    pending_startup_props: Vec<(PropKey, PropVal)>,
+    pending_startup_retry: Option<ScheduledStartupRetry>,
+    pending_reload_url: Option<String>,
+    pending_reload_seek: Option<f64>,
+    startup_retry_attempts: u32,
+    premature_eof_reloads: u32,
+    stop_started_at: Option<Instant>,
+    window_handle: isize,
+    gpu_video_processing: bool,
+    last_display_output: Option<(DisplayOutputState, bool)>,
+    next_display_refresh: Instant,
+}
+
+struct ActiveLoadfile {
+    url: String,
+    queued_at: Instant,
+    start_file_seen: bool,
+    file_loaded: bool,
+    requested_start: Option<f64>,
+}
+
+struct ScheduledStartupRetry {
+    due_at: Instant,
+    expected_url: String,
+    retry_url: String,
+    attempt: u32,
+    resume_position: Option<f64>,
+}
+
+struct MpvCommandJob {
+    name: String,
+    args: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct MpvCommandHandle(*mut libmpv2_sys::mpv_handle);
+
+unsafe impl Send for MpvCommandHandle {}
+unsafe impl Sync for MpvCommandHandle {}
+
+impl PlayerController {
+    fn new(window_handle: isize) -> Self {
+        Self {
+            observed_properties: HashSet::new(),
+            state: LoadState::Idle,
+            current_url: String::new(),
+            pending_loadfile: None,
+            active_loadfile: None,
+            pending_startup_props: Vec::new(),
+            pending_startup_retry: None,
+            pending_reload_url: None,
+            pending_reload_seek: None,
+            startup_retry_attempts: 0,
+            premature_eof_reloads: 0,
+            stop_started_at: None,
+            window_handle,
+            gpu_video_processing: false,
+            last_display_output: None,
+            next_display_refresh: Instant::now(),
+        }
+    }
+
+    fn refresh_display_output(&mut self, mpv: &Mpv) {
+        let now = Instant::now();
+        if now < self.next_display_refresh {
+            return;
+        }
+        self.next_display_refresh = now + Duration::from_millis(500);
+
+        let state = current_display_output_state(mpv, self.window_handle as HWND);
+        let key = (state, self.gpu_video_processing);
+        if self.last_display_output != Some(key) {
+            apply_display_output_mode(mpv, state, self.gpu_video_processing);
+            self.last_display_output = Some(key);
+        }
+    }
+
+    fn invalidate_display_output(&mut self) {
+        self.last_display_output = None;
+        self.next_display_refresh = Instant::now();
+    }
 }
 
 #[derive(Default)]
@@ -150,31 +230,14 @@ impl PartialUi for Player {
 
         let (in_msg_sender, in_msg_receiver) = flume::unbounded();
         let (rpc_response_sender, rpc_response_receiver) = flume::unbounded();
-        let (observe_property_sender, observe_property_receiver) = flume::unbounded();
         data.channel = ipc::Channel::new(Some((in_msg_sender, rpc_response_receiver)));
 
-        let mpv = Arc::new(create_mpv(window_handle));
-        let mpv_event_client = mpv
-            .create_client(None)
-            .expect("cannot create MPV event client");
-
+        let mpv = create_shareable_mpv(window_handle);
         let _event_thread = create_event_thread(
-            mpv_event_client,
-            observe_property_receiver,
-            rpc_response_sender,
-        );
-        let gpu_video_processing = Arc::new(AtomicBool::new(false));
-        let _display_thread = create_display_output_thread(
-            Arc::clone(&mpv),
-            window_handle as isize,
-            Arc::clone(&gpu_video_processing),
-        );
-        let _message_thread = create_message_thread(
             mpv,
             window_handle as isize,
-            gpu_video_processing,
-            observe_property_sender,
             in_msg_receiver,
+            rpc_response_sender,
         );
         // @TODO implement a mechanism to stop threads on `Player` drop if needed
 
@@ -182,7 +245,7 @@ impl PartialUi for Player {
     }
 }
 
-fn create_mpv(window_handle: HWND) -> Mpv {
+fn create_shareable_mpv(window_handle: HWND) -> Mpv {
     let mpv = Mpv::with_initializer(|initializer| {
         macro_rules! set_property {
             ($name:literal, $value:expr) => {
@@ -219,8 +282,6 @@ fn create_mpv(window_handle: HWND) -> Mpv {
             ("tone-mapping", "bt.2390"),
             ("dither-depth", "auto"),
             ("deband", "yes"),
-            ("scale", "spline36"),
-            ("cscale", "spline36"),
         ] {
             if let Err(error) = initializer.set_property(name, value) {
                 eprintln!("mpv: cannot set {name}={value}: {error:?}");
@@ -231,24 +292,25 @@ fn create_mpv(window_handle: HWND) -> Mpv {
     mpv.expect("cannot build MPV")
 }
 
-fn create_display_output_thread(
-    mpv: Arc<Mpv>,
-    window_handle: isize,
-    gpu_video_processing: Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let mut last_state = None;
+fn with_gpu_next_fallback(vo: String) -> String {
+    let mut outputs = vo
+        .split(',')
+        .filter(|output| !output.is_empty())
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let has_gpu_next = outputs.iter().any(|output| output == "gpu-next");
+    let has_gpu = outputs.iter().any(|output| output == "gpu");
 
-        loop {
-            let state = current_display_output_state(&mpv, window_handle as HWND);
-            let gpu = gpu_video_processing.load(Ordering::Relaxed);
-            if last_state != Some((state, gpu)) {
-                apply_display_output_mode(&mpv, state, gpu);
-                last_state = Some((state, gpu));
-            }
-            thread::sleep(Duration::from_millis(500));
-        }
-    })
+    if outputs.is_empty() {
+        outputs.push("gpu-next".to_string());
+        outputs.push("gpu".to_string());
+    } else if has_gpu_next && !has_gpu {
+        outputs.push("gpu".to_string());
+    } else if has_gpu && !has_gpu_next {
+        outputs.push("gpu-next".to_string());
+    }
+
+    format!("{},", outputs.join(","))
 }
 
 fn current_display_output_state(mpv: &Mpv, window_handle: HWND) -> DisplayOutputState {
@@ -283,8 +345,8 @@ fn current_video_filter_scale(mpv: &Mpv, window_handle: HWND) -> u32 {
 
 fn current_video_height(mpv: &Mpv) -> Option<f64> {
     let video_params = mpv.get_property::<String>("video-params").ok()?;
-    let video_params = serde_json::from_str::<serde_json::Value>(&video_params).ok()?;
-    video_params.get("h").and_then(serde_json::Value::as_f64)
+    let video_params = serde_json::from_str::<Value>(&video_params).ok()?;
+    video_params.get("h").and_then(Value::as_f64)
 }
 
 fn current_monitor_height(window_handle: HWND) -> Option<f64> {
@@ -303,8 +365,6 @@ fn current_monitor_height(window_handle: HWND) -> Option<f64> {
 }
 
 fn apply_display_output_mode(mpv: &Mpv, state: DisplayOutputState, gpu_video_processing: bool) {
-    // Target colorspace follows the display so native HDR still passes through; the RTX
-    // HDR filter is the opt-in part and only makes sense on an HDR display.
     let vf = if gpu_video_processing {
         let scale = state.scale_percent as f64 / 100.0;
         let mut vf = format!("d3d11vpp=scaling-mode=nvidia:scale={scale:.2}");
@@ -347,11 +407,9 @@ fn monitor_hdr_active(monitor: HMONITOR) -> Option<bool> {
         let Some(source_name) = display_source_name(&path) else {
             continue;
         };
-        if source_name.viewGdiDeviceName != device_name {
-            continue;
+        if source_name.viewGdiDeviceName == device_name {
+            return display_hdr_active(&path);
         }
-
-        return display_hdr_active(&path);
     }
 
     None
@@ -360,24 +418,19 @@ fn monitor_hdr_active(monitor: HMONITOR) -> Option<bool> {
 fn monitor_device_name(monitor: HMONITOR) -> Option<[u16; 32]> {
     let mut monitor_info: MONITORINFOEXW = unsafe { mem::zeroed() };
     monitor_info.cbSize = mem::size_of::<MONITORINFOEXW>() as DWORD;
-
     let result =
         unsafe { GetMonitorInfoW(monitor, &mut monitor_info as *mut _ as *mut MONITORINFO) };
-    if result == 0 {
-        None
-    } else {
-        Some(monitor_info.szDevice)
-    }
+    (result != 0).then_some(monitor_info.szDevice)
 }
 
 fn active_display_paths() -> Option<Vec<DISPLAYCONFIG_PATH_INFO>> {
     for _ in 0..3 {
         let mut path_count = 0;
         let mut mode_count = 0;
-        let buffer_status = unsafe {
+        let status = unsafe {
             GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
         };
-        if buffer_status != ERROR_SUCCESS as LONG {
+        if status != ERROR_SUCCESS as LONG {
             return None;
         }
 
@@ -385,7 +438,7 @@ fn active_display_paths() -> Option<Vec<DISPLAYCONFIG_PATH_INFO>> {
             vec![unsafe { mem::zeroed::<DISPLAYCONFIG_PATH_INFO>() }; path_count as usize];
         let mut modes =
             vec![unsafe { mem::zeroed::<DISPLAYCONFIG_MODE_INFO>() }; mode_count as usize];
-        let query_status = unsafe {
+        let status = unsafe {
             QueryDisplayConfig(
                 QDC_ONLY_ACTIVE_PATHS,
                 &mut path_count,
@@ -396,15 +449,14 @@ fn active_display_paths() -> Option<Vec<DISPLAYCONFIG_PATH_INFO>> {
             )
         };
 
-        if query_status == ERROR_SUCCESS as LONG {
+        if status == ERROR_SUCCESS as LONG {
             paths.truncate(path_count as usize);
             return Some(paths);
         }
-        if query_status != ERROR_INSUFFICIENT_BUFFER as LONG {
+        if status != ERROR_INSUFFICIENT_BUFFER as LONG {
             return None;
         }
     }
-
     None
 }
 
@@ -418,11 +470,7 @@ fn display_source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<DISPLAYCONFIG_S
     };
 
     let status = unsafe { DisplayConfigGetDeviceInfo(&mut source_name.header) };
-    if status == ERROR_SUCCESS as LONG {
-        Some(source_name)
-    } else {
-        None
-    }
+    (status == ERROR_SUCCESS as LONG).then_some(source_name)
 }
 
 fn display_hdr_active(path: &DISPLAYCONFIG_PATH_INFO) -> Option<bool> {
@@ -435,35 +483,55 @@ fn display_hdr_active(path: &DISPLAYCONFIG_PATH_INFO) -> Option<bool> {
     };
 
     let status = unsafe { DisplayConfigGetDeviceInfo(&mut color_info.header) };
-    if status == ERROR_SUCCESS as LONG {
-        Some(color_info.active_color_mode == DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR)
-    } else {
-        None
-    }
+    (status == ERROR_SUCCESS as LONG)
+        .then_some(color_info.active_color_mode == DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR)
 }
 
 fn create_event_thread(
-    mut mpv_event_client: Mpv,
-    observe_property_receiver: Receiver<ObserveProperty>,
+    mut mpv: Mpv,
+    window_handle: isize,
+    in_msg_receiver: Receiver<String>,
     rpc_response_sender: Sender<String>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        mpv_event_client
-            .disable_deprecated_events()
+        let mut controller = PlayerController::new(window_handle);
+        mpv.disable_deprecated_events()
             .expect("failed to disable deprecated MPV events");
+        let mpv_command_sender = spawn_mpv_command_worker(&mpv);
+
+        for (name, format) in [
+            ("time-pos", Format::Double),
+            ("duration", Format::Double),
+            ("pause", Format::Flag),
+            ("chapter", Format::Int64),
+            ("chapter-metadata/by-key/title", Format::String),
+        ] {
+            observe_property(&mpv, name, format);
+            controller.observed_properties.insert(name.to_string());
+        }
 
         loop {
-            // Drain newly observed properties
-            for ObserveProperty { name, format } in observe_property_receiver.drain() {
-                mpv_event_client
-                    .observe_property(&name, format, 0)
-                    .expect("failed to observe MPV property");
+            while let Ok(msg) = in_msg_receiver.try_recv() {
+                controller.handle_in_msg(&mpv, &mpv_command_sender, msg, &rpc_response_sender);
             }
+            controller.flush_stale_stop(&mpv_command_sender);
+            controller.flush_stale_loadfile(&mpv_command_sender);
+            controller.flush_pending_startup_retry(&mpv_command_sender);
+            controller.refresh_display_output(&mpv);
 
-            let event = match mpv_event_client.wait_event(0.1) {
+            let event = match mpv.wait_event(0.01) {
                 Some(Ok(event)) => event,
                 Some(Err(error)) => {
                     eprintln!("Event errored: {error:?}");
+                    let resume_position = controller
+                        .active_loadfile
+                        .as_ref()
+                        .and_then(|active| active.requested_start);
+                    controller.retry_local_stream_startup_failure(
+                        &mpv_command_sender,
+                        "event error",
+                        resume_position,
+                    );
                     continue;
                 }
                 None => continue,
@@ -471,52 +539,27 @@ fn create_event_thread(
 
             let player_response = match event {
                 Event::StartFile => {
-                    *CURRENT_TIME.lock().unwrap() = 0.0;
-                    *TOTAL_DURATION.lock().unwrap() = 0.0;
-                    *IS_PAUSED.lock().unwrap() = true;
-                    *IS_FILE_LOADED.lock().unwrap() = false;
-                    *CURRENT_CHAPTER.lock().unwrap() = -1;
-                    *CURRENT_CHAPTER_TITLE.lock().unwrap() = String::new();
+                    println!("[MPV] StartFile");
+                    controller.on_start_file();
                     continue;
                 }
                 Event::FileLoaded => {
-                    *IS_FILE_LOADED.lock().unwrap() = true;
+                    let url = controller.current_url.clone();
+                    println!("[MPV] FileLoaded url={url}");
+                    controller.on_file_loaded(&mpv, &rpc_response_sender);
+                    emit_loaded_property_snapshot(&mpv, &rpc_response_sender);
+
+                    if let Some(pos) = controller.take_pending_reload_seek_for(&url) {
+                        println!("[MPV] Restoring position after reload: {}", pos);
+                        send_command(
+                            &mpv_command_sender,
+                            CmdVal::Tripple(MpvCmd::Seek, pos.to_string(), "absolute".to_string()),
+                        );
+                    }
                     continue;
                 }
                 Event::PropertyChange { name, change, .. } => {
-                    // `change` is a plain `PropertyData`, not an Option
-                    if name == "time-pos" {
-                        // If it's a Double, print it
-                        if let PropertyData::Double(pos_secs) = change {
-                            *CURRENT_TIME.lock().unwrap() = pos_secs;
-                        }
-                    }
-                    if name == "duration" {
-                        if let PropertyData::Double(dur_secs) = change {
-                            *TOTAL_DURATION.lock().unwrap() = dur_secs;
-                        }
-                    }
-                    if name == "pause" {
-                        if let PropertyData::Flag(pause) = change {
-                            *IS_PAUSED.lock().unwrap() = pause;
-                        }
-                    }
-                    if name == "chapter" {
-                        if let PropertyData::Int64(chapter_idx) = change {
-                            *CURRENT_CHAPTER.lock().unwrap() = chapter_idx;
-                        }
-                    }
-                    if name == "chapter-metadata/by-key/title" {
-                        match change {
-                            PropertyData::Str(ref title) | PropertyData::OsdStr(ref title) => {
-                                *CURRENT_CHAPTER_TITLE.lock().unwrap() = title.to_string();
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // Because from_name_value expects `PropertyData`,
-                    // just pass `change` directly:
+                    update_cached_property(&name, &change);
                     PlayerResponse(
                         "mpv-prop-change",
                         PlayerEvent::PropChange(PlayerProprChange::from_name_value(
@@ -526,7 +569,78 @@ fn create_event_thread(
                     )
                 }
                 Event::EndFile(reason) => {
-                    *IS_FILE_LOADED.lock().unwrap() = false;
+                    let url = controller.current_url.clone();
+                    let time = *CURRENT_TIME.lock().unwrap();
+                    let duration = *TOTAL_DURATION.lock().unwrap();
+                    println!(
+                        "[MPV] EndFile reason={:?}, time={}, duration={}, url={}",
+                        reason, time, duration, url
+                    );
+
+                    controller.on_end_file();
+                    if controller.send_pending_loadfile(&mpv_command_sender) {
+                        continue;
+                    }
+
+                    // Implement reload-on-stuck behavior for local torrent URLs
+                    if reason == libmpv2::mpv_end_file_reason::Eof {
+                        let premature = url.contains("127.0.0.1:11470")
+                            && duration > 30.0
+                            && time > 0.0
+                            && time < duration - 10.0;
+
+                        if premature {
+                            if controller.premature_eof_reloads < 1 {
+                                controller.premature_eof_reloads += 1;
+                                println!(
+                                    "[MPV] Premature EOF detected on local stream. Reloading..."
+                                );
+
+                                let url2 = cache_busted_url(&url);
+
+                                controller.set_current_url(url2.clone());
+                                controller.pending_reload_url = Some(url2.clone());
+                                controller.pending_reload_seek = Some(time);
+                                let cmd =
+                                    CmdVal::Tripple(MpvCmd::Loadfile, url2, "replace".to_string());
+                                controller.send_loadfile_now(&mpv_command_sender, cmd);
+
+                                // Do not propagate this premature EndFile to the frontend,
+                                // otherwise the autoplay logic might trigger next episode.
+                                continue;
+                            }
+                        }
+                    }
+
+                    if reason == libmpv2::mpv_end_file_reason::Error {
+                        let resume_position = controller
+                            .active_loadfile
+                            .as_ref()
+                            .and_then(|active| active.requested_start);
+                        if controller.retry_local_stream_startup_failure(
+                            &mpv_command_sender,
+                            "end-file error",
+                            resume_position,
+                        ) {
+                            continue;
+                        }
+                    }
+
+                    let stopped_at_media_end = reason == libmpv2::mpv_end_file_reason::Stop
+                        && duration > 0.0
+                        && time >= duration - 1.0;
+
+                    if matches!(
+                        reason,
+                        libmpv2::mpv_end_file_reason::Stop
+                            | libmpv2::mpv_end_file_reason::Quit
+                            | libmpv2::mpv_end_file_reason::Redirect
+                    ) && !stopped_at_media_end
+                    {
+                        println!("[MPV] Suppressing non-terminal EndFile reason={:?}", reason);
+                        continue;
+                    }
+
                     PlayerResponse(
                         "mpv-event-ended",
                         PlayerEvent::End(PlayerEnded::from_end_reason(reason)),
@@ -535,164 +649,1089 @@ fn create_event_thread(
                 Event::Shutdown => {
                     break;
                 }
+                Event::CommandReply(request_id) => {
+                    println!("[MPV CMD REPLY] request_id={request_id}");
+                    controller.on_command_reply(request_id);
+                    continue;
+                }
                 _ => continue,
             };
 
-            if let Err(error) =
-                rpc_response_sender.send(RPCResponse::response_message(player_response.to_value()))
-            {
-                eprintln!("failed to send RPCResponse: {error}");
-                break;
-            }
+            rpc_response_sender
+                .send(RPCResponse::response_message(player_response.to_value()))
+                .expect("failed to send RPCResponse");
         }
     })
 }
 
-fn create_message_thread(
-    mpv: Arc<Mpv>,
-    window_handle: isize,
-    gpu_video_processing: Arc<AtomicBool>,
-    observe_property_sender: Sender<ObserveProperty>,
-    in_msg_receiver: Receiver<String>,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
+fn spawn_mpv_command_worker(mpv: &Mpv) -> Sender<MpvCommandJob> {
+    let command_handle = MpvCommandHandle(mpv.ctx.as_ptr());
+    let (sender, receiver) = flume::unbounded();
+    thread::spawn(move || run_mpv_command_worker(command_handle, receiver));
+    sender
+}
+
+fn run_mpv_command_worker(command_handle: MpvCommandHandle, receiver: Receiver<MpvCommandJob>) {
+    while let Ok(job) = receiver.recv() {
+        let started_at = Instant::now();
+        println!("[MPV CMD START] {} {:?}", job.name, job.args);
+        match run_mpv_command(command_handle, &job.name, &job.args) {
+            Ok(()) => {
+                println!(
+                    "[MPV CMD OK] {} {:?} elapsed_ms={}",
+                    job.name,
+                    job.args,
+                    started_at.elapsed().as_millis()
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "[MPV CMD ERROR] {} {:?} elapsed_ms={}: '{}'",
+                    job.name,
+                    job.args,
+                    started_at.elapsed().as_millis(),
+                    error
+                );
+            }
+        }
+    }
+}
+
+fn run_mpv_command(
+    command_handle: MpvCommandHandle,
+    name: &str,
+    args: &[String],
+) -> std::result::Result<(), String> {
+    let mut cstr_args = Vec::with_capacity(args.len() + 1);
+    cstr_args.push(CString::new(name).map_err(|error| error.to_string())?);
+    for arg in args {
+        cstr_args.push(CString::new(arg.as_str()).map_err(|error| error.to_string())?);
+    }
+
+    let mut ptrs = cstr_args
+        .iter()
+        .map(|arg| arg.as_ptr())
+        .collect::<Vec<*const c_char>>();
+    ptrs.push(std::ptr::null());
+
+    let result = unsafe { libmpv2_sys::mpv_command(command_handle.0, ptrs.as_mut_ptr()) };
+    if result < 0 {
+        Err(mpv_error_string(result))
+    } else {
+        Ok(())
+    }
+}
+
+fn mpv_error_string(error: i32) -> String {
+    let ptr = unsafe { libmpv2_sys::mpv_error_string(error) };
+    if ptr.is_null() {
+        return format!("mpv error {error}");
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+impl PlayerController {
+    fn handle_in_msg(
+        &mut self,
+        mpv: &Mpv,
+        mpv_command_sender: &Sender<MpvCommandJob>,
+        msg: String,
+        rpc_response_sender: &Sender<String>,
+    ) {
+        println!("[PLAYER] incoming raw message: {msg}");
+        let in_msg: InMsg = match serde_json::from_str(&msg) {
+            Ok(in_msg) => in_msg,
+            Err(error) => {
+                eprintln!("cannot parse InMsg:{:?} {error:#}", &msg);
+                return;
+            }
+        };
+
+        match in_msg {
+            InMsg(InMsgFn::MpvObserveProp, InMsgArgs::ObProp(PropKey::Bool(prop))) => {
+                observe_and_emit_current_property(
+                    mpv,
+                    rpc_response_sender,
+                    &mut self.observed_properties,
+                    &prop.to_string(),
+                    Format::Flag,
+                );
+            }
+            InMsg(InMsgFn::MpvObserveProp, InMsgArgs::ObProp(PropKey::Int(prop))) => {
+                observe_and_emit_current_property(
+                    mpv,
+                    rpc_response_sender,
+                    &mut self.observed_properties,
+                    &prop.to_string(),
+                    Format::Int64,
+                );
+            }
+            InMsg(InMsgFn::MpvObserveProp, InMsgArgs::ObProp(PropKey::Fp(prop))) => {
+                observe_and_emit_current_property(
+                    mpv,
+                    rpc_response_sender,
+                    &mut self.observed_properties,
+                    &prop.to_string(),
+                    Format::Double,
+                );
+            }
+            InMsg(InMsgFn::MpvObserveProp, InMsgArgs::ObProp(PropKey::Str(prop))) => {
+                observe_and_emit_current_property(
+                    mpv,
+                    rpc_response_sender,
+                    &mut self.observed_properties,
+                    &prop.to_string(),
+                    Format::String,
+                );
+            }
+            InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Bool(value))) => {
+                self.set_or_queue_prop(mpv, rpc_response_sender, name, PropVal::Bool(value));
+            }
+            InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Num(value))) => {
+                self.set_or_queue_prop(mpv, rpc_response_sender, name, PropVal::Num(value));
+            }
+            InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Str(value))) => {
+                let name_string = name.to_string();
+                let is_vo = name_string == "vo";
+                let value = if name_string == "sub-ass-override" && value == "strip" {
+                    // Map "strip" to "scale". This preserves ASS styles and positioning while
+                    // still allowing subtitle scaling.
+                    "scale".to_string()
+                } else if is_vo {
+                    with_gpu_next_fallback(value)
+                } else {
+                    value
+                };
+                self.set_or_queue_prop(mpv, rpc_response_sender, name, PropVal::Str(value));
+                if is_vo {
+                    self.invalidate_display_output();
+                }
+            }
+            InMsg(InMsgFn::MpvSetGpuVideoProcessing, InMsgArgs::Flag(enabled)) => {
+                self.gpu_video_processing = enabled;
+                self.invalidate_display_output();
+                self.refresh_display_output(mpv);
+            }
+            InMsg(InMsgFn::MpvCommand, InMsgArgs::Cmd(cmd)) => {
+                self.handle_command(mpv_command_sender, cmd);
+            }
+            msg => {
+                eprintln!("MPV unsupported message: '{msg:?}'");
+            }
+        }
+    }
+
+    fn handle_command(&mut self, mpv_command_sender: &Sender<MpvCommandJob>, cmd: CmdVal) {
+        println!("[PLAYER] parsed mpv command: {cmd:?}");
+        let cmd = sanitize_loadfile_start(cmd);
+        println!("[PLAYER] sanitized mpv command: {cmd:?}");
+
+        if is_stop_command(&cmd) {
+            self.handle_stop(mpv_command_sender, cmd);
+            return;
+        }
+
+        if is_loadfile_command(&cmd) {
+            self.capture_loadfile_url(&cmd);
+            if self.state == LoadState::Stopping {
+                println!("[PLAYER] deferring loadfile until stop completes: {cmd:?}");
+                self.pending_loadfile = Some(cmd);
+                return;
+            }
+            self.send_loadfile_now(mpv_command_sender, cmd);
+            return;
+        }
+
+        send_command(mpv_command_sender, cmd);
+    }
+
+    fn set_or_queue_prop(
+        &mut self,
+        mpv: &Mpv,
+        rpc_response_sender: &Sender<String>,
+        name: PropKey,
+        value: PropVal,
+    ) {
+        if self.should_defer_startup_property(&name) {
+            let name_string = name.to_string();
+            let value_json =
+                normalize_property_value_for_web(&name_string, &prop_val_to_json(&value));
+            cache_property_value(&name_string, &value_json);
+            emit_property_value(rpc_response_sender, &name_string, value_json);
+            self.queue_startup_property(name, value);
+            return;
+        }
+        set_prop_val(name, value, mpv, Some(rpc_response_sender));
+    }
+
+    fn handle_stop(&mut self, mpv_command_sender: &Sender<MpvCommandJob>, cmd: CmdVal) {
+        if self.state == LoadState::Stopping {
+            println!("[PLAYER] skipping duplicate stop while already stopping");
+            return;
+        }
+
+        clear_file_scoped_cached_props();
+        if self.state == LoadState::Idle {
+            if self.abort_active_loadfile("stop received while controller was idle") {
+                println!("[PLAYER] cancelled unresolved loadfile from idle state");
+            } else {
+                println!("[PLAYER] skipping idle stop");
+            }
+            return;
+        }
+
+        if self.state == LoadState::Loading
+            && self.abort_active_loadfile("stop received while loading")
         {
-            observe_property_sender
-                .send(ObserveProperty {
-                    name: "time-pos".to_string(),
-                    format: Format::Double,
-                })
-                .expect("cannot send ObserveProperty");
-            observe_property_sender
-                .send(ObserveProperty {
-                    name: "duration".to_string(),
-                    format: Format::Double,
-                })
-                .expect("cannot send ObserveProperty");
-            observe_property_sender
-                .send(ObserveProperty {
-                    name: "pause".to_string(),
-                    format: Format::Flag,
-                })
-                .expect("cannot send ObserveProperty");
-            // Chapter information (used for chapter-based intro/outro skipping).
-            observe_property_sender
-                .send(ObserveProperty {
-                    name: "chapter".to_string(),
-                    format: Format::Int64,
-                })
-                .expect("cannot send ObserveProperty");
-            observe_property_sender
-                .send(ObserveProperty {
-                    name: "chapter-metadata/by-key/title".to_string(),
-                    format: Format::String,
-                })
-                .expect("cannot send ObserveProperty");
+            println!("[PLAYER] cancelled in-flight loadfile instead of queuing stop behind it");
+            self.state = LoadState::Idle;
+            self.stop_started_at = None;
+            *IS_FILE_LOADED.lock().unwrap() = false;
+            *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+            return;
         }
 
-        // -- Helpers --
+        println!("[PLAYER] entering Stopping state from {:?}", self.state);
+        self.state = LoadState::Stopping;
+        self.stop_started_at = Some(Instant::now());
+        *IS_FILE_LOADED.lock().unwrap() = false;
+        *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = true;
+        send_command(mpv_command_sender, cmd);
+    }
 
-        let observe_property = |name: String, format: Format| {
-            if let Err(error) = observe_property_sender.send(ObserveProperty { name, format }) {
-                eprintln!("cannot send ObserveProperty: {error}");
-            }
+    fn capture_loadfile_url(&mut self, cmd: &CmdVal) {
+        let Some(url) = loadfile_url(cmd) else {
+            return;
         };
 
-        let send_command = |cmd: CmdVal| {
-            let parts: Vec<String> = cmd.into();
-            if let Some((name, args)) = parts.split_first() {
-                let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-                if let Err(error) = mpv.command(name, &args) {
-                    eprintln!("failed to execute MPV command: '{error:#}'")
-                }
+        let is_reload = url.contains("_reload=");
+        if self.current_url != url && !is_reload {
+            println!(
+                "[PLAYER] new non-reload stream. previous={}, next={}",
+                self.current_url, url
+            );
+            clear_file_scoped_cached_props();
+            *CURRENT_TIME.lock().unwrap() = 0.0;
+            *TOTAL_DURATION.lock().unwrap() = 0.0;
+            self.startup_retry_attempts = 0;
+            self.premature_eof_reloads = 0;
+            self.pending_startup_retry = None;
+            self.pending_reload_url = None;
+            self.pending_reload_seek = None;
+        }
+
+        self.set_current_url(url.to_string());
+        println!("Stream URL captured: {}", url);
+    }
+
+    fn on_start_file(&mut self) {
+        self.state = LoadState::Loading;
+        self.stop_started_at = None;
+        if let Some(active) = self.active_loadfile.as_mut() {
+            active.start_file_seen = true;
+        }
+        *CURRENT_TIME.lock().unwrap() = 0.0;
+        *TOTAL_DURATION.lock().unwrap() = 0.0;
+        *IS_PAUSED.lock().unwrap() = true;
+        *IS_FILE_LOADED.lock().unwrap() = false;
+        *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+        clear_file_scoped_cached_props();
+        *CURRENT_CHAPTER.lock().unwrap() = -1;
+        *CURRENT_CHAPTER_TITLE.lock().unwrap() = String::new();
+    }
+
+    fn on_file_loaded(&mut self, mpv: &Mpv, rpc_response_sender: &Sender<String>) {
+        self.state = LoadState::Loaded;
+        self.stop_started_at = None;
+        if let Some(active) = self.active_loadfile.as_mut() {
+            active.file_loaded = true;
+            self.active_loadfile = None;
+        }
+        self.pending_startup_retry = None;
+        self.startup_retry_attempts = 0;
+        *IS_FILE_LOADED.lock().unwrap() = true;
+        *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+        self.apply_pending_startup_properties(mpv, rpc_response_sender);
+        self.invalidate_display_output();
+    }
+
+    fn on_end_file(&mut self) {
+        let replacement_is_loading = self
+            .active_loadfile
+            .as_ref()
+            .map(|active| !active.file_loaded)
+            .unwrap_or(false);
+        if replacement_is_loading {
+            println!(
+                "[PLAYER] EndFile arrived while replacement loadfile is active; staying Loading"
+            );
+            self.state = LoadState::Loading;
+        } else {
+            self.state = LoadState::Idle;
+        }
+        self.stop_started_at = None;
+        *IS_FILE_LOADED.lock().unwrap() = false;
+        *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+    }
+
+    fn should_defer_startup_property(&self, name: &PropKey) -> bool {
+        self.state != LoadState::Loaded && is_startup_property(name)
+    }
+
+    fn queue_startup_property(&mut self, name: PropKey, value: PropVal) {
+        println!("[PLAYER] deferring startup property until file is loaded: {name:?}={value:?}");
+        if let Some((_, existing_value)) = self
+            .pending_startup_props
+            .iter_mut()
+            .find(|(existing_name, _)| *existing_name == name)
+        {
+            *existing_value = value;
+            return;
+        }
+        self.pending_startup_props.push((name, value));
+    }
+
+    fn apply_pending_startup_properties(
+        &mut self,
+        mpv: &Mpv,
+        rpc_response_sender: &Sender<String>,
+    ) {
+        let pending = std::mem::take(&mut self.pending_startup_props);
+        for (name, value) in pending {
+            println!("[PLAYER] applying deferred startup property: {name:?}={value:?}");
+            set_prop_val(name, value, mpv, Some(rpc_response_sender));
+        }
+    }
+
+    fn take_pending_reload_seek_for(&mut self, url: &str) -> Option<f64> {
+        match self.pending_reload_url.as_deref() {
+            Some(expected_url) if expected_url == url => {
+                self.pending_reload_url = None;
+                self.pending_reload_seek.take()
             }
+            Some(_) => {
+                self.pending_reload_url = None;
+                self.pending_reload_seek = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn set_current_url(&mut self, url: String) {
+        self.current_url = url.clone();
+        *CURRENT_STREAM_URL.lock().unwrap() = url;
+    }
+
+    fn send_loadfile_now(&mut self, mpv_command_sender: &Sender<MpvCommandJob>, cmd: CmdVal) {
+        let url = loadfile_url(&cmd).unwrap_or_default().to_string();
+        let requested_start = loadfile_requested_start(&cmd);
+        self.abort_active_loadfile("superseded by a newer loadfile");
+        self.state = LoadState::Loading;
+        self.stop_started_at = None;
+        *IS_FILE_LOADED.lock().unwrap() = false;
+        *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+        if send_command(mpv_command_sender, cmd) {
+            self.active_loadfile = Some(ActiveLoadfile {
+                url,
+                queued_at: Instant::now(),
+                start_file_seen: false,
+                file_loaded: false,
+                requested_start,
+            });
+        } else {
+            self.state = LoadState::Idle;
+        }
+    }
+
+    fn abort_active_loadfile(&mut self, reason: &str) -> bool {
+        let Some(active) = self.active_loadfile.take() else {
+            return false;
         };
 
-        fn set_property(name: impl ToString, value: impl SetData, mpv: &Mpv) {
-            if let Err(error) = mpv.set_property(&name.to_string(), value) {
-                eprintln!("cannot set MPV property: '{error:#}'")
-            }
+        println!(
+            "[PLAYER] clearing active loadfile url={} reason={}",
+            active.url, reason
+        );
+        true
+    }
+
+    fn on_command_reply(&mut self, request_id: u64) {
+        println!("[PLAYER] ignoring unexpected async command reply request_id={request_id}");
+    }
+
+    fn send_pending_loadfile(&mut self, mpv_command_sender: &Sender<MpvCommandJob>) -> bool {
+        let Some(cmd) = self.pending_loadfile.take() else {
+            return false;
+        };
+
+        println!("[PLAYER] sending deferred loadfile after stop completed: {cmd:?}");
+        self.send_loadfile_now(mpv_command_sender, cmd);
+        true
+    }
+
+    fn flush_stale_stop(&mut self, mpv_command_sender: &Sender<MpvCommandJob>) {
+        if self.state != LoadState::Stopping {
+            return;
         }
 
-        // -- InMsg handler loop --
+        let Some(started_at) = self.stop_started_at else {
+            return;
+        };
 
-        for msg in in_msg_receiver.iter() {
-            let in_msg: InMsg = match serde_json::from_str(&msg) {
-                Ok(in_msg) => in_msg,
-                Err(error) => {
-                    eprintln!("cannot parse InMsg:{:?} {error:#}", msg);
-                    continue;
-                }
-            };
+        if started_at.elapsed() < Duration::from_secs(2) {
+            return;
+        }
 
-            match in_msg {
-                InMsg(InMsgFn::MpvObserveProp, InMsgArgs::ObProp(PropKey::Bool(prop))) => {
-                    observe_property(prop.to_string(), Format::Flag);
-                }
-                InMsg(InMsgFn::MpvObserveProp, InMsgArgs::ObProp(PropKey::Int(prop))) => {
-                    observe_property(prop.to_string(), Format::Int64);
-                }
-                InMsg(InMsgFn::MpvObserveProp, InMsgArgs::ObProp(PropKey::Fp(prop))) => {
-                    observe_property(prop.to_string(), Format::Double);
-                }
-                InMsg(InMsgFn::MpvObserveProp, InMsgArgs::ObProp(PropKey::Str(prop))) => {
-                    observe_property(prop.to_string(), Format::String);
-                }
-                InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Bool(value))) => {
-                    set_property(name, value, &mpv);
-                }
-                InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Num(value))) => {
-                    set_property(name, value, &mpv);
-                }
-                InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Str(value))) => {
-                    let name_string = name.to_string();
-                    let is_vo = name_string == "vo";
-                    let value = if name_string == "sub-ass-override" && value == "strip" {
-                        // Preserve ASS styling/positioning while still allowing subtitle scale changes.
-                        "scale".to_string()
-                    } else if is_vo {
-                        with_gpu_next_fallback(value)
-                    } else {
-                        value
-                    };
-                    set_property(name, value, &mpv);
-                    // vo reinit reverts color props to defaults; re-assert for the current display.
-                    if is_vo {
-                        apply_display_output_mode(
-                            &mpv,
-                            current_display_output_state(&mpv, window_handle as HWND),
-                            gpu_video_processing.load(Ordering::Relaxed),
-                        );
-                    }
-                }
-                InMsg(InMsgFn::MpvSetGpuVideoProcessing, InMsgArgs::Flag(enabled)) => {
-                    gpu_video_processing.store(enabled, Ordering::Relaxed);
-                    apply_display_output_mode(
-                        &mpv,
-                        current_display_output_state(&mpv, window_handle as HWND),
-                        enabled,
-                    );
-                }
-                InMsg(InMsgFn::MpvCommand, InMsgArgs::Cmd(cmd)) => {
-                    // Capture the actual stream URL when loadfile is issued
-                    match &cmd {
-                        CmdVal::Double(MpvCmd::Loadfile, url)
-                        | CmdVal::Tripple(MpvCmd::Loadfile, url, ..)
-                        | CmdVal::Quadruple(MpvCmd::Loadfile, url, ..)
-                        | CmdVal::Quintuple(MpvCmd::Loadfile, url, ..) => {
-                            if let Ok(mut stream_url) = CURRENT_STREAM_URL.lock() {
-                                *stream_url = url.clone();
-                                println!("📺 Stream URL captured: {}", url);
-                            }
-                        }
-                        _ => {}
-                    }
-                    send_command(cmd);
-                }
-                msg => {
-                    eprintln!("MPV unsupported message: '{msg:?}'");
-                }
+        println!("[PLAYER] stop did not produce EndFile quickly; releasing queued transition");
+        self.state = LoadState::Idle;
+        self.stop_started_at = None;
+        *IS_FILE_LOADED.lock().unwrap() = false;
+        *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+        self.send_pending_loadfile(mpv_command_sender);
+    }
+
+    fn flush_stale_loadfile(&mut self, mpv_command_sender: &Sender<MpvCommandJob>) {
+        let Some(active) = self.active_loadfile.as_ref() else {
+            return;
+        };
+        if active.start_file_seen || active.queued_at.elapsed() < LOADFILE_START_TIMEOUT {
+            return;
+        }
+
+        let url = active.url.clone();
+        let resume_position = active.requested_start;
+        println!(
+            "[PLAYER] loadfile produced no StartFile within {}s; cancelling url={}",
+            LOADFILE_START_TIMEOUT.as_secs(),
+            url
+        );
+        self.abort_active_loadfile("StartFile watchdog expired");
+        self.state = LoadState::Idle;
+
+        if self.current_url != url {
+            println!(
+                "[PLAYER] not retrying stale watchdog URL. expired={}, current={}",
+                url, self.current_url
+            );
+            return;
+        }
+        self.retry_local_stream_startup_failure(
+            mpv_command_sender,
+            "StartFile watchdog",
+            resume_position,
+        );
+    }
+
+    fn flush_pending_startup_retry(&mut self, mpv_command_sender: &Sender<MpvCommandJob>) {
+        let Some(retry) = self.pending_startup_retry.as_ref() else {
+            return;
+        };
+
+        if retry.due_at > Instant::now() {
+            return;
+        }
+
+        let retry = self.pending_startup_retry.take().unwrap();
+        if self.state == LoadState::Stopping || self.current_url != retry.expected_url {
+            println!(
+                "[MPV] Skipping stale startup retry attempt {}/3. state={:?}, expected={}, current={}",
+                retry.attempt, self.state, retry.expected_url, self.current_url
+            );
+            return;
+        }
+
+        println!(
+            "[MPV] Running scheduled local stream retry attempt {}/3: {}",
+            retry.attempt, retry.retry_url
+        );
+        self.set_current_url(retry.retry_url.clone());
+        if let Some(position) = retry.resume_position {
+            self.pending_reload_url = Some(retry.retry_url.clone());
+            self.pending_reload_seek = Some(position);
+        }
+        self.send_loadfile_now(
+            mpv_command_sender,
+            CmdVal::Tripple(MpvCmd::Loadfile, retry.retry_url, "replace".to_string()),
+        );
+    }
+
+    fn retry_local_stream_startup_failure(
+        &mut self,
+        _mpv_command_sender: &Sender<MpvCommandJob>,
+        source: &str,
+        resume_position: Option<f64>,
+    ) -> bool {
+        let url = self.current_url.clone();
+        let time = *CURRENT_TIME.lock().unwrap();
+        let duration = *TOTAL_DURATION.lock().unwrap();
+
+        if self.state == LoadState::Stopping || !is_local_stream_url(&url) || time > 1.0 {
+            println!(
+                "[MPV] Not retrying startup failure ({source}): state={:?}, url={url}, time={time}, duration={duration}",
+                self.state
+            );
+            return false;
+        }
+
+        if self.startup_retry_attempts >= 3 {
+            println!("[MPV] Not retrying startup failure ({source}): attempts exhausted for {url}");
+            return false;
+        }
+
+        self.startup_retry_attempts += 1;
+        let attempt = self.startup_retry_attempts;
+
+        println!(
+            "[MPV] Local stream failed before playback ({source}). Scheduling retry in 2s (attempt {attempt}/3, time={time}, duration={duration})..."
+        );
+
+        let url2 = cache_busted_url(&url);
+        self.pending_startup_retry = Some(ScheduledStartupRetry {
+            due_at: Instant::now() + Duration::from_secs(2),
+            expected_url: url,
+            retry_url: url2,
+            attempt,
+            resume_position,
+        });
+        true
+    }
+}
+
+fn is_stop_command(cmd: &CmdVal) -> bool {
+    matches!(cmd, CmdVal::Single((MpvCmd::Stop,)))
+}
+
+fn is_loadfile_command(cmd: &CmdVal) -> bool {
+    loadfile_url(cmd).is_some()
+}
+
+fn loadfile_url(cmd: &CmdVal) -> Option<&str> {
+    match cmd {
+        CmdVal::Double(MpvCmd::Loadfile, url)
+        | CmdVal::Tripple(MpvCmd::Loadfile, url, ..)
+        | CmdVal::Quadruple(MpvCmd::Loadfile, url, ..)
+        | CmdVal::Quintuple(MpvCmd::Loadfile, url, ..) => Some(url),
+        _ => None,
+    }
+}
+
+fn loadfile_requested_start(cmd: &CmdVal) -> Option<f64> {
+    match cmd {
+        CmdVal::Quadruple(MpvCmd::Loadfile, _, _, options)
+        | CmdVal::Quintuple(MpvCmd::Loadfile, _, _, _, options) => loadfile_start_seconds(options),
+        _ => None,
+    }
+}
+
+fn is_startup_property(name: &PropKey) -> bool {
+    matches!(
+        name.to_string().as_str(),
+        "sub-scale"
+            | "sub-pos"
+            | "sub-color"
+            | "sub-back-color"
+            | "sub-border-color"
+            | "sub-outline-color"
+            | "sub-ass-override"
+            | "hwdec"
+            | "vo"
+            | "osc"
+            | "input-default-bindings"
+            | "input-vo-keyboard"
+            | "sid"
+            | "aid"
+            | "vid"
+            | "pause"
+            | "volume"
+            | "mute"
+            | "speed"
+    )
+}
+
+fn is_local_stream_url(url: &str) -> bool {
+    url.contains(":11470/")
+}
+
+fn cache_busted_url(url: &str) -> String {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    cache_busted_url_at(url, timestamp)
+}
+
+fn cache_busted_url_at(url: &str, timestamp: u128) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        let separator = if url.contains('?') { "&" } else { "?" };
+        return format!("{url}{separator}_reload={timestamp}");
+    };
+
+    let existing = parsed
+        .query_pairs()
+        .filter(|(name, _)| name != "_reload")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    parsed.set_query(None);
+    {
+        let mut query = parsed.query_pairs_mut();
+        for (name, value) in existing {
+            query.append_pair(&name, &value);
+        }
+        query.append_pair("_reload", &timestamp.to_string());
+    }
+    parsed.into()
+}
+
+fn sanitize_loadfile_start(cmd: CmdVal) -> CmdVal {
+    match cmd {
+        CmdVal::Quintuple(MpvCmd::Loadfile, url, flags, index, options) => {
+            let options = strip_stale_start_option(&url, options);
+            if options.is_empty() {
+                CmdVal::Tripple(MpvCmd::Loadfile, url, flags)
+            } else {
+                CmdVal::Quintuple(MpvCmd::Loadfile, url, flags, index, options)
             }
         }
+        CmdVal::Quadruple(MpvCmd::Loadfile, url, flags, options) => {
+            let options = strip_stale_start_option(&url, options);
+            if options.is_empty() {
+                CmdVal::Tripple(MpvCmd::Loadfile, url, flags)
+            } else {
+                CmdVal::Quadruple(MpvCmd::Loadfile, url, flags, options)
+            }
+        }
+        cmd => cmd,
+    }
+}
+
+fn strip_stale_start_option(url: &str, options: String) -> String {
+    let Some(start) = loadfile_start_seconds(&options) else {
+        return options;
+    };
+
+    let previous_url = CURRENT_STREAM_URL.lock().unwrap().clone();
+    let previous_time = *CURRENT_TIME.lock().unwrap();
+    let is_new_local_stream = !previous_url.is_empty()
+        && previous_url != url
+        && !url.contains("_reload=")
+        && url.contains(":11470/");
+    let mirrors_previous_position = previous_time > 30.0 && (start - previous_time).abs() <= 2.0;
+
+    if !is_new_local_stream || !mirrors_previous_position {
+        return options;
+    }
+
+    println!(
+        "[MPV] Dropping stale loadfile start={} for new stream {}; previous stream was {} at {:.3}s",
+        start, url, previous_url, previous_time
+    );
+
+    options
+        .split(',')
+        .filter(|option| !option.trim_start().starts_with("start="))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn loadfile_start_seconds(options: &str) -> Option<f64> {
+    options.split(',').find_map(|option| {
+        let value = option.trim().strip_prefix("start=")?;
+        value.trim_start_matches('+').parse::<f64>().ok()
     })
+}
+
+fn observe_property(mpv: &Mpv, name: &str, format: Format) {
+    if let Err(error) = mpv.observe_property(name, format, 0) {
+        eprintln!("failed to observe MPV property '{name}': {error:#}");
+    }
+}
+
+fn observe_and_emit_current_property(
+    mpv: &Mpv,
+    rpc_response_sender: &Sender<String>,
+    observed_properties: &mut HashSet<String>,
+    name: &str,
+    format: Format,
+) {
+    if observed_properties.insert(name.to_string()) {
+        observe_property(mpv, name, format);
+    } else {
+        println!("[PLAYER] observer already registered: {name}");
+    }
+    if !should_emit_current_property(name) {
+        println!("[PLAYER] immediate prop skipped: {name}");
+        return;
+    }
+    emit_current_property(mpv, rpc_response_sender, name, format);
+}
+
+fn should_emit_current_property(name: &str) -> bool {
+    // `@stremio/stremio-video` waits for mpv-version before it sends loadfile.
+    // Some transient playback props can block during stop/load transitions, so
+    // keep the synchronous snapshot path limited to stable option-like values.
+    is_cached_immediate_property(name)
+}
+
+fn is_cached_immediate_property(name: &str) -> bool {
+    matches!(
+        name,
+        "mpv-version"
+            | "ffmpeg-version"
+            | "pause"
+            | "volume"
+            | "mute"
+            | "sid"
+            | "aid"
+            | "vid"
+            | "sub-scale"
+            | "sub-pos"
+            | "sub-delay"
+            | "speed"
+    )
+}
+
+fn emit_current_property(
+    mpv: &Mpv,
+    rpc_response_sender: &Sender<String>,
+    name: &str,
+    format: Format,
+) {
+    if let Some(value) = cached_property_value(name) {
+        emit_property_value(rpc_response_sender, name, value);
+        return;
+    }
+
+    let value = match format {
+        Format::Flag => mpv.get_property::<bool>(name).map(Value::Bool),
+        Format::Int64 => mpv.get_property::<i64>(name).map(|value| json!(value)),
+        Format::Double => mpv.get_property::<f64>(name).map(|value| json!(value)),
+        Format::String => mpv
+            .get_property::<String>(name)
+            .map(|value| mpv_string_property_to_json(name, value)),
+        Format::Node => {
+            println!("[PLAYER] immediate prop skipped for unsupported node property: {name}");
+            return;
+        }
+    };
+
+    let value = match value {
+        Ok(value) => value,
+        Err(error) => {
+            println!("[PLAYER] immediate prop unavailable: {name}: {error:#}");
+            return;
+        }
+    };
+
+    cache_property_value(name, &value);
+    emit_property_value(rpc_response_sender, name, value);
+}
+
+fn emit_property_value(rpc_response_sender: &Sender<String>, name: &str, value: Value) {
+    println!("[PLAYER] immediate prop value: {name}={value}");
+    let response = json!(["mpv-prop-change", { "name": name, "data": value }]);
+    if let Err(error) = rpc_response_sender.send(RPCResponse::response_message(Some(response))) {
+        eprintln!("[PLAYER] failed to emit immediate prop '{name}': {error:#}");
+    }
+}
+
+fn cached_property_value(name: &str) -> Option<Value> {
+    if let Some(value) = CACHED_PLAYER_PROPS.lock().unwrap().get(name).cloned() {
+        return Some(value);
+    }
+
+    match name {
+        "mpv-version" => MPV_VERSION.lock().unwrap().clone().map(Value::String),
+        "ffmpeg-version" => FFMPEG_VERSION.lock().unwrap().clone().map(Value::String),
+        "pause" => Some(json!(*IS_PAUSED.lock().unwrap())),
+        "volume" => Some(json!(*CURRENT_VOLUME.lock().unwrap())),
+        "mute" => Some(Value::Bool(false)),
+        "sid" | "aid" | "vid" => Some(Value::String("no".to_string())),
+        "sub-scale" => Some(json!(1.0)),
+        "sub-pos" => Some(json!(100.0)),
+        "sub-delay" => Some(json!(0.0)),
+        "speed" => Some(json!(1.0)),
+        _ => None,
+    }
+}
+
+fn clear_file_scoped_cached_props() {
+    let mut props = CACHED_PLAYER_PROPS.lock().unwrap();
+    for name in [
+        "time-pos",
+        "duration",
+        "paused-for-cache",
+        "cache-buffering-state",
+        "demuxer-cache-time",
+        "seeking",
+        "eof-reached",
+        "metadata",
+        "video-params",
+        "track-list",
+        "aid",
+        "vid",
+        "sid",
+    ] {
+        props.remove(name);
+    }
+}
+
+fn emit_loaded_property_snapshot(mpv: &Mpv, rpc_response_sender: &Sender<String>) {
+    emit_loaded_double_property(mpv, rpc_response_sender, "duration", true);
+    emit_loaded_double_property(mpv, rpc_response_sender, "time-pos", false);
+    emit_loaded_flag_property(mpv, rpc_response_sender, "pause");
+    emit_loaded_double_property(mpv, rpc_response_sender, "volume", false);
+    emit_loaded_flag_property(mpv, rpc_response_sender, "mute");
+    emit_loaded_id_property(mpv, rpc_response_sender, "aid");
+    emit_loaded_id_property(mpv, rpc_response_sender, "vid");
+    emit_loaded_id_property(mpv, rpc_response_sender, "sid");
+}
+
+fn emit_loaded_double_property(
+    mpv: &Mpv,
+    rpc_response_sender: &Sender<String>,
+    name: &str,
+    require_positive: bool,
+) {
+    match mpv.get_property::<f64>(name) {
+        Ok(value) if value.is_finite() && (!require_positive || value > 0.0) => {
+            emit_loaded_snapshot_value(rpc_response_sender, name, json!(value));
+        }
+        Ok(value) => {
+            println!("[PLAYER] loaded snapshot prop skipped: {name}={value}");
+        }
+        Err(error) => {
+            println!("[PLAYER] loaded snapshot prop unavailable: {name}: {error:#}");
+        }
+    }
+}
+
+fn emit_loaded_flag_property(mpv: &Mpv, rpc_response_sender: &Sender<String>, name: &str) {
+    match mpv.get_property::<bool>(name) {
+        Ok(value) => emit_loaded_snapshot_value(rpc_response_sender, name, Value::Bool(value)),
+        Err(error) => {
+            println!("[PLAYER] loaded snapshot prop unavailable: {name}: {error:#}");
+        }
+    }
+}
+
+fn emit_loaded_id_property(mpv: &Mpv, rpc_response_sender: &Sender<String>, name: &str) {
+    if let Ok(value) = mpv.get_property::<String>(name) {
+        emit_loaded_snapshot_value(
+            rpc_response_sender,
+            name,
+            mpv_string_property_to_json(name, value),
+        );
+        return;
+    }
+
+    match mpv.get_property::<i64>(name) {
+        Ok(value) => {
+            emit_loaded_snapshot_value(rpc_response_sender, name, Value::String(value.to_string()))
+        }
+        Err(error) => {
+            println!("[PLAYER] loaded snapshot prop unavailable: {name}: {error:#}");
+        }
+    }
+}
+
+fn emit_loaded_snapshot_value(rpc_response_sender: &Sender<String>, name: &str, value: Value) {
+    let value = normalize_property_value_for_web(name, &value);
+    cache_property_value(name, &value);
+    emit_property_value(rpc_response_sender, name, value);
+}
+
+fn cache_property_value(name: &str, value: &Value) {
+    let value = normalize_property_value_for_web(name, value);
+    if is_cached_immediate_property(name) {
+        CACHED_PLAYER_PROPS
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), value.clone());
+    }
+
+    match name {
+        "mpv-version" => {
+            if let Some(value) = value.as_str() {
+                *MPV_VERSION.lock().unwrap() = Some(value.to_string());
+            }
+        }
+        "ffmpeg-version" => {
+            if let Some(value) = value.as_str() {
+                *FFMPEG_VERSION.lock().unwrap() = Some(value.to_string());
+            }
+        }
+        "volume" => {
+            if let Some(volume) = value.as_f64() {
+                *CURRENT_VOLUME.lock().unwrap() = volume;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_property_value_for_web(name: &str, value: &Value) -> Value {
+    if name == "mute" {
+        if let Some(value) = value.as_str() {
+            return Value::Bool(matches!(value, "yes" | "true" | "1"));
+        }
+    }
+    value.clone()
+}
+
+fn mpv_string_property_to_json(name: &str, value: String) -> Value {
+    if matches!(name, "metadata" | "track-list" | "video-params") {
+        match serde_json::from_str::<Value>(&value) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("[PLAYER] failed to parse JSON mpv property '{name}': {error:#}");
+                Value::String(value)
+            }
+        }
+    } else {
+        Value::String(value)
+    }
+}
+
+fn update_cached_property(name: &str, change: &PropertyData) {
+    let cached_value = match change {
+        PropertyData::Flag(value) => Some(Value::Bool(*value)),
+        PropertyData::Int64(value) => Some(json!(*value)),
+        PropertyData::Double(value) => Some(json!(*value)),
+        PropertyData::Str(value) | PropertyData::OsdStr(value) => {
+            Some(Value::String(value.to_string()))
+        }
+    };
+
+    if let Some(value) = cached_value {
+        cache_property_value(name, &value);
+    }
+
+    if name == "volume" {
+        if let PropertyData::Double(volume) = change {
+            *CURRENT_VOLUME.lock().unwrap() = *volume;
+        }
+    }
+    if name == "time-pos" {
+        if let PropertyData::Double(pos_secs) = change {
+            *CURRENT_TIME.lock().unwrap() = *pos_secs;
+        }
+    }
+    if name == "duration" {
+        if let PropertyData::Double(dur_secs) = change {
+            *TOTAL_DURATION.lock().unwrap() = *dur_secs;
+        }
+    }
+    if name == "pause" {
+        if let PropertyData::Flag(pause) = change {
+            *IS_PAUSED.lock().unwrap() = *pause;
+        }
+    }
+
+    if name == "chapter" {
+        if let PropertyData::Int64(chapter_idx) = change {
+            *CURRENT_CHAPTER.lock().unwrap() = *chapter_idx;
+        }
+    }
+    if name == "chapter-metadata/by-key/title" {
+        match change {
+            PropertyData::Str(s) | PropertyData::OsdStr(s) => {
+                *CURRENT_CHAPTER_TITLE.lock().unwrap() = s.to_string();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn send_command(mpv_command_sender: &Sender<MpvCommandJob>, cmd: CmdVal) -> bool {
+    let (name, args) = command_parts(cmd);
+    println!("[PLAYER] dispatching mpv command: {} {:?}", name, args);
+    match mpv_command_sender.send(MpvCommandJob { name, args }) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("[MPV CMD DISPATCH ERROR] {error:#}");
+            false
+        }
+    }
+}
+
+fn command_parts(cmd: CmdVal) -> (String, Vec<String>) {
+    match cmd {
+        CmdVal::Quintuple(name, arg1, arg2, arg3, arg4) => {
+            (name.to_string(), vec![arg1, arg2, arg3, arg4])
+        }
+        CmdVal::Quadruple(name, arg1, arg2, arg3) => (name.to_string(), vec![arg1, arg2, arg3]),
+        CmdVal::Tripple(name, arg1, arg2) => (name.to_string(), vec![arg1, arg2]),
+        CmdVal::Double(name, arg1) => (name.to_string(), vec![arg1]),
+        CmdVal::Single((name,)) => (name.to_string(), Vec::new()),
+    }
+}
+
+fn set_prop_val(
+    name: PropKey,
+    value: PropVal,
+    mpv: &Mpv,
+    rpc_response_sender: Option<&Sender<String>>,
+) {
+    let name = name.to_string();
+    let value_json = normalize_property_value_for_web(&name, &prop_val_to_json(&value));
+    let ok = match value {
+        PropVal::Bool(value) => set_property(&name, value, mpv),
+        PropVal::Num(value) => set_property(&name, value, mpv),
+        PropVal::Str(value) => set_property(&name, value, mpv),
+    };
+
+    if !ok {
+        return;
+    }
+
+    cache_property_value(&name, &value_json);
+    if let Some(rpc_response_sender) = rpc_response_sender {
+        emit_property_value(rpc_response_sender, &name, value_json);
+    }
+}
+
+fn prop_val_to_json(value: &PropVal) -> Value {
+    match value {
+        PropVal::Bool(value) => Value::Bool(*value),
+        PropVal::Num(value) => json!(*value),
+        PropVal::Str(value) => Value::String(value.clone()),
+    }
+}
+
+fn set_property(name: impl ToString, value: impl SetData, mpv: &Mpv) -> bool {
+    let name = name.to_string();
+    match mpv.set_property(&name, value) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("cannot set MPV property: '{error:#}'");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_busted_url_at;
+
+    #[test]
+    fn cache_buster_adds_query_to_plain_stream_url() {
+        assert_eq!(
+            cache_busted_url_at("http://127.0.0.1:11470/hash/3", 42),
+            "http://127.0.0.1:11470/hash/3?_reload=42"
+        );
+    }
+
+    #[test]
+    fn cache_buster_replaces_only_its_own_query_parameter() {
+        assert_eq!(
+            cache_busted_url_at(
+                "http://127.0.0.1:11470/hash/3?tr=tracker%3Audp%3A%2F%2Fhost&_reload=1",
+                42,
+            ),
+            "http://127.0.0.1:11470/hash/3?tr=tracker%3Audp%3A%2F%2Fhost&_reload=42"
+        );
+    }
 }
