@@ -183,6 +183,66 @@ fn send_webview_script(script: &str) {
     }
 }
 
+fn handle_media_status(params: Option<&Value>) {
+    let Some(params) = params else {
+        return;
+    };
+
+    if let Some(paused) = params.get("paused").and_then(Value::as_bool) {
+        if let Ok(mut is_paused) = IS_PAUSED.lock() {
+            *is_paused = paused;
+        }
+    }
+
+    for key in ["time", "timePos", "position", "currentTime"] {
+        if let Some(time) = params.get(key).and_then(Value::as_f64) {
+            if let Ok(mut current_time) = CURRENT_TIME.lock() {
+                *current_time = time;
+            }
+            break;
+        }
+    }
+
+    if let Some(duration) = params.get("duration").and_then(Value::as_f64) {
+        if let Ok(mut total_duration) = TOTAL_DURATION.lock() {
+            *total_duration = duration;
+        }
+    }
+}
+
+fn handle_media_metadata(params: Option<&Value>) {
+    let Some(params) = params else {
+        return;
+    };
+
+    if let Some(title) = params.get("title").and_then(Value::as_str) {
+        if let Ok(mut video_title) = VIDEO_TITLE.lock() {
+            *video_title = title.to_string();
+        }
+    }
+
+    if let Some(album) = params
+        .get("artist")
+        .or_else(|| params.get("album"))
+        .and_then(Value::as_str)
+    {
+        if let Ok(mut album_guard) = ALBUM.lock() {
+            *album_guard = album.to_string();
+        }
+    }
+
+    if let Some(cover) = params
+        .get("artUrl")
+        .or_else(|| params.get("poster"))
+        .or_else(|| params.get("thumbnail"))
+        .and_then(Value::as_str)
+    {
+        if let Ok(mut cover_url) = COVER_URL.lock() {
+            *cover_url = cover.to_string();
+        }
+    }
+}
+
 #[derive(Default, NwgUi)]
 pub struct MainWindow {
     pub command: String,
@@ -1491,6 +1551,7 @@ impl MainWindow {
                     Some("quit") => quit_sender.notice(),
                     Some("shell-route-changed") => {
                         if let Some(url) = msg.get_params().and_then(|arg| arg.as_str()) {
+                            println!("[WEB->SHELL] route changed: {url}");
                             if let Ok(mut current_url) = CURRENT_URL.lock() {
                                 *current_url = url.to_string();
                             }
@@ -1689,11 +1750,21 @@ impl MainWindow {
                         }
                     }
                     Some(player_command) if player_command.starts_with("mpv-") => {
+                        let player_command = player_command.to_string();
                         let resp_json = serde_json::to_string(
                             &msg.args.expect("Cannot have method without args"),
                         )
                         .expect("Cannot build response");
-                        player_tx.send(resp_json).ok();
+                        println!("[WEB->PLAYER] {player_command}: {resp_json}");
+                        if let Err(err) = player_tx.send(resp_json) {
+                            eprintln!("[WEB->PLAYER] failed to send {player_command}: {err}");
+                        }
+                    }
+                    Some("media.status") => {
+                        handle_media_status(msg.get_params());
+                    }
+                    Some("media.metadata") => {
+                        handle_media_metadata(msg.get_params());
                     }
                     Some(unknown) => {
                         eprintln!("Unsupported command {}({:?})", unknown, msg.get_params())
