@@ -583,8 +583,11 @@ fn create_message_thread(
                     set_property(name, value, &mpv);
                 }
                 InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Str(value))) => {
-                    let is_vo = name.to_string() == "vo";
-                    let value = if is_vo {
+                    let name_string = name.to_string();
+                    let value = if name_string == "sub-ass-override" && value == "strip" {
+                        // Preserve ASS styling/positioning while still allowing subtitle scale changes.
+                        "scale".to_string()
+                    } else if name_string == "vo" {
                         with_gpu_next_fallback(value)
                     } else {
                         value
