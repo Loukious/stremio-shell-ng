@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
-use semver::{Version, VersionReq};
+use semver::Version;
 use serde::Deserialize;
 use url::Url;
 
@@ -17,7 +17,6 @@ pub struct Update {
 #[derive(Debug)]
 pub struct Updater {
     pub current_version: Version,
-    pub next_version: VersionReq,
     pub endpoint: Url,
     pub force_update: bool,
 }
@@ -38,8 +37,6 @@ struct GitHubAsset {
 impl Updater {
     pub fn new(current_version: Version, updater_endpoint: &Url, force_update: bool) -> Self {
         Self {
-            next_version: VersionReq::parse(&format!(">{current_version}"))
-                .expect("Version is type-safe"),
             current_version,
             endpoint: updater_endpoint.clone(),
             force_update,
@@ -60,12 +57,12 @@ impl Updater {
             .json::<GitHubRelease>()?;
 
         let version = Version::parse(release.tag_name.trim_start_matches('v'))?;
-        if release.prerelease || !version.pre.is_empty() {
-            println!("Skipping prerelease v{version}");
+        if release.prerelease {
+            println!("Skipping GitHub prerelease v{version}");
             return Ok(None);
         }
 
-        if !self.force_update && !self.next_version.matches(&version) {
+        if !self.force_update && version <= self.current_version {
             println!("No new releases found newer than v{}", self.current_version);
             return Ok(None);
         }
@@ -134,5 +131,26 @@ impl Updater {
             version,
             file: dest,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn newer(current: &str, candidate: &str) -> bool {
+        Version::parse(candidate).unwrap() > Version::parse(current).unwrap()
+    }
+
+    #[test]
+    fn rc_versions_are_accepted_by_semver_ordering() {
+        assert!(newer("5.0.20", "5.0.21-rc2"));
+        assert!(newer("5.0.21-rc1", "5.0.21-rc2"));
+        assert!(newer("5.0.21-rc2", "5.0.21"));
+    }
+
+    #[test]
+    fn final_release_does_not_update_to_older_rc() {
+        assert!(!newer("5.0.21", "5.0.21-rc2"));
     }
 }
