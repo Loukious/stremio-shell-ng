@@ -111,6 +111,12 @@ struct Config {
     refresh_interval: u64,
     show_small_image: bool,
     lobby_max_size: i32,
+    auto_skip_enabled: bool,
+    auto_skip_intro: bool,
+    auto_skip_recap: bool,
+    auto_skip_outro: bool,
+    introdb_api_key: Option<String>,
+    theintrodb_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +266,21 @@ fn load_or_create_config() -> Config {
             .set("lobby_max_size", "8");
 
         default_config
+            .with_section(Some("AutoSkip"))
+            .set("enabled", "true")
+            .set("skip_intro", "true")
+            .set("skip_recap", "true")
+            .set("skip_outro", "true");
+
+        default_config
+            .with_section(Some("IntroDB"))
+            .set("api_key", "");
+
+        default_config
+            .with_section(Some("TheIntroDB"))
+            .set("api_key", "");
+
+        default_config
             .write_to_file(&config_path)
             .expect("Failed to create configuration file");
         println!(
@@ -320,6 +341,49 @@ fn load_or_create_config() -> Config {
         .max(2)
         .min(16);
 
+    // Backward-compat: older configs used [IntroDB] enabled=true as the master toggle.
+    let legacy_introdb_enabled = config
+        .section(Some("IntroDB"))
+        .and_then(|sec| sec.get("enabled"))
+        .map(|value| value == "true");
+
+    let auto_skip_enabled = config
+        .section(Some("AutoSkip"))
+        .and_then(|sec| sec.get("enabled"))
+        .map(|value| value == "true")
+        .or(legacy_introdb_enabled)
+        .unwrap_or(true);
+
+    let auto_skip_intro = config
+        .section(Some("AutoSkip"))
+        .and_then(|sec| sec.get("skip_intro"))
+        .map(|value| value == "true")
+        .unwrap_or(true);
+
+    let auto_skip_recap = config
+        .section(Some("AutoSkip"))
+        .and_then(|sec| sec.get("skip_recap"))
+        .map(|value| value == "true")
+        .unwrap_or(true);
+
+    let auto_skip_outro = config
+        .section(Some("AutoSkip"))
+        .and_then(|sec| sec.get("skip_outro"))
+        .map(|value| value == "true")
+        .unwrap_or(true);
+
+    let introdb_api_key = config
+        .section(Some("IntroDB"))
+        .and_then(|sec| sec.get("api_key"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let theintrodb_api_key = config
+        .section(Some("TheIntroDB"))
+        .and_then(|sec| sec.get("api_key"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
     Config {
         show_buttons,
         link_target,
@@ -328,6 +392,12 @@ fn load_or_create_config() -> Config {
         refresh_interval,
         show_small_image,
         lobby_max_size,
+        auto_skip_enabled,
+        auto_skip_intro,
+        auto_skip_recap,
+        auto_skip_outro,
+        introdb_api_key,
+        theintrodb_api_key,
     }
 }
 
@@ -1175,7 +1245,18 @@ impl MainWindow {
 
         let app_start_time = SystemTime::now();
         let auto_host_lobby = !self.command.starts_with("stremio://sync/");
+        let config = load_or_create_config();
         spawn_discordrpc_loop(app_start_time, auto_host_lobby);
+        crate::stremio_app::intro_skip::spawn_intro_skip_loop(
+            crate::stremio_app::intro_skip::IntroSkipConfig {
+                enabled: config.auto_skip_enabled,
+                skip_intro: config.auto_skip_intro,
+                skip_recap: config.auto_skip_recap,
+                skip_outro: config.auto_skip_outro,
+                introdb_api_key: config.introdb_api_key.clone(),
+                theintrodb_api_key: config.theintrodb_api_key.clone(),
+            },
+        );
         self.update_watch_party_menu();
 
         self.window.set_visible(!self.start_hidden);
