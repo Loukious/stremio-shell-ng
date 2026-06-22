@@ -6,6 +6,7 @@ pushd "%mypath%.."
 
 set "TARGET=x86_64-pc-windows-msvc"
 set "EXE=target\%TARGET%\release\stremio-shell-ng.exe"
+set "STREMIO_LIBMPV_REFRESH=%RANDOM%%RANDOM%%RANDOM%"
 
 :: Compile the main executable
 if not exist "%EXE%" (
