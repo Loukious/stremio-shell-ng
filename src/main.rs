@@ -48,7 +48,44 @@ struct Opt {
     server_ipc_key: String,
 }
 
+#[repr(C)]
+struct GdiplusStartupInput {
+    gdiplus_version: u32,
+    debug_event_callback: *mut std::ffi::c_void,
+    suppress_background_thread: i32,
+    suppress_external_codecs: i32,
+}
+
+#[link(name = "gdiplus")]
+extern "system" {
+    fn GdiplusStartup(
+        token: *mut usize,
+        input: *const GdiplusStartupInput,
+        output: *mut std::ffi::c_void,
+    ) -> i32;
+}
+
+static GDIPLUS_TOKEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn init_gdiplus() {
+    GDIPLUS_TOKEN.get_or_init(|| {
+        let input = GdiplusStartupInput {
+            gdiplus_version: 1,
+            debug_event_callback: std::ptr::null_mut(),
+            suppress_background_thread: 0,
+            suppress_external_codecs: 0,
+        };
+        let mut token: usize = 0;
+        unsafe {
+            GdiplusStartup(&mut token, &input, std::ptr::null_mut());
+        }
+        token
+    });
+}
+
 fn main() {
+    init_gdiplus();
+
     // native-windows-gui has some basic high DPI support with the high-dpi
     // feature. It supports the "System DPI Awareness" mode, but not the more
     // advanced Per-Monitor (v2) DPI Awareness modes.
