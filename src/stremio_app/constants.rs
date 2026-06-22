@@ -6,11 +6,8 @@ pub const STA_ENDPOINT: &str = "https://staging.strem.io/";
 pub const WINDOW_MIN_WIDTH: i32 = 1000;
 pub const WINDOW_MIN_HEIGHT: i32 = 600;
 pub const UPDATE_INTERVAL: u64 = 12 * 60 * 60;
-pub const UPDATE_ENDPOINT: [&str; 3] = [
-    "https://www.strem.io/updater/check?product=stremio-shell-ng",
-    "https://www.stremio.com/updater/check?product=stremio-shell-ng",
-    "https://www.stremio.net/updater/check?product=stremio-shell-ng",
-];
+pub const UPDATE_ENDPOINT: &str =
+    "https://api.github.com/repos/Loukious/stremio-shell-ng/releases/latest";
 pub const STREMIO_SERVER_DEV_MODE: &str = "STREMIO_SERVER_DEV_MODE";
 pub const SRV_BUFFER_SIZE: usize = 1024;
 pub const SERVER_IPC_KEY: &str = "SERVER_IPC_KEY";
