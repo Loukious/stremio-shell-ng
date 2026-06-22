@@ -105,4 +105,9 @@ impl RPCResponse {
     pub fn update_available() -> String {
         Self::response_message(Some(json!(["autoupdater-show-notif"])))
     }
+    pub fn pip_change(enabled: bool) -> String {
+        Self::response_message(Some(json!(["win-pip-changed", {
+            "enabled": enabled,
+        }])))
+    }
 }

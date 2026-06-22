@@ -10,6 +10,7 @@ native-windows-gui = { git = "https://github.com/Stremio/native-windows-gui", fe
     "notice",
     "tray-notification",
     "menu",
+    "timer",
 ] }
 native-windows-derive = "1"
 winapi = { version = "0.3.9", features = [
@@ -21,6 +22,7 @@ winapi = { version = "0.3.9", features = [
     "namedpipeapi",
     "dwmapi",
     "winreg",
+    "wingdi",
 ] }
 webview2 = "0.1.4"
 webview2-sys = "0.1.1"
