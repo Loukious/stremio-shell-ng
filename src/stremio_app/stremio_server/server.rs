@@ -1,9 +1,8 @@
 use crate::stremio_app::constants::{SRV_BUFFER_SIZE, SRV_LOG_SIZE, STREMIO_SERVER_DEV_MODE};
 use native_windows_gui::{self as nwg, PartialUi};
-use std::io::Write;
 use std::{
     env,
-    io::Read,
+    io::{BufRead, BufReader, Read, Write},
     ops::Deref,
     os::windows::process::CommandExt,
     path,
@@ -81,36 +80,37 @@ impl StremioServer {
                 .spawn();
             match child {
                 Ok(mut child) => {
-                    let mut stdout = child.stdout.take().unwrap();
+                    let stdout = child.stdout.take().unwrap();
                     let out_lines = lines.clone();
                     let tx = tx.clone();
                     let out_thread = thread::spawn(move || {
-                        let http_endpoint = String::new();
+                        let mut stdout = BufReader::new(stdout);
+                        let mut endpoint_sent = false;
                         loop {
-                            let mut buffer = [0; SRV_BUFFER_SIZE];
-                            let on = match stdout.read(&mut buffer[..]) {
+                            let mut line = String::new();
+                            match stdout.read_line(&mut line) {
                                 Ok(0) => break,
-                                Ok(n) => n,
+                                Ok(_) => {}
                                 Err(err) => {
                                     eprintln!("server stdout read error: {err}");
                                     break;
                                 }
-                            };
-                            std::io::stdout().write_all(&buffer[..on]).ok();
-                            let string_data = String::from_utf8_lossy(&buffer[..on]);
+                            }
+                            std::io::stdout().write_all(line.as_bytes()).ok();
                             {
                                 let lines = &mut *out_lines.lock().unwrap();
-                                *lines += string_data.deref();
-                                if http_endpoint.is_empty() {
-                                    if let Some(http_endpoint) = string_data
-                                        .lines()
-                                        .find(|line| line.starts_with("EngineFS server started at"))
+                                *lines += &line;
+                                if !endpoint_sent {
+                                    if let Some(http_endpoint) = line
+                                        .strip_prefix("EngineFS server started at")
+                                        .map(str::trim)
                                     {
-                                        let http_endpoint =
-                                            http_endpoint.split_whitespace().last().unwrap();
-                                        println!("HTTP endpoint: {http_endpoint}");
-                                        let endpoint = http_endpoint.to_string();
+                                        let endpoint = local_runtime_endpoint(http_endpoint);
+                                        println!(
+                                            "HTTP endpoint: {endpoint} (runtime advertised {http_endpoint})"
+                                        );
                                         tx.send(endpoint.clone()).ok();
+                                        endpoint_sent = true;
                                     }
                                 }
                                 *lines = lines
@@ -175,12 +175,51 @@ impl StremioServer {
             sender.notice();
         });
 
-        // Wait for the server to start and keep the exact endpoint printed by server.js.
+        // The bundled runtime is a child of this desktop process, so the
+        // WebUI should always reach it through the local loopback interface.
         let server_url = rx.recv().unwrap();
         if let Ok(mut stored_url) = self.server_url.lock() {
             *stored_url = Some(server_url.clone());
         }
         Some(server_url)
+    }
+}
+
+fn local_runtime_endpoint(endpoint: &str) -> String {
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return endpoint.to_string();
+    };
+
+    let Some(port) = url.port_or_known_default() else {
+        return endpoint.trim_end_matches('/').to_string();
+    };
+
+    format!("http://127.0.0.1:{port}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_runtime_endpoint;
+
+    #[test]
+    fn child_runtime_endpoint_uses_loopback() {
+        assert_eq!(
+            local_runtime_endpoint("http://192.168.0.2:11470"),
+            "http://127.0.0.1:11470"
+        );
+    }
+
+    #[test]
+    fn child_runtime_endpoint_uses_only_the_advertised_port() {
+        assert_eq!(
+            local_runtime_endpoint("http://10.0.0.5:11471/base/"),
+            "http://127.0.0.1:11471"
+        );
+    }
+
+    #[test]
+    fn invalid_child_runtime_endpoint_is_unchanged() {
+        assert_eq!(local_runtime_endpoint("not a url"), "not a url");
     }
 }
 
