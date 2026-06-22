@@ -13,7 +13,6 @@ use crate::stremio_app::sync_protocol::{
 
 use flume::{Receiver, Sender};
 use once_cell::sync::Lazy;
-use rand::RngCore;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1116,8 +1115,8 @@ fn emit_ui_event(event: SyncUiEvent) {
 fn generate_token() -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut bytes = [0u8; 32];
+    rand::fill(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
