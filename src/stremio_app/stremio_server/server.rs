@@ -68,8 +68,7 @@ impl StremioServer {
                     GetCurrentProcess(),
                 );
             }
-            let mut path = env::current_exe()
-                .expect("Cannot get the current executable path");
+            let mut path = env::current_exe().expect("Cannot get the current executable path");
             path.pop();
             let lines = Arc::new(Mutex::new(String::new()));
             let runtime_path = path.clone().join(path::Path::new("stremio-runtime"));
