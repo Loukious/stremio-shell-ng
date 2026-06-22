@@ -115,6 +115,9 @@ struct Config {
     auto_skip_intro: bool,
     auto_skip_recap: bool,
     auto_skip_outro: bool,
+    chapter_intro_words: Vec<String>,
+    chapter_recap_words: Vec<String>,
+    chapter_outro_words: Vec<String>,
     introdb_api_key: Option<String>,
     theintrodb_api_key: Option<String>,
 }
@@ -273,6 +276,15 @@ fn load_or_create_config() -> Config {
             .set("skip_outro", "true");
 
         default_config
+            .with_section(Some("AutoSkipChapters"))
+            // Comma-separated keywords matched against the current chapter title (case-insensitive).
+            // Each list is gated by the corresponding [AutoSkip] toggle (skip_intro/skip_recap/skip_outro).
+            // Leave a value blank to disable matching for that kind.
+            .set("intro", "opening,intro,logo")
+            .set("recap", "recap")
+            .set("outro", "credits,outro,ending");
+
+        default_config
             .with_section(Some("IntroDB"))
             .set("api_key", "");
 
@@ -296,6 +308,14 @@ fn load_or_create_config() -> Config {
             config_path.display()
         )
     });
+
+    fn parse_word_list(raw: &str) -> Vec<String> {
+        raw.split(',')
+            .map(|w| w.trim())
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_lowercase())
+            .collect()
+    }
 
     // Parse values from the configuration file
     let show_buttons = config
@@ -372,6 +392,23 @@ fn load_or_create_config() -> Config {
         .map(|value| value == "true")
         .unwrap_or(true);
 
+    // Chapter-title keyword lists (comma-separated)
+    // Matches are case-insensitive substring checks against `chapter-metadata/by-key/title`.
+    let (chapter_intro_words, chapter_recap_words, chapter_outro_words) =
+        if let Some(sec) = config.section(Some("AutoSkipChapters")) {
+            (
+                parse_word_list(sec.get("intro").unwrap_or("opening,intro,logo")),
+                parse_word_list(sec.get("recap").unwrap_or("recap")),
+                parse_word_list(sec.get("outro").unwrap_or("credits,outro,ending")),
+            )
+        } else {
+            (
+                parse_word_list("opening,intro,logo"),
+                parse_word_list("recap"),
+                parse_word_list("credits,outro,ending"),
+            )
+        };
+
     let introdb_api_key = config
         .section(Some("IntroDB"))
         .and_then(|sec| sec.get("api_key"))
@@ -396,6 +433,9 @@ fn load_or_create_config() -> Config {
         auto_skip_intro,
         auto_skip_recap,
         auto_skip_outro,
+        chapter_intro_words,
+        chapter_recap_words,
+        chapter_outro_words,
         introdb_api_key,
         theintrodb_api_key,
     }
@@ -1253,6 +1293,9 @@ impl MainWindow {
                 skip_intro: config.auto_skip_intro,
                 skip_recap: config.auto_skip_recap,
                 skip_outro: config.auto_skip_outro,
+                chapter_intro_words: config.chapter_intro_words.clone(),
+                chapter_recap_words: config.chapter_recap_words.clone(),
+                chapter_outro_words: config.chapter_outro_words.clone(),
                 introdb_api_key: config.introdb_api_key.clone(),
                 theintrodb_api_key: config.theintrodb_api_key.clone(),
             },
