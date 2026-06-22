@@ -19,6 +19,7 @@ pub struct Updater {
     pub current_version: Version,
     pub endpoint: Url,
     pub force_update: bool,
+    pub include_prerelease: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,11 +36,17 @@ struct GitHubAsset {
 }
 
 impl Updater {
-    pub fn new(current_version: Version, updater_endpoint: &Url, force_update: bool) -> Self {
+    pub fn new(
+        current_version: Version,
+        updater_endpoint: &Url,
+        force_update: bool,
+        include_prerelease: bool,
+    ) -> Self {
         Self {
             current_version,
             endpoint: updater_endpoint.clone(),
             force_update,
+            include_prerelease,
         }
     }
 
@@ -50,14 +57,10 @@ impl Updater {
         let client = reqwest::blocking::Client::builder()
             .user_agent("stremio-shell-ng")
             .build()?;
-        let release = client
-            .get(self.endpoint.clone())
-            .send()?
-            .error_for_status()?
-            .json::<GitHubRelease>()?;
+        let release = self.fetch_release(&client)?;
 
         let version = Version::parse(release.tag_name.trim_start_matches('v'))?;
-        if release.prerelease {
+        if release.prerelease && !self.include_prerelease {
             println!("Skipping GitHub prerelease v{version}");
             return Ok(None);
         }
@@ -131,6 +134,42 @@ impl Updater {
             version,
             file: dest,
         }))
+    }
+
+    fn fetch_release(
+        &self,
+        client: &reqwest::blocking::Client,
+    ) -> Result<GitHubRelease, anyhow::Error> {
+        if self.include_prerelease && self.endpoint.path().ends_with("/releases/latest") {
+            let mut releases_url = self.endpoint.clone();
+            let releases_path = releases_url
+                .path()
+                .strip_suffix("/latest")
+                .expect("checked suffix")
+                .to_string();
+            releases_url.set_path(&releases_path);
+            let releases = client
+                .get(releases_url)
+                .send()?
+                .error_for_status()?
+                .json::<Vec<GitHubRelease>>()?;
+
+            return releases
+                .into_iter()
+                .filter_map(|release| {
+                    let version = Version::parse(release.tag_name.trim_start_matches('v')).ok()?;
+                    Some((version, release))
+                })
+                .max_by(|(left, _), (right, _)| left.cmp(right))
+                .map(|(_, release)| release)
+                .context("No valid releases found in the GitHub response");
+        }
+
+        Ok(client
+            .get(self.endpoint.clone())
+            .send()?
+            .error_for_status()?
+            .json::<GitHubRelease>()?)
     }
 }
 
