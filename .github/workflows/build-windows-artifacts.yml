@@ -1,0 +1,86 @@
+name: Build Windows artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            msvc_arch: amd64
+            cargo_args: ""
+            setup_script: setup\Stremio.iss
+            setup_glob: StremioSetup-v*_x64.exe
+            include_steam: true
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            msvc_arch: amd64_arm64
+            cargo_args: "--no-default-features"
+            setup_script: setup\Stremio-arm64.iss
+            setup_glob: StremioSetup-v*_arm64.exe
+            include_steam: false
+
+    steps:
+      - name: Disable git eol translation
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build shell
+        shell: pwsh
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
+
+      - name: Build setup
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "${{ matrix.setup_script }}"
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $includeSteam = "${{ matrix.include_steam }}" -eq "true"
+          .\scripts\package-portable.ps1 `
+            -Target "${{ matrix.target }}" `
+            -OutputPath "artifacts\StremioRPCPortable.zip" `
+            -IncludeSteam:$includeSteam
+
+      - name: Upload setup
+        uses: actions/upload-artifact@v4
+        with:
+          name: StremioSetup-${{ matrix.arch }}
+          path: ${{ matrix.setup_glob }}
+          if-no-files-found: error
+
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: StremioRPCPortable-${{ matrix.arch }}
+          path: artifacts\StremioRPCPortable.zip
+          if-no-files-found: error

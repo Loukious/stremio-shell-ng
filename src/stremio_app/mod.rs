@@ -18,5 +18,9 @@ pub mod constants;
 pub mod intro_skip;
 pub mod mpv_hwnd;
 pub mod pip_window;
+#[cfg(feature = "steam-sync")]
+pub mod steam_sync;
+#[cfg(not(feature = "steam-sync"))]
+#[path = "steam_sync_unavailable.rs"]
 pub mod steam_sync;
 pub mod sync_protocol;
