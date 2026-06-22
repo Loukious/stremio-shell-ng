@@ -121,4 +121,9 @@ impl RPCResponse {
     pub fn media_key(action: &str) -> String {
         Self::response_message(Some(json!(["media-key", action])))
     }
+    pub fn pip_change(enabled: bool) -> String {
+        Self::response_message(Some(json!(["win-pip-changed", {
+            "enabled": enabled,
+        }])))
+    }
 }

@@ -25,6 +25,93 @@ const APPCOMMAND_MEDIA_PAUSE: u32 = 47;
 pub static WEB_CMD_TX: Lazy<Mutex<Option<flume::Sender<String>>>> = Lazy::new(|| Mutex::new(None));
 pub const WEBVIEW_EXEC_SCRIPT_PREFIX: &str = "__stremio_shell_exec_script__:";
 
+const PIP_BUTTON_SCRIPT: &str = r##"
+;(function(){
+    if (window.self !== window.top) return;
+    if (window.__stremioShellPipInstalled) return;
+    window.__stremioShellPipInstalled = true;
+
+    var PIP_INNER = ''
+        + '<rect x="100" y="126" width="312" height="260" rx="40" ry="40" '
+        +   'style="stroke:currentcolor;stroke-width:34;fill:none"></rect>'
+        + '<rect x="238" y="240" width="150" height="104" rx="16" ry="16" '
+        +   'style="fill:currentcolor;stroke:none"></rect>';
+
+    function isPlayerRoute(){
+        return (location.hash || '').indexOf('/player') !== -1;
+    }
+
+    function findFullscreenBtn(){
+        var els = document.querySelectorAll('[title]');
+        for (var i = 0; i < els.length; i++){
+            var title = (els[i].getAttribute('title') || '').toLowerCase();
+            if (title.indexOf('fullscreen') !== -1){
+                var rect = els[i].getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) return els[i];
+            }
+        }
+        return null;
+    }
+
+    function buildPipButton(fsBtn){
+        var pip = fsBtn.cloneNode(true);
+        pip.id = 'stremio-shell-pip-btn';
+        pip.setAttribute('title', 'Picture-in-Picture');
+        pip.removeAttribute('aria-label');
+        var svg = pip.querySelector('svg');
+        if (svg) svg.innerHTML = PIP_INNER;
+        pip.addEventListener('click', function(e){
+            e.stopPropagation();
+            e.preventDefault();
+            try {
+                window.chrome.webview.postMessage(JSON.stringify({
+                    id: 1,
+                    args: ['win-set-pip', {}]
+                }));
+            } catch (_) {}
+        }, true);
+        return pip;
+    }
+
+    function placeButton(){
+        if (!isPlayerRoute()) return;
+        var fsBtn = findFullscreenBtn();
+        if (!fsBtn || !fsBtn.parentElement) return;
+        var pip = document.getElementById('stremio-shell-pip-btn');
+        if (pip && pip.parentElement === fsBtn.parentElement && pip.nextElementSibling === fsBtn) {
+            return;
+        }
+        if (!pip || !pip.isConnected) pip = buildPipButton(fsBtn);
+        fsBtn.parentElement.insertBefore(pip, fsBtn);
+    }
+
+    window.addEventListener('hashchange', placeButton);
+    setInterval(placeButton, 500);
+    placeButton();
+
+    try {
+        var observer = new MutationObserver(function(){ placeButton(); });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+    } catch (_) {}
+
+    try {
+        window.chrome.webview.addEventListener('message', function(ev){
+            try {
+                var data = typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data;
+                var args = data && data.args;
+                if (Array.isArray(args) && args[0] === 'win-pip-changed') {
+                    var enabled = !!(args[1] && args[1].enabled);
+                    var button = document.getElementById('stremio-shell-pip-btn');
+                    if (button) {
+                        button.setAttribute('title', enabled ? 'Exit Picture-in-Picture' : 'Picture-in-Picture');
+                    }
+                }
+            } catch (_) {}
+        });
+    } catch (_) {}
+})();
+"##;
+
 use super::constants::{WARNING_URL, WHITELISTED_HOSTS};
 
 pub static CURRENT_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".to_string()));
@@ -226,6 +313,8 @@ impl PartialUi for WebView {
                                 }
                             }catch(e){}
                             "##, |_| Ok(())).expect("Cannot add script to webview");
+                            wv.execute_script(PIP_BUTTON_SCRIPT, |_| Ok(()))
+                                .expect("Cannot add PiP button script to webview");
                             Ok(())
                         }).expect("Cannot add content loading");
 

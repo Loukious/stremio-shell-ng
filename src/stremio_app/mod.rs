@@ -16,5 +16,7 @@ pub mod window_settings;
 pub use named_pipe::{PipeClient, PipeServer};
 pub mod constants;
 pub mod intro_skip;
+pub mod mpv_hwnd;
+pub mod pip_window;
 pub mod steam_sync;
 pub mod sync_protocol;

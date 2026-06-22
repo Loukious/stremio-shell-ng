@@ -16,6 +16,8 @@ pub struct SystemTray {
     pub tray_show_hide: nwg::MenuItem,
     #[nwg_control(parent: tray_menu, text: "Always on &top")]
     pub tray_topmost: nwg::MenuItem,
+    #[nwg_control(parent: tray_menu, text: "Picture-in-&Picture")]
+    pub tray_pip: nwg::MenuItem,
     #[nwg_control(parent: tray_menu, text: "Start watch party")]
     pub tray_start_watch_party: nwg::MenuItem,
     #[nwg_control(parent: tray_menu, text: "End watch party", disabled: true)]
