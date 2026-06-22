@@ -441,8 +441,7 @@ fn load_or_create_config() -> Config {
         .and_then(|sec| sec.get("lobby_max_size"))
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(8)
-        .max(2)
-        .min(16);
+        .clamp(2, 16);
 
     // Backward-compat: older configs used [IntroDB] enabled=true as the master toggle.
     let legacy_introdb_enabled = config
@@ -834,14 +833,15 @@ pub fn spawn_discordrpc_loop(
                                 episode = String::new();
 
                                 if is_player {
-                                    let video_id =
-                                        match decode(cur_url.split('/').last().unwrap_or("")) {
-                                            Ok(decoded) => decoded,
-                                            Err(e) => {
-                                                eprintln!("⚠️ URL decoding failed: {e}");
-                                                continue;
-                                            }
-                                        };
+                                    let video_id = match decode(
+                                        cur_url.split('/').next_back().unwrap_or(""),
+                                    ) {
+                                        Ok(decoded) => decoded,
+                                        Err(e) => {
+                                            eprintln!("⚠️ URL decoding failed: {e}");
+                                            continue;
+                                        }
+                                    };
 
                                     let (parsed_type, parsed_id, parsed_season, parsed_episode) =
                                         parse_video_id(&video_id);
@@ -962,6 +962,7 @@ pub fn spawn_discordrpc_loop(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_player_activity(
     drp: &mut DiscordIpcClient,
     config: &Config,
@@ -1342,15 +1343,12 @@ impl MainWindow {
         let sync_events_queue = self.sync_events.clone();
         let (sync_event_tx, sync_event_rx) = flume::unbounded();
         crate::stremio_app::steam_sync::set_ui_event_sender(sync_event_tx);
-        thread::spawn(move || loop {
-            match sync_event_rx.recv() {
-                Ok(event) => {
-                    if let Ok(mut events) = sync_events_queue.lock() {
-                        events.push_back(event);
-                    }
-                    sync_notice_sender.notice();
+        thread::spawn(move || {
+            while let Ok(event) = sync_event_rx.recv() {
+                if let Ok(mut events) = sync_events_queue.lock() {
+                    events.push_back(event);
                 }
-                Err(_) => break,
+                sync_notice_sender.notice();
             }
         });
 

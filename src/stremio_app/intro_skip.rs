@@ -993,7 +993,7 @@ fn extract_video_id_from_url(cur_url: &str) -> Option<String> {
     }
 
     let cur_url = cur_url.trim_end_matches('/');
-    let last = cur_url.split('/').last().unwrap_or("");
+    let last = cur_url.split('/').next_back().unwrap_or("");
     let last = last.split('?').next().unwrap_or(last);
     let decoded = decode(last).ok()?;
     let decoded = decoded.as_ref();

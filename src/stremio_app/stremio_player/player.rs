@@ -559,7 +559,7 @@ fn create_event_thread(
                     continue;
                 }
                 Event::PropertyChange { name, change, .. } => {
-                    update_cached_property(&name, &change);
+                    update_cached_property(name, &change);
                     PlayerResponse(
                         "mpv-prop-change",
                         PlayerEvent::PropChange(PlayerProprChange::from_name_value(
@@ -589,26 +589,22 @@ fn create_event_thread(
                             && time > 0.0
                             && time < duration - 10.0;
 
-                        if premature {
-                            if controller.premature_eof_reloads < 1 {
-                                controller.premature_eof_reloads += 1;
-                                println!(
-                                    "[MPV] Premature EOF detected on local stream. Reloading..."
-                                );
+                        if premature && controller.premature_eof_reloads < 1 {
+                            controller.premature_eof_reloads += 1;
+                            println!("[MPV] Premature EOF detected on local stream. Reloading...");
 
-                                let url2 = cache_busted_url(&url);
+                            let url2 = cache_busted_url(&url);
 
-                                controller.set_current_url(url2.clone());
-                                controller.pending_reload_url = Some(url2.clone());
-                                controller.pending_reload_seek = Some(time);
-                                let cmd =
-                                    CmdVal::Tripple(MpvCmd::Loadfile, url2, "replace".to_string());
-                                controller.send_loadfile_now(&mpv_command_sender, cmd);
+                            controller.set_current_url(url2.clone());
+                            controller.pending_reload_url = Some(url2.clone());
+                            controller.pending_reload_seek = Some(time);
+                            let cmd =
+                                CmdVal::Tripple(MpvCmd::Loadfile, url2, "replace".to_string());
+                            controller.send_loadfile_now(&mpv_command_sender, cmd);
 
-                                // Do not propagate this premature EndFile to the frontend,
-                                // otherwise the autoplay logic might trigger next episode.
-                                continue;
-                            }
+                            // Do not propagate this premature EndFile to the frontend,
+                            // otherwise the autoplay logic might trigger next episode.
+                            continue;
                         }
                     }
 

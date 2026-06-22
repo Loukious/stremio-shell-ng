@@ -431,7 +431,7 @@ fn handle_event(client: &steamworks::Client, event: RuntimeEvent, mode: &mut Opt
                 });
 
                 set_lobby_counts(1, max_size);
-                set_lobby_members(host_lobby_members(&client, &HashMap::new()));
+                set_lobby_members(host_lobby_members(client, &HashMap::new()));
                 set_lobby_role(LobbyRole::Host);
                 emit_ui_event(SyncUiEvent::HostStarted);
 

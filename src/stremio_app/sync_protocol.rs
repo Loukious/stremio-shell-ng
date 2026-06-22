@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "steam-sync"), allow(dead_code))]
+
 use serde::{Deserialize, Serialize};
 
 pub const STEAM_SYNC_APP_ID: u32 = 480;
