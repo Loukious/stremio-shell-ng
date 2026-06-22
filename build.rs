@@ -48,7 +48,10 @@ fn main() {
     println!("cargo:rustc-link-arg={}", flags);
     let archive = fs::read(archive).unwrap();
     let target_dir = PathBuf::from(".");
-    zip_extract::extract(Cursor::new(archive), &target_dir, true).ok();
+    zip::ZipArchive::new(Cursor::new(archive))
+        .expect("invalid libmpv archive")
+        .extract(&target_dir)
+        .expect("failed to extract libmpv archive");
 
     copy_steam_runtime_dll();
 }

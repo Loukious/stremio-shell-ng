@@ -2016,7 +2016,7 @@ dependencies = [
  "whoami",
  "winapi",
  "winres",
- "zip-extract",
+ "zip",
 ]
 
 [[package]]
@@ -2980,17 +2980,6 @@ dependencies = [
  "zeroize",
  "zopfli",
  "zstd",
-]
-
-[[package]]
-name = "zip-extract"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fa5b9958fd0b5b685af54f2c3fa21fca05fe295ebaf3e77b6d24d96c4174037"
-dependencies = [
- "log",
- "thiserror 2.0.18",
- "zip",
 ]
 
 [[package]]
