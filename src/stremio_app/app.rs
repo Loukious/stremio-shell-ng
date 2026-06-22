@@ -899,6 +899,81 @@ impl MainWindow {
                     saved_style.center_window(hwnd, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT);
                 }
             }
+
+            // Make the title bar follow the Windows dark/light theme and
+            // use Mica backdrop on Windows 11 for a modern translucent look.
+            unsafe {
+                use winapi::um::dwmapi::{DwmSetWindowAttribute, DwmExtendFrameIntoClientArea};
+                use winapi::um::uxtheme::MARGINS;
+                use winapi::um::winreg::{RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_CURRENT_USER};
+                use winapi::shared::minwindef::{DWORD, HKEY};
+                use winapi::um::winnt::KEY_READ;
+
+                // Read the system dark/light mode from the registry
+                let mut is_dark = true; // default to dark
+                let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+                    .encode_utf16().collect();
+                let value_name: Vec<u16> = "AppsUseLightTheme\0"
+                    .encode_utf16().collect();
+                let mut hkey: HKEY = std::ptr::null_mut();
+                if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) == 0 {
+                    let mut data: DWORD = 0;
+                    let mut data_size: DWORD = std::mem::size_of::<DWORD>() as DWORD;
+                    if RegQueryValueExW(
+                        hkey,
+                        value_name.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut data as *mut DWORD as *mut u8,
+                        &mut data_size,
+                    ) == 0 {
+                        // AppsUseLightTheme: 0 = dark, 1 = light
+                        is_dark = data == 0;
+                    }
+                    RegCloseKey(hkey);
+                }
+
+                // DWMWA_USE_IMMERSIVE_DARK_MODE (attribute 20)
+                const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+                let dark_mode: i32 = if is_dark { 1 } else { 0 };
+                let hr = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    &dark_mode as *const i32 as *const _,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                if hr != 0 {
+                    eprintln!("[DWM] DwmSetWindowAttribute(IMMERSIVE_DARK_MODE) failed: 0x{:08X}", hr);
+                }
+
+                // DWMWA_SYSTEMBACKDROP_TYPE (attribute 38) — Windows 11 22H2+
+                // Value 2 = Mica, 3 = Acrylic, 4 = Mica Alt
+                const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+                let backdrop_type: i32 = 2; // Mica
+                let hr = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_SYSTEMBACKDROP_TYPE,
+                    &backdrop_type as *const i32 as *const _,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                if hr != 0 {
+                    eprintln!("[DWM] DwmSetWindowAttribute(SYSTEMBACKDROP_TYPE) failed: 0x{:08X}", hr);
+                }
+
+                // Extend the frame into the client area — required for Mica
+                // to be visible on Win32 windows. A top margin of -1 extends
+                // the frame (and Mica effect) fully.
+                let margins = MARGINS {
+                    cxLeftWidth: 0,
+                    cxRightWidth: 0,
+                    cyTopHeight: -1,
+                    cyBottomHeight: 0,
+                };
+                let hr = DwmExtendFrameIntoClientArea(hwnd, &margins);
+                if hr != 0 {
+                    eprintln!("[DWM] DwmExtendFrameIntoClientArea failed: 0x{:08X}", hr);
+                }
+            }
         }
 
         let app_start_time = SystemTime::now();
