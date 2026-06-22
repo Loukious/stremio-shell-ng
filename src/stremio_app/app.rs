@@ -117,6 +117,7 @@ struct Config {
     disable_when_paused: bool,
     refresh_interval: u64,
     show_small_image: bool,
+    swap_name_and_title: bool,
     lobby_max_size: i32,
     auto_skip_enabled: bool,
     auto_skip_intro: bool,
@@ -338,7 +339,8 @@ fn load_or_create_config() -> Config {
             .set("disable_in_menu", "false")
             .set("disable_when_paused", "false")
             .set("refresh_interval", "5")
-            .set("show_small_image", "true");
+            .set("show_small_image", "true")
+            .set("swap_name_and_title", "false");
         default_config
             .with_section(Some("Lobby"))
             .set("lobby_max_size", "8");
@@ -428,6 +430,12 @@ fn load_or_create_config() -> Config {
         .map(|value| value == "true")
         .unwrap_or(true);
 
+    let swap_name_and_title = config
+        .section(Some("Activity"))
+        .and_then(|sec| sec.get("swap_name_and_title"))
+        .map(|value| value == "true")
+        .unwrap_or(false);
+
     let lobby_max_size = config
         .section(Some("Lobby"))
         .and_then(|sec| sec.get("lobby_max_size"))
@@ -503,6 +511,7 @@ fn load_or_create_config() -> Config {
         disable_when_paused,
         refresh_interval,
         show_small_image,
+        swap_name_and_title,
         lobby_max_size,
         auto_skip_enabled,
         auto_skip_intro,
@@ -988,7 +997,7 @@ fn build_player_activity(
     let lobby = lobby_presence(config);
     let lobby_text = lobby.as_ref().and_then(LobbyPresence::others_text);
 
-    let (activity_name, details, mut state_text) = if media_type == "series" {
+    let (mut activity_name, mut details, mut state_text) = if media_type == "series" {
         (
             info.name.clone(),
             info.epname.clone(),
@@ -997,6 +1006,9 @@ fn build_player_activity(
     } else {
         (info.name.clone(), info.name.clone(), info.year.clone())
     };
+    if config.swap_name_and_title {
+        std::mem::swap(&mut activity_name, &mut details);
+    }
     if let Some(text) = &lobby_text {
         state_text = if state_text.is_empty() {
             text.clone()
