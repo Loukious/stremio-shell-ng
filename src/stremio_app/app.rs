@@ -139,7 +139,7 @@ pub struct MainWindow {
     #[nwg_events(OnNotice: [Self::on_toggle_fullscreen_notice] )]
     pub toggle_fullscreen_notice: nwg::Notice,
     #[nwg_control]
-    #[nwg_events(OnNotice: [nwg::stop_thread_dispatch()] )]
+    #[nwg_events(OnNotice: [Self::on_exit] )]
     pub quit_notice: nwg::Notice,
     #[nwg_control]
     #[nwg_events(OnNotice: [Self::on_hide_splash_notice] )]
