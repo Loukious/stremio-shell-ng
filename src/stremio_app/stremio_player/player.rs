@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -67,6 +68,8 @@ pub static CURRENT_STREAM_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(Str
 /// to inject mpv commands without going through the webview pipeline.
 /// Populated once during `on_init`.
 pub static PLAYER_CMD_TX: Lazy<Mutex<Option<Sender<String>>>> = Lazy::new(|| Mutex::new(None));
+
+static NEXT_MPV_COMMAND_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 const LOADFILE_START_TIMEOUT: Duration = Duration::from_secs(20);
 const DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2: u32 = 15;
@@ -141,6 +144,7 @@ struct PlayerController {
 
 struct ActiveLoadfile {
     url: String,
+    command_request_id: u64,
     queued_at: Instant,
     start_file_seen: bool,
     file_loaded: bool,
@@ -156,6 +160,7 @@ struct ScheduledStartupRetry {
 }
 
 struct MpvCommandJob {
+    request_id: u64,
     name: String,
     args: Vec<String>,
 }
@@ -551,7 +556,7 @@ fn create_event_thread(
 
                     if let Some(pos) = controller.take_pending_reload_seek_for(&url) {
                         println!("[MPV] Restoring position after reload: {}", pos);
-                        send_command(
+                        let _ = send_command(
                             &mpv_command_sender,
                             CmdVal::Tripple(MpvCmd::Seek, pos.to_string(), "absolute".to_string()),
                         );
@@ -670,21 +675,26 @@ fn spawn_mpv_command_worker(mpv: &Mpv) -> Sender<MpvCommandJob> {
 fn run_mpv_command_worker(command_handle: MpvCommandHandle, receiver: Receiver<MpvCommandJob>) {
     while let Ok(job) = receiver.recv() {
         let started_at = Instant::now();
-        println!("[MPV CMD START] {} {:?}", job.name, job.args);
-        match run_mpv_command(command_handle, &job.name, &job.args) {
+        println!(
+            "[MPV CMD START] {} {:?} request_id={}",
+            job.name, job.args, job.request_id
+        );
+        match run_mpv_command_async(command_handle, job.request_id, &job.name, &job.args) {
             Ok(()) => {
                 println!(
-                    "[MPV CMD OK] {} {:?} elapsed_ms={}",
+                    "[MPV CMD QUEUED] {} {:?} request_id={} elapsed_ms={}",
                     job.name,
                     job.args,
+                    job.request_id,
                     started_at.elapsed().as_millis()
                 );
             }
             Err(error) => {
                 eprintln!(
-                    "[MPV CMD ERROR] {} {:?} elapsed_ms={}: '{}'",
+                    "[MPV CMD ERROR] {} {:?} request_id={} elapsed_ms={}: '{}'",
                     job.name,
                     job.args,
+                    job.request_id,
                     started_at.elapsed().as_millis(),
                     error
                 );
@@ -693,8 +703,9 @@ fn run_mpv_command_worker(command_handle: MpvCommandHandle, receiver: Receiver<M
     }
 }
 
-fn run_mpv_command(
+fn run_mpv_command_async(
     command_handle: MpvCommandHandle,
+    request_id: u64,
     name: &str,
     args: &[String],
 ) -> std::result::Result<(), String> {
@@ -710,7 +721,8 @@ fn run_mpv_command(
         .collect::<Vec<*const c_char>>();
     ptrs.push(std::ptr::null());
 
-    let result = unsafe { libmpv2_sys::mpv_command(command_handle.0, ptrs.as_mut_ptr()) };
+    let result =
+        unsafe { libmpv2_sys::mpv_command_async(command_handle.0, request_id, ptrs.as_mut_ptr()) };
     if result < 0 {
         Err(mpv_error_string(result))
     } else {
@@ -840,7 +852,7 @@ impl PlayerController {
             return;
         }
 
-        send_command(mpv_command_sender, cmd);
+        let _ = send_command(mpv_command_sender, cmd);
     }
 
     fn set_or_queue_prop(
@@ -881,11 +893,12 @@ impl PlayerController {
         if self.state == LoadState::Loading
             && self.abort_active_loadfile("stop received while loading")
         {
-            println!("[PLAYER] cancelled in-flight loadfile instead of queuing stop behind it");
-            self.state = LoadState::Idle;
-            self.stop_started_at = None;
+            println!("[PLAYER] cancelling in-flight loadfile with async stop");
+            self.state = LoadState::Stopping;
+            self.stop_started_at = Some(Instant::now());
             *IS_FILE_LOADED.lock().unwrap() = false;
-            *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+            *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = true;
+            let _ = send_command(mpv_command_sender, cmd);
             return;
         }
 
@@ -894,7 +907,7 @@ impl PlayerController {
         self.stop_started_at = Some(Instant::now());
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = true;
-        send_command(mpv_command_sender, cmd);
+        let _ = send_command(mpv_command_sender, cmd);
     }
 
     fn capture_loadfile_url(&mut self, cmd: &CmdVal) {
@@ -1029,9 +1042,10 @@ impl PlayerController {
         self.stop_started_at = None;
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
-        if send_command(mpv_command_sender, cmd) {
+        if let Some(command_request_id) = send_command(mpv_command_sender, cmd) {
             self.active_loadfile = Some(ActiveLoadfile {
                 url,
+                command_request_id,
                 queued_at: Instant::now(),
                 start_file_seen: false,
                 file_loaded: false,
@@ -1055,7 +1069,17 @@ impl PlayerController {
     }
 
     fn on_command_reply(&mut self, request_id: u64) {
-        println!("[PLAYER] ignoring unexpected async command reply request_id={request_id}");
+        if let Some(active) = self.active_loadfile.as_ref() {
+            if active.command_request_id == request_id {
+                println!(
+                    "[PLAYER] loadfile command reply request_id={request_id} url={}",
+                    active.url
+                );
+                return;
+            }
+        }
+
+        println!("[PLAYER] async command reply request_id={request_id}");
     }
 
     fn send_pending_loadfile(&mut self, mpv_command_sender: &Sender<MpvCommandJob>) -> bool {
@@ -1641,14 +1665,22 @@ fn update_cached_property(name: &str, change: &PropertyData) {
     }
 }
 
-fn send_command(mpv_command_sender: &Sender<MpvCommandJob>, cmd: CmdVal) -> bool {
+fn send_command(mpv_command_sender: &Sender<MpvCommandJob>, cmd: CmdVal) -> Option<u64> {
     let (name, args) = command_parts(cmd);
-    println!("[PLAYER] dispatching mpv command: {} {:?}", name, args);
-    match mpv_command_sender.send(MpvCommandJob { name, args }) {
-        Ok(()) => true,
+    let request_id = NEXT_MPV_COMMAND_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    println!(
+        "[PLAYER] dispatching mpv command: {} {:?} request_id={}",
+        name, args, request_id
+    );
+    match mpv_command_sender.send(MpvCommandJob {
+        request_id,
+        name,
+        args,
+    }) {
+        Ok(()) => Some(request_id),
         Err(error) => {
             eprintln!("[MPV CMD DISPATCH ERROR] {error:#}");
-            false
+            None
         }
     }
 }
