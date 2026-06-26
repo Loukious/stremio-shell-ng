@@ -1520,6 +1520,16 @@ impl MainWindow {
         // Read message from player; tee updates to the Web UI and the PiP overlay.
         thread::spawn(move || {
             for msg in player_rx.iter() {
+                #[cfg(debug_assertions)]
+                if msg.contains("mpv-event-ended")
+                    || msg.contains("mpv-event-error")
+                    || msg.contains("mpv-prop-change")
+                        && (msg.contains("\"path\"")
+                            || msg.contains("\"duration\"")
+                            || msg.contains("\"time-pos\""))
+                {
+                    println!("[PLAYER->WEB] {msg}");
+                }
                 let _ = web_tx_player.send(msg.clone());
                 let _ = pip_event_tx.send(msg);
             }
@@ -1540,6 +1550,15 @@ impl MainWindow {
                 .ok()
                 .and_then(|s| serde_json::from_str::<RPCRequest>(&s).ok())
             {
+                #[cfg(debug_assertions)]
+                if let Some(method) = msg.get_method() {
+                    if method.starts_with("mpv-")
+                        || method == "shell-route-changed"
+                        || method == "app-ready"
+                    {
+                        println!("[WEB->SHELL] method={method} params={:?}", msg.get_params());
+                    }
+                }
                 match msg.get_method() {
                     // The handshake. Here we send some useful data to the WEB UI
                     None if msg.is_handshake() => {
