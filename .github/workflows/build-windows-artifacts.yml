@@ -6,6 +6,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build ${{ matrix.arch }}
@@ -127,3 +130,110 @@ jobs:
           path: artifacts\StremioRPCPortable.zip
           if-no-files-found: error
           retention-days: 1
+
+  release:
+    name: Publish release candidate
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          find artifacts -type f -name 'StremioSetup-v*_x64.exe' -exec cp '{}' dist/ \;
+          find artifacts -type f -name 'StremioSetup-v*_arm64.exe' -exec cp '{}' dist/ \;
+          cp artifacts/StremioRPCPortable-x64/StremioRPCPortable.zip dist/StremioRPCPortable_x64.zip
+          cp artifacts/StremioRPCPortable-arm64/StremioRPCPortable.zip dist/StremioRPCPortable_arm64.zip
+
+          echo "Release assets:"
+          ls -la dist
+
+      - name: Choose release candidate tag
+        id: rc
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          base_tag="v${version}"
+          current_tag=""
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            current_tag="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ "$current_tag" =~ ^v[0-9]+(\.[0-9A-Za-z-]+)*-rc[0-9]+$ ]]; then
+            release_tag="$current_tag"
+            version="${release_tag#v}"
+            version="${version%-rc*}"
+          else
+            git fetch --tags --force
+            existing_numbers="$(
+              {
+                git tag -l "${base_tag}-rc*" | sed -En "s/^${base_tag}-rc([0-9]+)$/\1/p"
+                gh release list --limit 200 --json tagName --jq '.[].tagName' \
+                  | sed -En "s/^${base_tag}-rc([0-9]+)$/\1/p"
+              } | sort -n | uniq
+            )"
+            last_number="$(printf '%s\n' "$existing_numbers" | tail -n 1)"
+            if [[ -z "$last_number" ]]; then
+              next_number=1
+            else
+              next_number=$((last_number + 1))
+            fi
+            release_tag="${base_tag}-rc${next_number}"
+
+            if ! git rev-parse -q --verify "refs/tags/${release_tag}" >/dev/null; then
+              git tag "$release_tag" "$GITHUB_SHA"
+              git push origin "refs/tags/${release_tag}"
+            fi
+          fi
+
+          rc_number="${release_tag##*-rc}"
+          {
+            echo "version=${version}"
+            echo "tag=${release_tag}"
+            echo "rc_number=${rc_number}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Selected release candidate: ${release_tag}"
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.rc.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.rc.outputs.version }}
+          RC_NUMBER: ${{ steps.rc.outputs.rc_number }}
+        run: |
+          set -euo pipefail
+
+          title="Stremio RPC ${RELEASE_VERSION} RC${RC_NUMBER}"
+          notes="Release candidate ${RC_NUMBER} for v${RELEASE_VERSION}."
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --title "$title" \
+              --notes "$notes"
+          else
+            gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes "$notes"
+          fi
+
+          gh release upload "$RELEASE_TAG" dist/* --clobber
