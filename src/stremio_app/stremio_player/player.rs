@@ -159,17 +159,8 @@ struct ScheduledStartupRetry {
     resume_position: Option<f64>,
 }
 
-struct MpvCommandJob {
-    request_id: u64,
-    name: String,
-    args: Vec<String>,
-}
-
 #[derive(Clone, Copy)]
 struct MpvCommandHandle(*mut libmpv2_sys::mpv_handle);
-
-unsafe impl Send for MpvCommandHandle {}
-unsafe impl Sync for MpvCommandHandle {}
 
 impl PlayerController {
     fn new(window_handle: isize) -> Self {
@@ -194,13 +185,21 @@ impl PlayerController {
     }
 
     fn refresh_display_output(&mut self, mpv: &Mpv) {
+        if self.state != LoadState::Loaded {
+            return;
+        }
+
         let now = Instant::now();
         if now < self.next_display_refresh {
             return;
         }
         self.next_display_refresh = now + Duration::from_millis(500);
 
-        let state = current_display_output_state(mpv, self.window_handle as HWND);
+        let state = current_display_output_state(
+            mpv,
+            self.window_handle as HWND,
+            self.gpu_video_processing,
+        );
         let key = (state, self.gpu_video_processing);
         if self.last_display_output != Some(key) {
             apply_display_output_mode(mpv, state, self.gpu_video_processing);
@@ -318,10 +317,18 @@ fn with_gpu_next_fallback(vo: String) -> String {
     format!("{},", outputs.join(","))
 }
 
-fn current_display_output_state(mpv: &Mpv, window_handle: HWND) -> DisplayOutputState {
+fn current_display_output_state(
+    mpv: &Mpv,
+    window_handle: HWND,
+    gpu_video_processing: bool,
+) -> DisplayOutputState {
     DisplayOutputState {
         mode: current_display_output_mode(window_handle),
-        scale_percent: current_video_filter_scale(mpv, window_handle),
+        scale_percent: if gpu_video_processing {
+            current_video_filter_scale(mpv, window_handle)
+        } else {
+            100
+        },
     }
 }
 
@@ -502,8 +509,6 @@ fn create_event_thread(
         let mut controller = PlayerController::new(window_handle);
         mpv.disable_deprecated_events()
             .expect("failed to disable deprecated MPV events");
-        let mpv_command_sender = spawn_mpv_command_worker(&mpv);
-
         for (name, format) in [
             ("time-pos", Format::Double),
             ("duration", Format::Double),
@@ -517,11 +522,11 @@ fn create_event_thread(
 
         loop {
             while let Ok(msg) = in_msg_receiver.try_recv() {
-                controller.handle_in_msg(&mpv, &mpv_command_sender, msg, &rpc_response_sender);
+                controller.handle_in_msg(&mpv, msg, &rpc_response_sender);
             }
-            controller.flush_stale_stop(&mpv_command_sender);
-            controller.flush_stale_loadfile(&mpv_command_sender);
-            controller.flush_pending_startup_retry(&mpv_command_sender);
+            controller.flush_stale_stop(&mpv);
+            controller.flush_stale_loadfile(&mpv);
+            controller.flush_pending_startup_retry(&mpv);
             controller.refresh_display_output(&mpv);
 
             let event = match mpv.wait_event(0.01) {
@@ -532,11 +537,7 @@ fn create_event_thread(
                         .active_loadfile
                         .as_ref()
                         .and_then(|active| active.requested_start);
-                    controller.retry_local_stream_startup_failure(
-                        &mpv_command_sender,
-                        "event error",
-                        resume_position,
-                    );
+                    controller.retry_local_stream_startup_failure("event error", resume_position);
                     continue;
                 }
                 None => continue,
@@ -557,7 +558,7 @@ fn create_event_thread(
                     if let Some(pos) = controller.take_pending_reload_seek_for(&url) {
                         println!("[MPV] Restoring position after reload: {}", pos);
                         let _ = send_command(
-                            &mpv_command_sender,
+                            &mpv,
                             CmdVal::Tripple(MpvCmd::Seek, pos.to_string(), "absolute".to_string()),
                         );
                     }
@@ -583,7 +584,7 @@ fn create_event_thread(
                     );
 
                     controller.on_end_file();
-                    if controller.send_pending_loadfile(&mpv_command_sender) {
+                    if controller.send_pending_loadfile(&mpv) {
                         continue;
                     }
 
@@ -605,7 +606,7 @@ fn create_event_thread(
                             controller.pending_reload_seek = Some(time);
                             let cmd =
                                 CmdVal::Tripple(MpvCmd::Loadfile, url2, "replace".to_string());
-                            controller.send_loadfile_now(&mpv_command_sender, cmd);
+                            controller.send_loadfile_now(&mpv, cmd);
 
                             // Do not propagate this premature EndFile to the frontend,
                             // otherwise the autoplay logic might trigger next episode.
@@ -618,11 +619,9 @@ fn create_event_thread(
                             .active_loadfile
                             .as_ref()
                             .and_then(|active| active.requested_start);
-                        if controller.retry_local_stream_startup_failure(
-                            &mpv_command_sender,
-                            "end-file error",
-                            resume_position,
-                        ) {
+                        if controller
+                            .retry_local_stream_startup_failure("end-file error", resume_position)
+                        {
                             continue;
                         }
                     }
@@ -665,44 +664,6 @@ fn create_event_thread(
     })
 }
 
-fn spawn_mpv_command_worker(mpv: &Mpv) -> Sender<MpvCommandJob> {
-    let command_handle = MpvCommandHandle(mpv.ctx.as_ptr());
-    let (sender, receiver) = flume::unbounded();
-    thread::spawn(move || run_mpv_command_worker(command_handle, receiver));
-    sender
-}
-
-fn run_mpv_command_worker(command_handle: MpvCommandHandle, receiver: Receiver<MpvCommandJob>) {
-    while let Ok(job) = receiver.recv() {
-        let started_at = Instant::now();
-        println!(
-            "[MPV CMD START] {} {:?} request_id={}",
-            job.name, job.args, job.request_id
-        );
-        match run_mpv_command_async(command_handle, job.request_id, &job.name, &job.args) {
-            Ok(()) => {
-                println!(
-                    "[MPV CMD QUEUED] {} {:?} request_id={} elapsed_ms={}",
-                    job.name,
-                    job.args,
-                    job.request_id,
-                    started_at.elapsed().as_millis()
-                );
-            }
-            Err(error) => {
-                eprintln!(
-                    "[MPV CMD ERROR] {} {:?} request_id={} elapsed_ms={}: '{}'",
-                    job.name,
-                    job.args,
-                    job.request_id,
-                    started_at.elapsed().as_millis(),
-                    error
-                );
-            }
-        }
-    }
-}
-
 fn run_mpv_command_async(
     command_handle: MpvCommandHandle,
     request_id: u64,
@@ -741,13 +702,7 @@ fn mpv_error_string(error: i32) -> String {
 }
 
 impl PlayerController {
-    fn handle_in_msg(
-        &mut self,
-        mpv: &Mpv,
-        mpv_command_sender: &Sender<MpvCommandJob>,
-        msg: String,
-        rpc_response_sender: &Sender<String>,
-    ) {
+    fn handle_in_msg(&mut self, mpv: &Mpv, msg: String, rpc_response_sender: &Sender<String>) {
         println!("[PLAYER] incoming raw message: {msg}");
         let in_msg: InMsg = match serde_json::from_str(&msg) {
             Ok(in_msg) => in_msg,
@@ -820,10 +775,12 @@ impl PlayerController {
             InMsg(InMsgFn::MpvSetGpuVideoProcessing, InMsgArgs::Flag(enabled)) => {
                 self.gpu_video_processing = enabled;
                 self.invalidate_display_output();
-                self.refresh_display_output(mpv);
+                println!(
+                    "[PLAYER] gpu video processing set to {enabled}; display refresh deferred"
+                );
             }
             InMsg(InMsgFn::MpvCommand, InMsgArgs::Cmd(cmd)) => {
-                self.handle_command(mpv_command_sender, cmd);
+                self.handle_command(mpv, cmd);
             }
             msg => {
                 eprintln!("MPV unsupported message: '{msg:?}'");
@@ -831,13 +788,13 @@ impl PlayerController {
         }
     }
 
-    fn handle_command(&mut self, mpv_command_sender: &Sender<MpvCommandJob>, cmd: CmdVal) {
+    fn handle_command(&mut self, mpv: &Mpv, cmd: CmdVal) {
         println!("[PLAYER] parsed mpv command: {cmd:?}");
         let cmd = sanitize_loadfile_start(cmd);
         println!("[PLAYER] sanitized mpv command: {cmd:?}");
 
         if is_stop_command(&cmd) {
-            self.handle_stop(mpv_command_sender, cmd);
+            self.handle_stop(mpv, cmd);
             return;
         }
 
@@ -848,11 +805,11 @@ impl PlayerController {
                 self.pending_loadfile = Some(cmd);
                 return;
             }
-            self.send_loadfile_now(mpv_command_sender, cmd);
+            self.send_loadfile_now(mpv, cmd);
             return;
         }
 
-        let _ = send_command(mpv_command_sender, cmd);
+        let _ = send_command(mpv, cmd);
     }
 
     fn set_or_queue_prop(
@@ -874,7 +831,7 @@ impl PlayerController {
         set_prop_val(name, value, mpv, Some(rpc_response_sender));
     }
 
-    fn handle_stop(&mut self, mpv_command_sender: &Sender<MpvCommandJob>, cmd: CmdVal) {
+    fn handle_stop(&mut self, mpv: &Mpv, cmd: CmdVal) {
         if self.state == LoadState::Stopping {
             println!("[PLAYER] skipping duplicate stop while already stopping");
             return;
@@ -898,7 +855,7 @@ impl PlayerController {
             self.stop_started_at = Some(Instant::now());
             *IS_FILE_LOADED.lock().unwrap() = false;
             *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = true;
-            let _ = send_command(mpv_command_sender, cmd);
+            let _ = send_command(mpv, cmd);
             return;
         }
 
@@ -907,7 +864,7 @@ impl PlayerController {
         self.stop_started_at = Some(Instant::now());
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = true;
-        let _ = send_command(mpv_command_sender, cmd);
+        let _ = send_command(mpv, cmd);
     }
 
     fn capture_loadfile_url(&mut self, cmd: &CmdVal) {
@@ -1034,7 +991,7 @@ impl PlayerController {
         *CURRENT_STREAM_URL.lock().unwrap() = url;
     }
 
-    fn send_loadfile_now(&mut self, mpv_command_sender: &Sender<MpvCommandJob>, cmd: CmdVal) {
+    fn send_loadfile_now(&mut self, mpv: &Mpv, cmd: CmdVal) {
         let url = loadfile_url(&cmd).unwrap_or_default().to_string();
         let requested_start = loadfile_requested_start(&cmd);
         self.abort_active_loadfile("superseded by a newer loadfile");
@@ -1042,7 +999,7 @@ impl PlayerController {
         self.stop_started_at = None;
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
-        if let Some(command_request_id) = send_command(mpv_command_sender, cmd) {
+        if let Some(command_request_id) = send_command(mpv, cmd) {
             self.active_loadfile = Some(ActiveLoadfile {
                 url,
                 command_request_id,
@@ -1082,17 +1039,17 @@ impl PlayerController {
         println!("[PLAYER] async command reply request_id={request_id}");
     }
 
-    fn send_pending_loadfile(&mut self, mpv_command_sender: &Sender<MpvCommandJob>) -> bool {
+    fn send_pending_loadfile(&mut self, mpv: &Mpv) -> bool {
         let Some(cmd) = self.pending_loadfile.take() else {
             return false;
         };
 
         println!("[PLAYER] sending deferred loadfile after stop completed: {cmd:?}");
-        self.send_loadfile_now(mpv_command_sender, cmd);
+        self.send_loadfile_now(mpv, cmd);
         true
     }
 
-    fn flush_stale_stop(&mut self, mpv_command_sender: &Sender<MpvCommandJob>) {
+    fn flush_stale_stop(&mut self, mpv: &Mpv) {
         if self.state != LoadState::Stopping {
             return;
         }
@@ -1110,10 +1067,10 @@ impl PlayerController {
         self.stop_started_at = None;
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
-        self.send_pending_loadfile(mpv_command_sender);
+        self.send_pending_loadfile(mpv);
     }
 
-    fn flush_stale_loadfile(&mut self, mpv_command_sender: &Sender<MpvCommandJob>) {
+    fn flush_stale_loadfile(&mut self, _mpv: &Mpv) {
         let Some(active) = self.active_loadfile.as_ref() else {
             return;
         };
@@ -1138,14 +1095,10 @@ impl PlayerController {
             );
             return;
         }
-        self.retry_local_stream_startup_failure(
-            mpv_command_sender,
-            "StartFile watchdog",
-            resume_position,
-        );
+        self.retry_local_stream_startup_failure("StartFile watchdog", resume_position);
     }
 
-    fn flush_pending_startup_retry(&mut self, mpv_command_sender: &Sender<MpvCommandJob>) {
+    fn flush_pending_startup_retry(&mut self, mpv: &Mpv) {
         let Some(retry) = self.pending_startup_retry.as_ref() else {
             return;
         };
@@ -1173,14 +1126,13 @@ impl PlayerController {
             self.pending_reload_seek = Some(position);
         }
         self.send_loadfile_now(
-            mpv_command_sender,
+            mpv,
             CmdVal::Tripple(MpvCmd::Loadfile, retry.retry_url, "replace".to_string()),
         );
     }
 
     fn retry_local_stream_startup_failure(
         &mut self,
-        _mpv_command_sender: &Sender<MpvCommandJob>,
         source: &str,
         resume_position: Option<f64>,
     ) -> bool {
@@ -1665,21 +1617,36 @@ fn update_cached_property(name: &str, change: &PropertyData) {
     }
 }
 
-fn send_command(mpv_command_sender: &Sender<MpvCommandJob>, cmd: CmdVal) -> Option<u64> {
+fn send_command(mpv: &Mpv, cmd: CmdVal) -> Option<u64> {
     let (name, args) = command_parts(cmd);
     let request_id = NEXT_MPV_COMMAND_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     println!(
         "[PLAYER] dispatching mpv command: {} {:?} request_id={}",
         name, args, request_id
     );
-    match mpv_command_sender.send(MpvCommandJob {
-        request_id,
-        name,
-        args,
-    }) {
-        Ok(()) => Some(request_id),
+    let command_handle = MpvCommandHandle(mpv.ctx.as_ptr());
+    let started_at = Instant::now();
+    println!("[MPV CMD START] {name} {args:?} request_id={request_id}");
+    match run_mpv_command_async(command_handle, request_id, &name, &args) {
+        Ok(()) => {
+            println!(
+                "[MPV CMD QUEUED] {} {:?} request_id={} elapsed_ms={}",
+                name,
+                args,
+                request_id,
+                started_at.elapsed().as_millis()
+            );
+            Some(request_id)
+        }
         Err(error) => {
-            eprintln!("[MPV CMD DISPATCH ERROR] {error:#}");
+            eprintln!(
+                "[MPV CMD ERROR] {} {:?} request_id={} elapsed_ms={}: '{}'",
+                name,
+                args,
+                request_id,
+                started_at.elapsed().as_millis(),
+                error
+            );
             None
         }
     }
