@@ -16,17 +16,18 @@ use winapi::um::wingdi::{
 };
 use winapi::um::winuser::{
     BeginPaint, ClientToScreen, CreateWindowExW, DefWindowProcW, EndPaint, FillRect, GetClientRect,
-    GetCursorPos, GetWindowLongA, GetWindowLongPtrW, GetWindowRect, InvalidateRect,
-    IsWindowVisible, LoadCursorW, MoveWindow, PostMessageW, RedrawWindow, RegisterClassExW,
-    ReleaseCapture, SetCapture, SetLayeredWindowAttributes, SetParent, SetWindowLongA,
-    SetWindowLongPtrW, SetWindowPos, SetWindowRgn, ShowWindow, GWLP_USERDATA, GWL_EXSTYLE,
-    GWL_STYLE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
-    HTTOPRIGHT, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA, PAINTSTRUCT,
-    RDW_INVALIDATE, RDW_UPDATENOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE, WNDCLASSEXW,
-    WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    GetCursorPos, GetMonitorInfoW, GetWindowLongA, GetWindowLongPtrW, GetWindowRect,
+    InvalidateRect, IsWindowVisible, LoadCursorW, MonitorFromRect, MoveWindow, PostMessageW,
+    RedrawWindow, RegisterClassExW, ReleaseCapture, SetCapture, SetLayeredWindowAttributes,
+    SetParent, SetWindowLongA, SetWindowLongPtrW, SetWindowPos, SetWindowRgn, ShowWindow,
+    GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
+    HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST, IDC_ARROW,
+    LWA_ALPHA, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_INVALIDATE, RDW_UPDATENOW,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA,
+    WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE,
+    WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
+    WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+    WS_THICKFRAME,
 };
 
 // -----------------------------------------------------------------------------
@@ -160,6 +161,7 @@ const DRAG_HANDLE_W: i32 = 96;
 const DRAG_HANDLE_H: i32 = 10;
 
 const TRANSPARENT_ALPHA: u8 = 150;
+const PIP_SCREEN_MARGIN: i32 = 24;
 
 // Hit identifiers for buttons.
 #[repr(u8)]
@@ -172,6 +174,77 @@ enum HitId {
     Skip,
     Transparency,
     Slider,
+}
+
+fn sanitize_pip_bounds(
+    initial_pos: Option<(i32, i32)>,
+    initial_size: (i32, i32),
+) -> (i32, i32, i32, i32) {
+    let mut width = initial_size.0.max(PIP_MIN_WIDTH);
+    let mut height = initial_size.1.max(PIP_MIN_HEIGHT);
+    let desired_x = initial_pos.map(|(x, _)| x).unwrap_or(0);
+    let desired_y = initial_pos.map(|(_, y)| y).unwrap_or(0);
+    let desired = RECT {
+        left: desired_x,
+        top: desired_y,
+        right: desired_x + width,
+        bottom: desired_y + height,
+    };
+
+    let Some(work) = monitor_work_rect(&desired) else {
+        return (desired_x, desired_y, width, height);
+    };
+
+    let work_width = (work.right - work.left).max(1);
+    let work_height = (work.bottom - work.top).max(1);
+    width = width.min(work_width).max(PIP_MIN_WIDTH.min(work_width));
+    height = height.min(work_height).max(PIP_MIN_HEIGHT.min(work_height));
+
+    let max_x = work.right - width;
+    let max_y = work.bottom - height;
+    let (x, y) = if let Some((x, y)) = initial_pos {
+        (
+            clamp_to_range(x, work.left, max_x),
+            clamp_to_range(y, work.top, max_y),
+        )
+    } else {
+        (
+            clamp_to_range(work.right - width - PIP_SCREEN_MARGIN, work.left, max_x),
+            clamp_to_range(work.bottom - height - PIP_SCREEN_MARGIN, work.top, max_y),
+        )
+    };
+
+    if initial_pos.is_some_and(|pos| pos != (x, y)) {
+        eprintln!(
+            "PiP placement adjusted onto visible monitor: ({desired_x}, {desired_y}) -> ({x}, {y})"
+        );
+    }
+
+    (x, y, width, height)
+}
+
+fn monitor_work_rect(rect: &RECT) -> Option<RECT> {
+    unsafe {
+        let monitor = MonitorFromRect(rect, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return None;
+        }
+
+        let mut info: MONITORINFO = mem::zeroed();
+        info.cbSize = mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+        Some(info.rcWork)
+    }
+}
+
+fn clamp_to_range(value: i32, min: i32, max: i32) -> i32 {
+    if max <= min {
+        min
+    } else {
+        value.clamp(min, max)
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -236,14 +309,13 @@ impl PipWindow {
         let (w, h) = ctx
             .initial_size
             .unwrap_or((PIP_DEFAULT_WIDTH, PIP_DEFAULT_HEIGHT));
+        let (x, y, w, h) = sanitize_pip_bounds(ctx.initial_pos, (w, h));
 
-        let mut window_builder = nwg::Window::builder()
+        let window_builder = nwg::Window::builder()
             .title("Stremio - Picture in Picture")
             .size((w, h))
+            .position((x, y))
             .flags(nwg::WindowFlags::WINDOW | nwg::WindowFlags::RESIZABLE);
-        if let Some((x, y)) = ctx.initial_pos {
-            window_builder = window_builder.position((x, y));
-        }
         window_builder.build(&mut self.window)?;
 
         nwg::Timer::builder()
@@ -501,6 +573,7 @@ impl PipWindow {
 
     pub fn show(&self) {
         self.last_cursor_activity_ms.set(now_ms());
+        self.window.set_visible(true);
         if let Some(overlay) = self.overlay_hwnd.get() {
             unsafe {
                 ShowWindow(overlay, SW_SHOWNA);
