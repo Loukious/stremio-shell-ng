@@ -72,6 +72,13 @@ pub static PLAYER_CMD_TX: Lazy<Mutex<Option<Sender<String>>>> = Lazy::new(|| Mut
 static NEXT_MPV_COMMAND_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 const LOADFILE_START_TIMEOUT: Duration = Duration::from_secs(20);
+const MPV_COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(8);
+const LOCAL_LOADFILE_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const LOCAL_STREAM_STARTUP_RETRY_LIMIT: u32 = 60;
+const LOCAL_STREAM_STARTUP_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MPV_RECOVERY_STOP_TIMEOUT: Duration = Duration::from_secs(8);
+const MPV_COMMAND_QUEUE_RECOVERY_LIMIT: u32 = 3;
+const POST_END_DRAIN_STOP_WINDOW: Duration = Duration::from_secs(10);
 const DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2: u32 = 15;
 const DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR: u32 = 2;
 
@@ -134,8 +141,16 @@ struct PlayerController {
     pending_reload_url: Option<String>,
     pending_reload_seek: Option<f64>,
     startup_retry_attempts: u32,
+    command_queue_recoveries: u32,
     premature_eof_reloads: u32,
     stop_started_at: Option<Instant>,
+    stop_command_request_id: Option<u64>,
+    recovery_sender: Sender<RecoveryEvent>,
+    recovery_stop_generation: u64,
+    recovery_stop_in_flight: Option<RecoveryStop>,
+    last_end_file_at: Option<Instant>,
+    post_end_stop_sent: bool,
+    post_end_stop_in_flight: bool,
     window_handle: isize,
     gpu_video_processing: bool,
     last_display_output: Option<(DisplayOutputState, bool)>,
@@ -143,9 +158,13 @@ struct PlayerController {
 }
 
 struct ActiveLoadfile {
+    cmd: CmdVal,
     url: String,
     command_request_id: u64,
+    abortable: bool,
     queued_at: Instant,
+    last_wait_log_at: Instant,
+    command_replied: bool,
     start_file_seen: bool,
     file_loaded: bool,
     requested_start: Option<f64>,
@@ -159,11 +178,34 @@ struct ScheduledStartupRetry {
     resume_position: Option<f64>,
 }
 
+struct RecoveryStop {
+    generation: u64,
+    started_at: Instant,
+}
+
+enum RecoveryEvent {
+    StopFinished {
+        generation: u64,
+        result: Result<(), String>,
+    },
+}
+
 #[derive(Clone, Copy)]
 struct MpvCommandHandle(*mut libmpv2_sys::mpv_handle);
 
+#[derive(Clone, Copy)]
+struct RecoveryClientHandle(usize);
+
+unsafe impl Send for RecoveryClientHandle {}
+
+#[derive(Clone, Copy)]
+struct CommandSubmission {
+    request_id: u64,
+    abortable: bool,
+}
+
 impl PlayerController {
-    fn new(window_handle: isize) -> Self {
+    fn new(window_handle: isize, recovery_sender: Sender<RecoveryEvent>) -> Self {
         Self {
             observed_properties: HashSet::new(),
             state: LoadState::Idle,
@@ -175,8 +217,16 @@ impl PlayerController {
             pending_reload_url: None,
             pending_reload_seek: None,
             startup_retry_attempts: 0,
+            command_queue_recoveries: 0,
             premature_eof_reloads: 0,
             stop_started_at: None,
+            stop_command_request_id: None,
+            recovery_sender,
+            recovery_stop_generation: 0,
+            recovery_stop_in_flight: None,
+            last_end_file_at: None,
+            post_end_stop_sent: false,
+            post_end_stop_in_flight: false,
             window_handle,
             gpu_video_processing: false,
             last_display_output: None,
@@ -506,7 +556,8 @@ fn create_event_thread(
     rpc_response_sender: Sender<String>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut controller = PlayerController::new(window_handle);
+        let (recovery_sender, recovery_receiver) = flume::unbounded();
+        let mut controller = PlayerController::new(window_handle, recovery_sender);
         mpv.disable_deprecated_events()
             .expect("failed to disable deprecated MPV events");
         for (name, format) in [
@@ -523,6 +574,9 @@ fn create_event_thread(
         loop {
             while let Ok(msg) = in_msg_receiver.try_recv() {
                 controller.handle_in_msg(&mpv, msg, &rpc_response_sender);
+            }
+            while let Ok(event) = recovery_receiver.try_recv() {
+                controller.handle_recovery_event(&mpv, event);
             }
             controller.flush_stale_stop(&mpv);
             controller.flush_stale_loadfile(&mpv);
@@ -651,7 +705,7 @@ fn create_event_thread(
                 }
                 Event::CommandReply(request_id) => {
                     println!("[MPV CMD REPLY] request_id={request_id}");
-                    controller.on_command_reply(request_id);
+                    controller.on_command_reply(request_id, &mpv);
                     continue;
                 }
                 _ => continue,
@@ -684,6 +738,52 @@ fn run_mpv_command_async(
 
     let result =
         unsafe { libmpv2_sys::mpv_command_async(command_handle.0, request_id, ptrs.as_mut_ptr()) };
+    if result < 0 {
+        Err(mpv_error_string(result))
+    } else {
+        Ok(())
+    }
+}
+
+fn create_recovery_client(mpv: &Mpv, name: &str) -> Option<RecoveryClientHandle> {
+    let name = match CString::new(name) {
+        Ok(name) => name,
+        Err(error) => {
+            eprintln!("[MPV RECOVERY] invalid recovery client name: {error}");
+            return None;
+        }
+    };
+    let client = unsafe { libmpv2_sys::mpv_create_client(mpv.ctx.as_ptr(), name.as_ptr()) };
+    if client.is_null() {
+        eprintln!("[MPV RECOVERY] mpv_create_client returned null; mpv is likely shutting down");
+        return None;
+    }
+    Some(RecoveryClientHandle(client as usize))
+}
+
+fn run_mpv_command_sync(
+    command_handle: RecoveryClientHandle,
+    name: &str,
+    args: &[String],
+) -> std::result::Result<(), String> {
+    let mut cstr_args = Vec::with_capacity(args.len() + 1);
+    cstr_args.push(CString::new(name).map_err(|error| error.to_string())?);
+    for arg in args {
+        cstr_args.push(CString::new(arg.as_str()).map_err(|error| error.to_string())?);
+    }
+
+    let mut ptrs = cstr_args
+        .iter()
+        .map(|arg| arg.as_ptr())
+        .collect::<Vec<*const c_char>>();
+    ptrs.push(std::ptr::null());
+
+    let result = unsafe {
+        libmpv2_sys::mpv_command(
+            command_handle.0 as *mut libmpv2_sys::mpv_handle,
+            ptrs.as_mut_ptr(),
+        )
+    };
     if result < 0 {
         Err(mpv_error_string(result))
     } else {
@@ -819,8 +919,9 @@ impl PlayerController {
         name: PropKey,
         value: PropVal,
     ) {
+        let name_string = name.to_string();
+        apply_property_set_side_effect(&name_string, &value);
         if self.should_defer_startup_property(&name) {
-            let name_string = name.to_string();
             let value_json =
                 normalize_property_value_for_web(&name_string, &prop_val_to_json(&value));
             cache_property_value(&name_string, &value_json);
@@ -839,23 +940,53 @@ impl PlayerController {
 
         clear_file_scoped_cached_props();
         if self.state == LoadState::Idle {
-            if self.abort_active_loadfile("stop received while controller was idle") {
+            if self.abort_active_loadfile(mpv, "stop received while controller was idle") {
                 println!("[PLAYER] cancelled unresolved loadfile from idle state");
+            } else if self.should_forward_post_end_stop() {
+                println!("[PLAYER] forwarding post-EndFile stop to interrupt mpv drain");
+                self.post_end_stop_sent = true;
+                self.post_end_stop_in_flight = true;
+                self.state = LoadState::Stopping;
+                self.stop_started_at = Some(Instant::now());
+                *IS_FILE_LOADED.lock().unwrap() = false;
+                *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = true;
+                self.stop_command_request_id = send_command(mpv, cmd)
+                    .and_then(|submission| submission.abortable.then_some(submission.request_id));
             } else {
                 println!("[PLAYER] skipping idle stop");
             }
             return;
         }
 
+        let startup_load_in_flight = self
+            .active_loadfile
+            .as_ref()
+            .map(|active| !active.start_file_seen)
+            .unwrap_or(false);
         if self.state == LoadState::Loading
-            && self.abort_active_loadfile("stop received while loading")
+            && startup_load_in_flight
+            && self.abort_active_loadfile(mpv, "stop received before StartFile")
+        {
+            println!("[PLAYER] cancelled startup loadfile without queuing stop");
+            self.state = LoadState::Idle;
+            self.stop_started_at = None;
+            self.stop_command_request_id = None;
+            self.post_end_stop_in_flight = false;
+            *IS_FILE_LOADED.lock().unwrap() = false;
+            *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+            return;
+        }
+
+        if self.state == LoadState::Loading
+            && self.abort_active_loadfile(mpv, "stop received while loading")
         {
             println!("[PLAYER] cancelling in-flight loadfile with async stop");
             self.state = LoadState::Stopping;
             self.stop_started_at = Some(Instant::now());
             *IS_FILE_LOADED.lock().unwrap() = false;
             *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = true;
-            let _ = send_command(mpv, cmd);
+            self.stop_command_request_id = send_command(mpv, cmd)
+                .and_then(|submission| submission.abortable.then_some(submission.request_id));
             return;
         }
 
@@ -864,7 +995,8 @@ impl PlayerController {
         self.stop_started_at = Some(Instant::now());
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = true;
-        let _ = send_command(mpv, cmd);
+        self.stop_command_request_id = send_command(mpv, cmd)
+            .and_then(|submission| submission.abortable.then_some(submission.request_id));
     }
 
     fn capture_loadfile_url(&mut self, cmd: &CmdVal) {
@@ -873,15 +1005,20 @@ impl PlayerController {
         };
 
         let is_reload = url.contains("_reload=");
-        if self.current_url != url && !is_reload {
-            println!(
-                "[PLAYER] new non-reload stream. previous={}, next={}",
-                self.current_url, url
-            );
+        if !is_reload {
+            if self.current_url == url {
+                println!("[PLAYER] restarting current non-reload stream: {url}");
+            } else {
+                println!(
+                    "[PLAYER] new non-reload stream. previous={}, next={}",
+                    self.current_url, url
+                );
+            }
             clear_file_scoped_cached_props();
             *CURRENT_TIME.lock().unwrap() = 0.0;
             *TOTAL_DURATION.lock().unwrap() = 0.0;
             self.startup_retry_attempts = 0;
+            self.command_queue_recoveries = 0;
             self.premature_eof_reloads = 0;
             self.pending_startup_retry = None;
             self.pending_reload_url = None;
@@ -895,12 +1032,14 @@ impl PlayerController {
     fn on_start_file(&mut self) {
         self.state = LoadState::Loading;
         self.stop_started_at = None;
+        self.last_end_file_at = None;
+        self.post_end_stop_sent = false;
+        self.post_end_stop_in_flight = false;
         if let Some(active) = self.active_loadfile.as_mut() {
             active.start_file_seen = true;
         }
         *CURRENT_TIME.lock().unwrap() = 0.0;
         *TOTAL_DURATION.lock().unwrap() = 0.0;
-        *IS_PAUSED.lock().unwrap() = true;
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
         clear_file_scoped_cached_props();
@@ -911,6 +1050,10 @@ impl PlayerController {
     fn on_file_loaded(&mut self, mpv: &Mpv, rpc_response_sender: &Sender<String>) {
         self.state = LoadState::Loaded;
         self.stop_started_at = None;
+        self.stop_command_request_id = None;
+        self.last_end_file_at = None;
+        self.post_end_stop_sent = false;
+        self.post_end_stop_in_flight = false;
         if let Some(active) = self.active_loadfile.as_mut() {
             active.file_loaded = true;
             self.active_loadfile = None;
@@ -938,8 +1081,100 @@ impl PlayerController {
             self.state = LoadState::Idle;
         }
         self.stop_started_at = None;
+        self.stop_command_request_id = None;
+        self.last_end_file_at = Some(Instant::now());
+        self.post_end_stop_sent = false;
+        self.post_end_stop_in_flight = false;
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+    }
+
+    fn should_forward_post_end_stop(&self) -> bool {
+        if self.post_end_stop_sent {
+            return false;
+        }
+        self.last_end_file_at
+            .map(|ended_at| ended_at.elapsed() <= POST_END_DRAIN_STOP_WINDOW)
+            .unwrap_or(false)
+    }
+
+    fn start_recovery_stop(&mut self, mpv: &Mpv, reason: &str) -> bool {
+        if let Some(in_flight) = &self.recovery_stop_in_flight {
+            println!(
+                "[MPV RECOVERY] stop already in flight generation={} elapsed_ms={}",
+                in_flight.generation,
+                in_flight.started_at.elapsed().as_millis()
+            );
+            return true;
+        }
+
+        let client = match create_recovery_client(mpv, "stremio-recovery-stop") {
+            Some(client) => client,
+            None => return false,
+        };
+
+        self.recovery_stop_generation += 1;
+        let generation = self.recovery_stop_generation;
+        let sender = self.recovery_sender.clone();
+        self.recovery_stop_in_flight = Some(RecoveryStop {
+            generation,
+            started_at: Instant::now(),
+        });
+        println!("[MPV RECOVERY] starting sync stop generation={generation} reason={reason}");
+
+        thread::spawn(move || {
+            let started_at = Instant::now();
+            let result = run_mpv_command_sync(client, "stop", &[]);
+            unsafe {
+                libmpv2_sys::mpv_destroy(client.0 as *mut libmpv2_sys::mpv_handle);
+            }
+            println!(
+                "[MPV RECOVERY] sync stop finished generation={} elapsed_ms={} result={:?}",
+                generation,
+                started_at.elapsed().as_millis(),
+                result
+            );
+            let _ = sender.send(RecoveryEvent::StopFinished { generation, result });
+        });
+
+        true
+    }
+
+    fn handle_recovery_event(&mut self, mpv: &Mpv, event: RecoveryEvent) {
+        match event {
+            RecoveryEvent::StopFinished { generation, result } => {
+                let Some(in_flight) = &self.recovery_stop_in_flight else {
+                    println!("[MPV RECOVERY] ignoring stale stop result generation={generation}");
+                    return;
+                };
+                if in_flight.generation != generation {
+                    println!(
+                        "[MPV RECOVERY] ignoring mismatched stop result generation={} current={}",
+                        generation, in_flight.generation
+                    );
+                    return;
+                }
+
+                match result {
+                    Ok(()) => println!("[MPV RECOVERY] stop completed generation={generation}"),
+                    Err(error) => {
+                        eprintln!("[MPV RECOVERY] stop failed generation={generation}: {error}")
+                    }
+                }
+                self.recovery_stop_in_flight = None;
+                self.release_queued_transition_after_stop(mpv);
+            }
+        }
+    }
+
+    fn release_queued_transition_after_stop(&mut self, mpv: &Mpv) {
+        self.post_end_stop_in_flight = false;
+        self.state = LoadState::Idle;
+        self.stop_started_at = None;
+        self.stop_command_request_id = None;
+        *IS_FILE_LOADED.lock().unwrap() = false;
+        *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+        self.send_pending_loadfile(mpv);
     }
 
     fn should_defer_startup_property(&self, name: &PropKey) -> bool {
@@ -994,16 +1229,21 @@ impl PlayerController {
     fn send_loadfile_now(&mut self, mpv: &Mpv, cmd: CmdVal) {
         let url = loadfile_url(&cmd).unwrap_or_default().to_string();
         let requested_start = loadfile_requested_start(&cmd);
-        self.abort_active_loadfile("superseded by a newer loadfile");
+        let active_cmd = cmd.clone();
+        self.abort_active_loadfile(mpv, "superseded by a newer loadfile");
         self.state = LoadState::Loading;
         self.stop_started_at = None;
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
-        if let Some(command_request_id) = send_command(mpv, cmd) {
+        if let Some(submission) = send_command(mpv, cmd) {
             self.active_loadfile = Some(ActiveLoadfile {
+                cmd: active_cmd,
                 url,
-                command_request_id,
+                command_request_id: submission.request_id,
+                abortable: submission.abortable,
                 queued_at: Instant::now(),
+                last_wait_log_at: Instant::now(),
+                command_replied: false,
                 start_file_seen: false,
                 file_loaded: false,
                 requested_start,
@@ -1013,21 +1253,46 @@ impl PlayerController {
         }
     }
 
-    fn abort_active_loadfile(&mut self, reason: &str) -> bool {
+    fn abort_active_loadfile(&mut self, mpv: &Mpv, reason: &str) -> bool {
         let Some(active) = self.active_loadfile.take() else {
             return false;
         };
 
-        println!(
-            "[PLAYER] clearing active loadfile url={} reason={}",
-            active.url, reason
-        );
+        if active.abortable {
+            println!(
+                "[PLAYER] aborting active loadfile request_id={} url={} reason={}",
+                active.command_request_id, active.url, reason
+            );
+            unsafe {
+                libmpv2_sys::mpv_abort_async_command(mpv.ctx.as_ptr(), active.command_request_id);
+            }
+        } else {
+            println!(
+                "[PLAYER] dropping active sync loadfile request_id={} url={} reason={}",
+                active.command_request_id, active.url, reason
+            );
+        }
         true
     }
 
-    fn on_command_reply(&mut self, request_id: u64) {
-        if let Some(active) = self.active_loadfile.as_ref() {
+    fn on_command_reply(&mut self, request_id: u64, mpv: &Mpv) {
+        if self.stop_command_request_id == Some(request_id) {
+            println!("[PLAYER] stop command reply request_id={request_id}");
+            self.stop_command_request_id = None;
+            if self.state == LoadState::Stopping {
+                if self.post_end_stop_in_flight {
+                    println!("[PLAYER] post-EndFile stop completed; releasing queued transition");
+                } else {
+                    println!("[PLAYER] stop completed; releasing queued transition");
+                }
+                self.release_queued_transition_after_stop(mpv);
+            }
+            return;
+        }
+
+        if let Some(active) = self.active_loadfile.as_mut() {
             if active.command_request_id == request_id {
+                active.command_replied = true;
                 println!(
                     "[PLAYER] loadfile command reply request_id={request_id} url={}",
                     active.url
@@ -1054,6 +1319,19 @@ impl PlayerController {
             return;
         }
 
+        if let Some(in_flight) = &self.recovery_stop_in_flight {
+            if in_flight.started_at.elapsed() < MPV_RECOVERY_STOP_TIMEOUT {
+                return;
+            }
+            println!(
+                "[MPV RECOVERY] sync stop timed out generation={}; releasing queued transition anyway",
+                in_flight.generation
+            );
+            self.recovery_stop_in_flight = None;
+            self.release_queued_transition_after_stop(mpv);
+            return;
+        }
+
         let Some(started_at) = self.stop_started_at else {
             return;
         };
@@ -1063,18 +1341,91 @@ impl PlayerController {
         }
 
         println!("[PLAYER] stop did not produce EndFile quickly; releasing queued transition");
-        self.state = LoadState::Idle;
-        self.stop_started_at = None;
-        *IS_FILE_LOADED.lock().unwrap() = false;
-        *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
-        self.send_pending_loadfile(mpv);
+        if let Some(request_id) = self.stop_command_request_id.take() {
+            println!("[PLAYER] aborting stale stop request_id={request_id}");
+            unsafe {
+                libmpv2_sys::mpv_abort_async_command(mpv.ctx.as_ptr(), request_id);
+            }
+        }
+
+        if self.post_end_stop_in_flight
+            && self.start_recovery_stop(mpv, "post-EndFile async stop did not reply")
+        {
+            return;
+        }
+
+        self.release_queued_transition_after_stop(mpv);
     }
 
-    fn flush_stale_loadfile(&mut self, _mpv: &Mpv) {
+    fn flush_stale_loadfile(&mut self, mpv: &Mpv) {
         let Some(active) = self.active_loadfile.as_ref() else {
             return;
         };
-        if active.start_file_seen || active.queued_at.elapsed() < LOADFILE_START_TIMEOUT {
+        if active.start_file_seen {
+            return;
+        }
+
+        let elapsed = active.queued_at.elapsed();
+        if !active.command_replied && elapsed >= MPV_COMMAND_REPLY_TIMEOUT {
+            if self.command_queue_recoveries >= MPV_COMMAND_QUEUE_RECOVERY_LIMIT {
+                if let Some(active) = self.active_loadfile.as_mut() {
+                    if active.last_wait_log_at.elapsed() >= LOCAL_LOADFILE_WAIT_LOG_INTERVAL {
+                        active.last_wait_log_at = Instant::now();
+                        println!(
+                            "[MPV RECOVERY] loadfile command still has no reply after {}s; recovery limit exhausted for {}",
+                            active.queued_at.elapsed().as_secs(),
+                            active.url
+                        );
+                    }
+                }
+                return;
+            }
+
+            let url = active.url.clone();
+            let retry_cmd = cache_busted_loadfile_cmd(active.cmd.clone());
+            let retry_url = loadfile_url(&retry_cmd)
+                .map(str::to_string)
+                .unwrap_or_else(|| url.clone());
+            self.command_queue_recoveries += 1;
+            println!(
+                "[MPV RECOVERY] loadfile command request_id={} produced no reply within {}s; recovery attempt {}/{} url={}",
+                active.command_request_id,
+                MPV_COMMAND_REPLY_TIMEOUT.as_secs(),
+                self.command_queue_recoveries,
+                MPV_COMMAND_QUEUE_RECOVERY_LIMIT,
+                url
+            );
+
+            self.abort_active_loadfile(mpv, "loadfile command did not reply");
+            self.pending_loadfile = Some(retry_cmd);
+            self.set_current_url(retry_url);
+            self.state = LoadState::Stopping;
+            self.stop_started_at = Some(Instant::now());
+            self.stop_command_request_id = None;
+            *IS_FILE_LOADED.lock().unwrap() = false;
+            *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = true;
+            if !self.start_recovery_stop(mpv, "loadfile command did not reply") {
+                self.release_queued_transition_after_stop(mpv);
+            }
+            return;
+        }
+
+        if elapsed < LOADFILE_START_TIMEOUT {
+            return;
+        }
+
+        let Some(active) = self.active_loadfile.as_mut() else {
+            return;
+        };
+        if is_local_stream_url(&active.url) {
+            if active.last_wait_log_at.elapsed() >= LOCAL_LOADFILE_WAIT_LOG_INTERVAL {
+                active.last_wait_log_at = Instant::now();
+                println!(
+                    "[PLAYER] local stream still waiting for first bytes after {}s; keeping loadfile active: {}",
+                    active.queued_at.elapsed().as_secs(),
+                    active.url
+                );
+            }
             return;
         }
 
@@ -1085,7 +1436,8 @@ impl PlayerController {
             LOADFILE_START_TIMEOUT.as_secs(),
             url
         );
-        self.abort_active_loadfile("StartFile watchdog expired");
+        self.abort_active_loadfile(mpv, "StartFile watchdog expired");
+        let _ = send_command(mpv, CmdVal::Single((MpvCmd::Stop,)));
         self.state = LoadState::Idle;
 
         if self.current_url != url {
@@ -1095,7 +1447,7 @@ impl PlayerController {
             );
             return;
         }
-        self.retry_local_stream_startup_failure("StartFile watchdog", resume_position);
+        self.schedule_local_stream_startup_retry("StartFile watchdog", url, resume_position);
     }
 
     fn flush_pending_startup_retry(&mut self, mpv: &Mpv) {
@@ -1110,15 +1462,19 @@ impl PlayerController {
         let retry = self.pending_startup_retry.take().unwrap();
         if self.state == LoadState::Stopping || self.current_url != retry.expected_url {
             println!(
-                "[MPV] Skipping stale startup retry attempt {}/3. state={:?}, expected={}, current={}",
-                retry.attempt, self.state, retry.expected_url, self.current_url
+                "[MPV] Skipping stale startup retry attempt {}/{}. state={:?}, expected={}, current={}",
+                retry.attempt,
+                LOCAL_STREAM_STARTUP_RETRY_LIMIT,
+                self.state,
+                retry.expected_url,
+                self.current_url
             );
             return;
         }
 
         println!(
-            "[MPV] Running scheduled local stream retry attempt {}/3: {}",
-            retry.attempt, retry.retry_url
+            "[MPV] Running scheduled local stream retry attempt {}/{}: {}",
+            retry.attempt, LOCAL_STREAM_STARTUP_RETRY_LIMIT, retry.retry_url
         );
         self.set_current_url(retry.retry_url.clone());
         if let Some(position) = retry.resume_position {
@@ -1139,17 +1495,45 @@ impl PlayerController {
         let url = self.current_url.clone();
         let time = *CURRENT_TIME.lock().unwrap();
         let duration = *TOTAL_DURATION.lock().unwrap();
+        let startup_load_in_flight = self
+            .active_loadfile
+            .as_ref()
+            .map(|active| !active.start_file_seen)
+            .unwrap_or(false);
 
-        if self.state == LoadState::Stopping || !is_local_stream_url(&url) || time > 1.0 {
+        if self.state == LoadState::Stopping
+            || !is_local_stream_url(&url)
+            || (time > 1.0 && !startup_load_in_flight)
+        {
             println!(
-                "[MPV] Not retrying startup failure ({source}): state={:?}, url={url}, time={time}, duration={duration}",
+                "[MPV] Not retrying startup failure ({source}): state={:?}, url={url}, time={time}, duration={duration}, startup_load_in_flight={startup_load_in_flight}",
                 self.state
             );
             return false;
         }
 
-        if self.startup_retry_attempts >= 3 {
-            println!("[MPV] Not retrying startup failure ({source}): attempts exhausted for {url}");
+        self.schedule_local_stream_startup_retry(source, url, resume_position)
+    }
+
+    fn schedule_local_stream_startup_retry(
+        &mut self,
+        source: &str,
+        url: String,
+        resume_position: Option<f64>,
+    ) -> bool {
+        let time = *CURRENT_TIME.lock().unwrap();
+        let duration = *TOTAL_DURATION.lock().unwrap();
+
+        if self.state == LoadState::Stopping || !is_local_stream_url(&url) {
+            println!(
+                "[MPV] Not scheduling startup retry ({source}): state={:?}, url={url}, time={time}, duration={duration}, resume_position={resume_position:?}",
+                self.state
+            );
+            return false;
+        }
+
+        if self.startup_retry_attempts >= LOCAL_STREAM_STARTUP_RETRY_LIMIT {
+            println!("[MPV] Not scheduling startup retry ({source}): attempts exhausted for {url}");
             return false;
         }
 
@@ -1157,12 +1541,14 @@ impl PlayerController {
         let attempt = self.startup_retry_attempts;
 
         println!(
-            "[MPV] Local stream failed before playback ({source}). Scheduling retry in 2s (attempt {attempt}/3, time={time}, duration={duration})..."
+            "[MPV] Local stream failed before playback ({source}). Scheduling retry in {}s (attempt {attempt}/{}, time={time}, duration={duration}, resume_position={resume_position:?})...",
+            LOCAL_STREAM_STARTUP_RETRY_DELAY.as_secs(),
+            LOCAL_STREAM_STARTUP_RETRY_LIMIT
         );
 
         let url2 = cache_busted_url(&url);
         self.pending_startup_retry = Some(ScheduledStartupRetry {
-            due_at: Instant::now() + Duration::from_secs(2),
+            due_at: Instant::now() + LOCAL_STREAM_STARTUP_RETRY_DELAY,
             expected_url: url,
             retry_url: url2,
             attempt,
@@ -1233,6 +1619,28 @@ fn cache_busted_url(url: &str) -> String {
         .unwrap()
         .as_millis();
     cache_busted_url_at(url, timestamp)
+}
+
+fn cache_busted_loadfile_cmd(cmd: CmdVal) -> CmdVal {
+    match cmd {
+        CmdVal::Double(MpvCmd::Loadfile, url) => {
+            CmdVal::Double(MpvCmd::Loadfile, cache_busted_url(&url))
+        }
+        CmdVal::Tripple(MpvCmd::Loadfile, url, flags) => {
+            CmdVal::Tripple(MpvCmd::Loadfile, cache_busted_url(&url), flags)
+        }
+        CmdVal::Quadruple(MpvCmd::Loadfile, url, flags, index) => {
+            CmdVal::Quadruple(MpvCmd::Loadfile, cache_busted_url(&url), flags, index)
+        }
+        CmdVal::Quintuple(MpvCmd::Loadfile, url, flags, index, options) => CmdVal::Quintuple(
+            MpvCmd::Loadfile,
+            cache_busted_url(&url),
+            flags,
+            index,
+            options,
+        ),
+        cmd => cmd,
+    }
 }
 
 fn cache_busted_url_at(url: &str, timestamp: u128) -> String {
@@ -1617,30 +2025,34 @@ fn update_cached_property(name: &str, change: &PropertyData) {
     }
 }
 
-fn send_command(mpv: &Mpv, cmd: CmdVal) -> Option<u64> {
+fn send_command(mpv: &Mpv, cmd: CmdVal) -> Option<CommandSubmission> {
     let (name, args) = command_parts(cmd);
     let request_id = NEXT_MPV_COMMAND_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     println!(
-        "[PLAYER] dispatching mpv command: {} {:?} request_id={}",
+        "[PLAYER] dispatching mpv command: {} {:?} request_id={} mode=async",
         name, args, request_id
     );
     let command_handle = MpvCommandHandle(mpv.ctx.as_ptr());
     let started_at = Instant::now();
-    println!("[MPV CMD START] {name} {args:?} request_id={request_id}");
+
+    println!("[MPV CMD START] {name} {args:?} request_id={request_id} mode=async");
     match run_mpv_command_async(command_handle, request_id, &name, &args) {
         Ok(()) => {
             println!(
-                "[MPV CMD QUEUED] {} {:?} request_id={} elapsed_ms={}",
+                "[MPV CMD QUEUED] {} {:?} request_id={} elapsed_ms={} mode=async",
                 name,
                 args,
                 request_id,
                 started_at.elapsed().as_millis()
             );
-            Some(request_id)
+            Some(CommandSubmission {
+                request_id,
+                abortable: true,
+            })
         }
         Err(error) => {
             eprintln!(
-                "[MPV CMD ERROR] {} {:?} request_id={} elapsed_ms={}: '{}'",
+                "[MPV CMD ERROR] {} {:?} request_id={} elapsed_ms={} mode=async: '{}'",
                 name,
                 args,
                 request_id,
@@ -1672,19 +2084,41 @@ fn set_prop_val(
 ) {
     let name = name.to_string();
     let value_json = normalize_property_value_for_web(&name, &prop_val_to_json(&value));
-    let ok = match value {
-        PropVal::Bool(value) => set_property(&name, value, mpv),
-        PropVal::Num(value) => set_property(&name, value, mpv),
-        PropVal::Str(value) => set_property(&name, value, mpv),
+    let ok = match &value {
+        PropVal::Bool(value) => set_property(&name, *value, mpv),
+        PropVal::Num(value) => set_property(&name, *value, mpv),
+        PropVal::Str(value) => set_property(&name, value.as_str(), mpv),
     };
 
     if !ok {
         return;
     }
 
+    apply_property_set_side_effect(&name, &value);
     cache_property_value(&name, &value_json);
     if let Some(rpc_response_sender) = rpc_response_sender {
         emit_property_value(rpc_response_sender, &name, value_json);
+    }
+}
+
+fn apply_property_set_side_effect(name: &str, value: &PropVal) {
+    if name != "pause" {
+        return;
+    }
+
+    let pause = match value {
+        PropVal::Bool(value) => Some(*value),
+        PropVal::Num(value) => Some(*value != 0.0),
+        PropVal::Str(value) => match value.as_str() {
+            "yes" | "true" | "1" => Some(true),
+            "no" | "false" | "0" => Some(false),
+            _ => None,
+        },
+    };
+
+    if let Some(pause) = pause {
+        *IS_PAUSED.lock().unwrap() = pause;
+        cache_property_value(name, &Value::Bool(pause));
     }
 }
 
