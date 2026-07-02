@@ -50,6 +50,14 @@ impl Updater {
         }
     }
 
+    fn target_arch_suffix() -> &'static str {
+        if cfg!(target_arch = "aarch64") {
+            "_arm64"
+        } else {
+            "_x64"
+        }
+    }
+
     pub fn autoupdate(&self) -> Result<Option<Update>, anyhow::Error> {
         println!("Fetching updates for v{}", self.current_version);
         println!("Using updater endpoint {}", &self.endpoint);
@@ -70,20 +78,28 @@ impl Updater {
             return Ok(None);
         }
 
+        let arch_suffix = Self::target_arch_suffix();
         let installer = release
             .assets
             .iter()
             .find(|asset| {
                 let name = asset.name.to_ascii_lowercase();
-                name.ends_with(".exe") && name.contains("setup")
+                name.ends_with(".exe")
+                    && name.contains("setup")
+                    && name.contains(arch_suffix)
             })
             .or_else(|| {
                 release
                     .assets
                     .iter()
-                    .find(|asset| asset.name.to_ascii_lowercase().ends_with(".exe"))
+                    .find(|asset| {
+                        let name = asset.name.to_ascii_lowercase();
+                        name.ends_with(".exe") && name.contains(arch_suffix)
+                    })
             })
-            .context("No Windows installer asset found in the latest GitHub release")?;
+            .context(format!(
+                "No Windows installer asset found for architecture suffix {arch_suffix}"
+            ))?;
 
         let dest = std::env::temp_dir().join(&installer.name);
         println!(
@@ -191,5 +207,35 @@ mod tests {
     #[test]
     fn final_release_does_not_update_to_older_rc() {
         assert!(!newer("5.0.21", "5.0.21-rc2"));
+    }
+
+    #[test]
+    fn prefers_arch_matching_installer_asset() {
+        let assets = vec![
+            GitHubAsset {
+                name: "StremioSetup-v1.2.3_x64.exe".to_string(),
+                browser_download_url: Url::parse("https://example.com/x64.exe").unwrap(),
+            },
+            GitHubAsset {
+                name: "StremioSetup-v1.2.3_arm64.exe".to_string(),
+                browser_download_url: Url::parse("https://example.com/arm64.exe").unwrap(),
+            },
+        ];
+
+        let selected = assets
+            .iter()
+            .find(|asset| {
+                let name = asset.name.to_ascii_lowercase();
+                name.ends_with(".exe")
+                    && name.contains("setup")
+                    && name.contains(Updater::target_arch_suffix())
+            })
+            .expect("matching installer should be selected");
+
+        if cfg!(target_arch = "aarch64") {
+            assert!(selected.name.ends_with("_arm64.exe"));
+        } else {
+            assert!(selected.name.ends_with("_x64.exe"));
+        }
     }
 }
