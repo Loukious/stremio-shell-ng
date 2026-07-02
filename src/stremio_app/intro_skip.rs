@@ -285,6 +285,19 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         {
             let t = chapter_title.trim().to_lowercase();
             if let Some((kind, matched)) = segment_kind_from_chapter_title(&t, &config) {
+                if !chapter_skip_allowed(kind, time_pos) {
+                    last_skipped_chapter = Some(chapter_idx);
+                    println!(
+                        "AutoSkip chapter {} ignored as unsafe: '{}' at {:.3}s (chapter #{}, matched '{}')",
+                        kind.label(),
+                        chapter_title,
+                        time_pos,
+                        chapter_idx,
+                        matched
+                    );
+                    continue;
+                }
+
                 if send_add_chapter(1) {
                     last_skipped_chapter = Some(chapter_idx);
                     println!(
@@ -842,6 +855,28 @@ fn is_plausible_outro(seg: &SkipSegment) -> bool {
     }
 
     seg.segment.start_sec >= duration * 0.5
+}
+
+fn chapter_skip_allowed(kind: SegmentKind, time_pos: f64) -> bool {
+    if !time_pos.is_finite() || time_pos < 0.0 {
+        return false;
+    }
+
+    match kind {
+        // Chapter metadata is often coarse. Some files have an "Opening" chapter
+        // whose next chapter is the ending, so only trust intro/recap chapter jumps
+        // near the start of playback and let segment data handle later skips.
+        SegmentKind::Intro => time_pos <= 120.0,
+        SegmentKind::Recap => time_pos <= 180.0,
+        SegmentKind::Outro => {
+            let duration = TOTAL_DURATION.lock().map(|d| *d).unwrap_or(0.0);
+            if !duration.is_finite() || duration <= 0.0 {
+                return false;
+            }
+
+            time_pos >= duration * 0.75 || duration - time_pos <= 300.0
+        }
+    }
 }
 
 fn format_media_key(key: &MediaKey) -> String {
