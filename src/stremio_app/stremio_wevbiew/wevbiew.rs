@@ -1,5 +1,6 @@
 use crate::stremio_app::constants::SERVER_IPC_KEY;
 use crate::stremio_app::ipc;
+use crate::stremio_app::stremio_player::player::PLAYER_CMD_TX;
 use native_windows_gui::{self as nwg, PartialUi};
 use once_cell::sync::Lazy;
 use once_cell::unsync::OnceCell;
@@ -159,7 +160,6 @@ impl PartialUi for WebView {
         println!("Building WebView");
         let (tx, rx) = flume::unbounded();
         let tx_drag_drop = tx.clone();
-        let tx_media = tx.clone();
         let (tx_web, rx_web) = flume::unbounded();
         let tx_fs = tx_web.clone();
         data.channel = RefCell::new(Some((tx, rx_web)));
@@ -370,16 +370,24 @@ impl PartialUi for WebView {
                 });
             } else if msg == WM_APPCOMMAND {
                 let cmd = ((l >> 16) & 0xFFF) as u32;
-                let action = match cmd {
+                let player_cmd = match cmd {
                     APPCOMMAND_MEDIA_PLAY_PAUSE
                     | APPCOMMAND_MEDIA_PLAY
-                    | APPCOMMAND_MEDIA_PAUSE => Some("play-pause"),
-                    APPCOMMAND_MEDIA_NEXTTRACK => Some("next-track"),
-                    APPCOMMAND_MEDIA_PREVIOUSTRACK => Some("previous-track"),
+                    | APPCOMMAND_MEDIA_PAUSE => Some(r#"["mpv-command", ["cycle", "pause"]]"#),
+                    APPCOMMAND_MEDIA_NEXTTRACK => {
+                        Some(r#"["mpv-command", ["seek", "10", "relative"]]"#)
+                    }
+                    APPCOMMAND_MEDIA_PREVIOUSTRACK => {
+                        Some(r#"["mpv-command", ["seek", "-10", "relative"]]"#)
+                    }
                     _ => None,
                 };
-                if let Some(action) = action {
-                    tx_media.send(ipc::RPCResponse::media_key(action)).ok();
+                if let Some(player_cmd) = player_cmd {
+                    if let Ok(guard) = PLAYER_CMD_TX.lock() {
+                        if let Some(player_tx) = guard.as_ref() {
+                            player_tx.send(player_cmd.to_string()).ok();
+                        }
+                    }
                     return Some(1);
                 }
             }
