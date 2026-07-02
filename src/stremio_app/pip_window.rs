@@ -223,6 +223,45 @@ fn sanitize_pip_bounds(
     (x, y, width, height)
 }
 
+fn ensure_pip_window_visible(hwnd: HWND, reason: &str) {
+    unsafe {
+        let mut rect: RECT = mem::zeroed();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return;
+        }
+
+        let Some(work) = monitor_work_rect(&rect) else {
+            return;
+        };
+
+        let work_width = (work.right - work.left).max(1);
+        let work_height = (work.bottom - work.top).max(1);
+        let width = (rect.right - rect.left).max(PIP_MIN_WIDTH).min(work_width);
+        let height = (rect.bottom - rect.top)
+            .max(PIP_MIN_HEIGHT)
+            .min(work_height);
+        let x = clamp_to_range(rect.left, work.left, work.right - width);
+        let y = clamp_to_range(rect.top, work.top, work.bottom - height);
+
+        if x == rect.left
+            && y == rect.top
+            && width == rect.right - rect.left
+            && height == rect.bottom - rect.top
+        {
+            return;
+        }
+
+        eprintln!(
+            "PiP window rect adjusted onto visible monitor ({reason}): ({}, {}, {}, {}) -> ({x}, {y}, {width}, {height})",
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top
+        );
+        SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
+    }
+}
+
 fn monitor_work_rect(rect: &RECT) -> Option<RECT> {
     unsafe {
         let monitor = MonitorFromRect(rect, MONITOR_DEFAULTTONEAREST);
@@ -352,6 +391,7 @@ impl PipWindow {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED,
             );
         }
+        ensure_pip_window_visible(top_hwnd, "after-create");
 
         // Apply initial transparency if remembered.
         self.transparent.set(ctx.initial_transparent);
@@ -583,6 +623,7 @@ impl PipWindow {
         }
         if let Some(hwnd) = self.hwnd() {
             apply_transparency(hwnd, self.transparent.get());
+            ensure_pip_window_visible(hwnd, "before-show");
             unsafe {
                 SetWindowPos(
                     hwnd,
