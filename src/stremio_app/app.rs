@@ -1000,8 +1000,8 @@ fn build_player_activity(
 
     let (mut activity_name, mut details, mut state_text) = if media_type == "series" {
         (
-            info.name.clone(),
             info.epname.clone(),
+            info.name.clone(),
             format!("S{}E{}", season, episode),
         )
     } else {
