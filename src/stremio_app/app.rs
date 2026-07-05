@@ -1,6 +1,6 @@
 use discord_rich_presence::{
     activity::{
-        Activity, ActivityType, Assets, Button, Party, Secrets, StatusDisplayType, Timestamps,
+        Activity, ActivityType, Assets, Button, Party, Secrets, Timestamps,
     },
     DiscordIpc, DiscordIpcClient,
 };
@@ -1042,7 +1042,6 @@ fn build_player_activity(
         .name(&activity_name)
         .details(&details)
         .state(&state_text)
-        .status_display_type(StatusDisplayType::Details)
         .timestamps(timestamps)
         .assets(assets);
 
