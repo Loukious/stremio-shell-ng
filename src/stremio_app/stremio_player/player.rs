@@ -1,4 +1,5 @@
 use crate::stremio_app::ipc;
+use crate::stremio_app::mpv_hwnd::find_exact_mpv_child_hwnd;
 use crate::stremio_app::RPCResponse;
 use flume::{Receiver, Sender};
 use libmpv2::events::PropertyData;
@@ -27,7 +28,9 @@ use winapi::um::{
     },
     winnt::LONG,
     winuser::{
-        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+        GetMonitorInfoW, GetWindow, IsWindow, MonitorFromWindow, SetWindowPos, GW_HWNDNEXT,
+        HWND_BOTTOM, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, SWP_ASYNCWINDOWPOS,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     },
 };
 
@@ -76,9 +79,7 @@ const MPV_COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(8);
 const LOCAL_LOADFILE_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const LOCAL_STREAM_STARTUP_RETRY_LIMIT: u32 = 60;
 const LOCAL_STREAM_STARTUP_RETRY_DELAY: Duration = Duration::from_secs(5);
-const MPV_RECOVERY_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const MPV_COMMAND_QUEUE_RECOVERY_LIMIT: u32 = 3;
-const POST_END_DRAIN_STOP_WINDOW: Duration = Duration::from_secs(10);
 const DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2: u32 = 15;
 const DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR: u32 = 2;
 
@@ -145,12 +146,9 @@ struct PlayerController {
     premature_eof_reloads: u32,
     stop_started_at: Option<Instant>,
     stop_command_request_id: Option<u64>,
-    recovery_sender: Sender<RecoveryEvent>,
-    recovery_stop_generation: u64,
-    recovery_stop_in_flight: Option<RecoveryStop>,
-    last_end_file_at: Option<Instant>,
-    post_end_stop_sent: bool,
-    post_end_stop_in_flight: bool,
+    persistent_render_properties: HashMap<String, PropVal>,
+    mpv_child_hwnd: Option<HWND>,
+    next_surface_order_refresh: Instant,
     window_handle: isize,
     gpu_video_processing: bool,
     managed_gpu_filter_applied: bool,
@@ -179,25 +177,8 @@ struct ScheduledStartupRetry {
     resume_position: Option<f64>,
 }
 
-struct RecoveryStop {
-    generation: u64,
-    started_at: Instant,
-}
-
-enum RecoveryEvent {
-    StopFinished {
-        generation: u64,
-        result: Result<(), String>,
-    },
-}
-
 #[derive(Clone, Copy)]
 struct MpvClientHandle(*mut libmpv2_sys::mpv_handle);
-
-#[derive(Clone, Copy)]
-struct RecoveryClientHandle(usize);
-
-unsafe impl Send for RecoveryClientHandle {}
 
 #[derive(Clone, Copy)]
 struct CommandSubmission {
@@ -206,7 +187,7 @@ struct CommandSubmission {
 }
 
 impl PlayerController {
-    fn new(window_handle: isize, recovery_sender: Sender<RecoveryEvent>) -> Self {
+    fn new(window_handle: isize) -> Self {
         Self {
             observed_properties: HashSet::new(),
             state: LoadState::Idle,
@@ -222,12 +203,9 @@ impl PlayerController {
             premature_eof_reloads: 0,
             stop_started_at: None,
             stop_command_request_id: None,
-            recovery_sender,
-            recovery_stop_generation: 0,
-            recovery_stop_in_flight: None,
-            last_end_file_at: None,
-            post_end_stop_sent: false,
-            post_end_stop_in_flight: false,
+            persistent_render_properties: HashMap::new(),
+            mpv_child_hwnd: None,
+            next_surface_order_refresh: Instant::now(),
             window_handle,
             gpu_video_processing: false,
             managed_gpu_filter_applied: false,
@@ -264,6 +242,42 @@ impl PlayerController {
     fn invalidate_display_output(&mut self) {
         self.last_display_output = None;
         self.next_display_refresh = Instant::now();
+    }
+
+    fn keep_video_surface_behind_webview(&mut self) {
+        let now = Instant::now();
+        if now < self.next_surface_order_refresh {
+            return;
+        }
+        self.next_surface_order_refresh = now + Duration::from_millis(250);
+
+        let child = self
+            .mpv_child_hwnd
+            .filter(|hwnd| unsafe { IsWindow(*hwnd) } != 0)
+            .or_else(|| find_exact_mpv_child_hwnd(self.window_handle as HWND));
+        let Some(child) = child else {
+            self.mpv_child_hwnd = None;
+            return;
+        };
+        self.mpv_child_hwnd = Some(child);
+
+        // The WebView2 controller and mpv are sibling windows. Keep mpv at the
+        // bottom so the transparent player area can reveal video without the
+        // force-window idle frame covering the rest of the application.
+        if unsafe { GetWindow(child, GW_HWNDNEXT) }.is_null() {
+            return;
+        }
+        unsafe {
+            SetWindowPos(
+                child,
+                HWND_BOTTOM,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+            );
+        }
     }
 }
 
@@ -317,6 +331,11 @@ fn create_shareable_mpv(window_handle: HWND) -> Mpv {
         set_property!("audio-client-name", "Stremio");
         set_property!("config", "yes");
         set_property!("load-scripts", "yes");
+        // Keep the embedded VO alive between files. Recreating it at every EOF can
+        // deadlock inside a GPU driver's presentation teardown before the next
+        // loadfile command reaches mpv.
+        set_property!("idle", "yes");
+        set_property!("force-window", "immediate");
         set_property!("terminal", "yes");
         #[cfg(debug_assertions)]
         set_property!("msg-level", "all=no,cplayer=debug");
@@ -592,8 +611,7 @@ fn create_event_thread(
     rpc_response_sender: Sender<String>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let (recovery_sender, recovery_receiver) = flume::unbounded();
-        let mut controller = PlayerController::new(window_handle, recovery_sender);
+        let mut controller = PlayerController::new(window_handle);
         mpv.disable_deprecated_events()
             .expect("failed to disable deprecated MPV events");
         for (name, format) in [
@@ -611,13 +629,11 @@ fn create_event_thread(
             while let Ok(msg) = in_msg_receiver.try_recv() {
                 controller.handle_in_msg(&mpv, msg, &rpc_response_sender);
             }
-            while let Ok(event) = recovery_receiver.try_recv() {
-                controller.handle_recovery_event(&mpv, event);
-            }
             controller.flush_stale_stop(&mpv);
             controller.flush_stale_loadfile(&mpv);
             controller.flush_pending_startup_retry(&mpv);
             controller.refresh_display_output(&mpv);
+            controller.keep_video_surface_behind_webview();
 
             let event = match mpv.wait_event(0.01) {
                 Some(Ok(event)) => event,
@@ -897,52 +913,6 @@ fn request_property_async(mpv: &Mpv, name: &str, format: Format) -> bool {
     }
 }
 
-fn create_recovery_client(mpv: &Mpv, name: &str) -> Option<RecoveryClientHandle> {
-    let name = match CString::new(name) {
-        Ok(name) => name,
-        Err(error) => {
-            eprintln!("[MPV RECOVERY] invalid recovery client name: {error}");
-            return None;
-        }
-    };
-    let client = unsafe { libmpv2_sys::mpv_create_client(mpv.ctx.as_ptr(), name.as_ptr()) };
-    if client.is_null() {
-        eprintln!("[MPV RECOVERY] mpv_create_client returned null; mpv is likely shutting down");
-        return None;
-    }
-    Some(RecoveryClientHandle(client as usize))
-}
-
-fn run_mpv_command_sync(
-    command_handle: RecoveryClientHandle,
-    name: &str,
-    args: &[String],
-) -> std::result::Result<(), String> {
-    let mut cstr_args = Vec::with_capacity(args.len() + 1);
-    cstr_args.push(CString::new(name).map_err(|error| error.to_string())?);
-    for arg in args {
-        cstr_args.push(CString::new(arg.as_str()).map_err(|error| error.to_string())?);
-    }
-
-    let mut ptrs = cstr_args
-        .iter()
-        .map(|arg| arg.as_ptr())
-        .collect::<Vec<*const c_char>>();
-    ptrs.push(std::ptr::null());
-
-    let result = unsafe {
-        libmpv2_sys::mpv_command(
-            command_handle.0 as *mut libmpv2_sys::mpv_handle,
-            ptrs.as_mut_ptr(),
-        )
-    };
-    if result < 0 {
-        Err(mpv_error_string(result))
-    } else {
-        Ok(())
-    }
-}
-
 fn mpv_error_string(error: i32) -> String {
     let ptr = unsafe { libmpv2_sys::mpv_error_string(error) };
     if ptr.is_null() {
@@ -1002,10 +972,11 @@ impl PlayerController {
                 );
             }
             InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Bool(value))) => {
-                self.set_or_queue_prop(mpv, rpc_response_sender, name, PropVal::Bool(value));
+                let _ =
+                    self.set_or_queue_prop(mpv, rpc_response_sender, name, PropVal::Bool(value));
             }
             InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Num(value))) => {
-                self.set_or_queue_prop(mpv, rpc_response_sender, name, PropVal::Num(value));
+                let _ = self.set_or_queue_prop(mpv, rpc_response_sender, name, PropVal::Num(value));
             }
             InMsg(InMsgFn::MpvSetProp, InMsgArgs::StProp(name, PropVal::Str(value))) => {
                 let name_string = name.to_string();
@@ -1019,8 +990,9 @@ impl PlayerController {
                 } else {
                     value
                 };
-                self.set_or_queue_prop(mpv, rpc_response_sender, name, PropVal::Str(value));
-                if is_vo {
+                let changed =
+                    self.set_or_queue_prop(mpv, rpc_response_sender, name, PropVal::Str(value));
+                if is_vo && changed {
                     self.invalidate_display_output();
                 }
             }
@@ -1070,18 +1042,36 @@ impl PlayerController {
         rpc_response_sender: &Sender<String>,
         name: PropKey,
         value: PropVal,
-    ) {
+    ) -> bool {
         let name_string = name.to_string();
         apply_property_set_side_effect(&name_string, &value);
+        if is_unchanged_persistent_render_property(
+            &self.persistent_render_properties,
+            &name_string,
+            &value,
+        ) {
+            let value_json =
+                normalize_property_value_for_web(&name_string, &prop_val_to_json(&value));
+            cache_property_value(&name_string, &value_json);
+            emit_property_value(rpc_response_sender, &name_string, value_json);
+            println!("[PLAYER] skipping unchanged render property: {name_string}={value:?}");
+            return false;
+        }
+
         if self.should_defer_startup_property(&name) {
             let value_json =
                 normalize_property_value_for_web(&name_string, &prop_val_to_json(&value));
             cache_property_value(&name_string, &value_json);
             emit_property_value(rpc_response_sender, &name_string, value_json);
             self.queue_startup_property(name, value);
-            return;
+            return true;
         }
-        set_prop_val(name, value, mpv, Some(rpc_response_sender));
+
+        let applied = set_prop_val(name, value.clone(), mpv, Some(rpc_response_sender));
+        if applied && is_persistent_render_property(&name_string) {
+            self.persistent_render_properties.insert(name_string, value);
+        }
+        applied
     }
 
     fn handle_stop(&mut self, mpv: &Mpv, cmd: CmdVal) {
@@ -1094,16 +1084,6 @@ impl PlayerController {
         if self.state == LoadState::Idle {
             if self.abort_active_loadfile(mpv, "stop received while controller was idle") {
                 println!("[PLAYER] cancelled unresolved loadfile from idle state");
-            } else if self.should_forward_post_end_stop() {
-                println!("[PLAYER] forwarding post-EndFile stop to interrupt mpv drain");
-                self.post_end_stop_sent = true;
-                self.post_end_stop_in_flight = true;
-                self.state = LoadState::Stopping;
-                self.stop_started_at = Some(Instant::now());
-                *IS_FILE_LOADED.lock().unwrap() = false;
-                *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = true;
-                self.stop_command_request_id = send_command(mpv, cmd)
-                    .and_then(|submission| submission.abortable.then_some(submission.request_id));
             } else {
                 println!("[PLAYER] skipping idle stop");
             }
@@ -1123,7 +1103,6 @@ impl PlayerController {
             self.state = LoadState::Idle;
             self.stop_started_at = None;
             self.stop_command_request_id = None;
-            self.post_end_stop_in_flight = false;
             *IS_FILE_LOADED.lock().unwrap() = false;
             *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
             return;
@@ -1184,9 +1163,6 @@ impl PlayerController {
     fn on_start_file(&mut self) {
         self.state = LoadState::Loading;
         self.stop_started_at = None;
-        self.last_end_file_at = None;
-        self.post_end_stop_sent = false;
-        self.post_end_stop_in_flight = false;
         if let Some(active) = self.active_loadfile.as_mut() {
             active.start_file_seen = true;
         }
@@ -1203,9 +1179,6 @@ impl PlayerController {
         self.state = LoadState::Loaded;
         self.stop_started_at = None;
         self.stop_command_request_id = None;
-        self.last_end_file_at = None;
-        self.post_end_stop_sent = false;
-        self.post_end_stop_in_flight = false;
         if let Some(active) = self.active_loadfile.as_mut() {
             active.file_loaded = true;
             self.active_loadfile = None;
@@ -1234,93 +1207,11 @@ impl PlayerController {
         }
         self.stop_started_at = None;
         self.stop_command_request_id = None;
-        self.last_end_file_at = Some(Instant::now());
-        self.post_end_stop_sent = false;
-        self.post_end_stop_in_flight = false;
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
     }
 
-    fn should_forward_post_end_stop(&self) -> bool {
-        if self.post_end_stop_sent {
-            return false;
-        }
-        self.last_end_file_at
-            .map(|ended_at| ended_at.elapsed() <= POST_END_DRAIN_STOP_WINDOW)
-            .unwrap_or(false)
-    }
-
-    fn start_recovery_stop(&mut self, mpv: &Mpv, reason: &str) -> bool {
-        if let Some(in_flight) = &self.recovery_stop_in_flight {
-            println!(
-                "[MPV RECOVERY] stop already in flight generation={} elapsed_ms={}",
-                in_flight.generation,
-                in_flight.started_at.elapsed().as_millis()
-            );
-            return true;
-        }
-
-        let client = match create_recovery_client(mpv, "stremio-recovery-stop") {
-            Some(client) => client,
-            None => return false,
-        };
-
-        self.recovery_stop_generation += 1;
-        let generation = self.recovery_stop_generation;
-        let sender = self.recovery_sender.clone();
-        self.recovery_stop_in_flight = Some(RecoveryStop {
-            generation,
-            started_at: Instant::now(),
-        });
-        println!("[MPV RECOVERY] starting sync stop generation={generation} reason={reason}");
-
-        thread::spawn(move || {
-            let started_at = Instant::now();
-            let result = run_mpv_command_sync(client, "stop", &[]);
-            unsafe {
-                libmpv2_sys::mpv_destroy(client.0 as *mut libmpv2_sys::mpv_handle);
-            }
-            println!(
-                "[MPV RECOVERY] sync stop finished generation={} elapsed_ms={} result={:?}",
-                generation,
-                started_at.elapsed().as_millis(),
-                result
-            );
-            let _ = sender.send(RecoveryEvent::StopFinished { generation, result });
-        });
-
-        true
-    }
-
-    fn handle_recovery_event(&mut self, mpv: &Mpv, event: RecoveryEvent) {
-        match event {
-            RecoveryEvent::StopFinished { generation, result } => {
-                let Some(in_flight) = &self.recovery_stop_in_flight else {
-                    println!("[MPV RECOVERY] ignoring stale stop result generation={generation}");
-                    return;
-                };
-                if in_flight.generation != generation {
-                    println!(
-                        "[MPV RECOVERY] ignoring mismatched stop result generation={} current={}",
-                        generation, in_flight.generation
-                    );
-                    return;
-                }
-
-                match result {
-                    Ok(()) => println!("[MPV RECOVERY] stop completed generation={generation}"),
-                    Err(error) => {
-                        eprintln!("[MPV RECOVERY] stop failed generation={generation}: {error}")
-                    }
-                }
-                self.recovery_stop_in_flight = None;
-                self.release_queued_transition_after_stop(mpv);
-            }
-        }
-    }
-
     fn release_queued_transition_after_stop(&mut self, mpv: &Mpv) {
-        self.post_end_stop_in_flight = false;
         self.state = LoadState::Idle;
         self.stop_started_at = None;
         self.stop_command_request_id = None;
@@ -1356,7 +1247,12 @@ impl PlayerController {
             }
 
             println!("[PLAYER] applying deferred pre-load property: {name:?}={value:?}");
-            set_prop_val(name, value, mpv, None);
+            let name_string = name.to_string();
+            if set_prop_val(name, value.clone(), mpv, None)
+                && is_persistent_render_property(&name_string)
+            {
+                self.persistent_render_properties.insert(name_string, value);
+            }
         }
     }
 
@@ -1443,11 +1339,7 @@ impl PlayerController {
             println!("[PLAYER] stop command reply request_id={request_id}");
             self.stop_command_request_id = None;
             if self.state == LoadState::Stopping {
-                if self.post_end_stop_in_flight {
-                    println!("[PLAYER] post-EndFile stop completed; releasing queued transition");
-                } else {
-                    println!("[PLAYER] stop completed; releasing queued transition");
-                }
+                println!("[PLAYER] stop completed; releasing queued transition");
                 self.release_queued_transition_after_stop(mpv);
             }
             return;
@@ -1482,19 +1374,6 @@ impl PlayerController {
             return;
         }
 
-        if let Some(in_flight) = &self.recovery_stop_in_flight {
-            if in_flight.started_at.elapsed() < MPV_RECOVERY_STOP_TIMEOUT {
-                return;
-            }
-            println!(
-                "[MPV RECOVERY] sync stop timed out generation={}; releasing queued transition anyway",
-                in_flight.generation
-            );
-            self.recovery_stop_in_flight = None;
-            self.release_queued_transition_after_stop(mpv);
-            return;
-        }
-
         let Some(started_at) = self.stop_started_at else {
             return;
         };
@@ -1509,12 +1388,6 @@ impl PlayerController {
             unsafe {
                 libmpv2_sys::mpv_abort_async_command(mpv.ctx.as_ptr(), request_id);
             }
-        }
-
-        if self.post_end_stop_in_flight
-            && self.start_recovery_stop(mpv, "post-EndFile async stop did not reply")
-        {
-            return;
         }
 
         self.release_queued_transition_after_stop(mpv);
@@ -1567,9 +1440,7 @@ impl PlayerController {
             self.stop_command_request_id = None;
             *IS_FILE_LOADED.lock().unwrap() = false;
             *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = true;
-            if !self.start_recovery_stop(mpv, "loadfile command did not reply") {
-                self.release_queued_transition_after_stop(mpv);
-            }
+            self.release_queued_transition_after_stop(mpv);
             return;
         }
 
@@ -1775,6 +1646,18 @@ fn is_startup_property(name: &str) -> bool {
 
 fn is_file_scoped_property(name: &str) -> bool {
     matches!(name, "sid" | "aid" | "vid")
+}
+
+fn is_persistent_render_property(name: &str) -> bool {
+    matches!(name, "vo" | "hwdec")
+}
+
+fn is_unchanged_persistent_render_property(
+    properties: &HashMap<String, PropVal>,
+    name: &str,
+    value: &PropVal,
+) -> bool {
+    is_persistent_render_property(name) && properties.get(name) == Some(value)
 }
 
 fn should_defer_property(state: LoadState, name: &str) -> bool {
@@ -2231,13 +2114,13 @@ fn set_prop_val(
     value: PropVal,
     mpv: &Mpv,
     rpc_response_sender: Option<&Sender<String>>,
-) {
+) -> bool {
     let name = name.to_string();
     let value_json = normalize_property_value_for_web(&name, &prop_val_to_json(&value));
     let ok = set_property_async(&name, &value, mpv);
 
     if !ok {
-        return;
+        return false;
     }
 
     apply_property_set_side_effect(&name, &value);
@@ -2245,6 +2128,7 @@ fn set_prop_val(
     if let Some(rpc_response_sender) = rpc_response_sender {
         emit_property_value(rpc_response_sender, &name, value_json);
     }
+    true
 }
 
 fn apply_property_set_side_effect(name: &str, value: &PropVal) {
@@ -2279,11 +2163,12 @@ fn prop_val_to_json(value: &PropVal) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_busted_url_at, property_data_to_json, should_defer_property,
-        should_retry_startup_failure_event, LoadState,
+        cache_busted_url_at, is_unchanged_persistent_render_property, property_data_to_json,
+        should_defer_property, should_retry_startup_failure_event, LoadState, PropVal,
     };
     use libmpv2::events::PropertyData;
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn cache_buster_adds_query_to_plain_stream_url() {
@@ -2317,6 +2202,30 @@ mod tests {
         for property in ["vo", "hwdec", "pause", "volume", "mute", "speed"] {
             assert!(should_defer_property(LoadState::Stopping, property));
         }
+    }
+
+    #[test]
+    fn repeated_render_setup_is_coalesced_without_coalescing_playback_controls() {
+        let properties = HashMap::from([
+            ("vo".to_string(), PropVal::Str("gpu-next,gpu,".to_string())),
+            ("pause".to_string(), PropVal::Bool(false)),
+        ]);
+
+        assert!(is_unchanged_persistent_render_property(
+            &properties,
+            "vo",
+            &PropVal::Str("gpu-next,gpu,".to_string()),
+        ));
+        assert!(!is_unchanged_persistent_render_property(
+            &properties,
+            "vo",
+            &PropVal::Str("gpu,".to_string()),
+        ));
+        assert!(!is_unchanged_persistent_render_property(
+            &properties,
+            "pause",
+            &PropVal::Bool(false),
+        ));
     }
 
     #[test]
