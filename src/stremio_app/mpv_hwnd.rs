@@ -21,7 +21,8 @@ fn is_webview_class(class: &str) -> bool {
 }
 
 struct EnumState {
-    found: Option<HWND>,
+    exact: Option<HWND>,
+    fallback: Option<HWND>,
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -29,20 +30,32 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let class = get_class_name(hwnd);
     // Prefer an exact "mpv" class match; if MPV ever renames, fall through.
     if class.eq_ignore_ascii_case("mpv") {
-        state_cell.borrow_mut().found = Some(hwnd);
+        state_cell.borrow_mut().exact = Some(hwnd);
         return 0; // stop enumeration
     }
-    if !is_webview_class(&class) && state_cell.borrow().found.is_none() {
-        state_cell.borrow_mut().found = Some(hwnd);
+    if !is_webview_class(&class) && state_cell.borrow().fallback.is_none() {
+        state_cell.borrow_mut().fallback = Some(hwnd);
         // Keep enumerating to allow an explicit "mpv" match to override.
     }
     TRUE
 }
 
 pub fn find_mpv_child_hwnd(parent: HWND) -> Option<HWND> {
-    let state = RefCell::new(EnumState { found: None });
+    let state = enumerate_children(parent);
+    state.exact.or(state.fallback)
+}
+
+pub fn find_exact_mpv_child_hwnd(parent: HWND) -> Option<HWND> {
+    enumerate_children(parent).exact
+}
+
+fn enumerate_children(parent: HWND) -> EnumState {
+    let state = RefCell::new(EnumState {
+        exact: None,
+        fallback: None,
+    });
     unsafe {
         EnumChildWindows(parent, Some(enum_proc), &state as *const _ as LPARAM);
     }
-    state.into_inner().found
+    state.into_inner()
 }
