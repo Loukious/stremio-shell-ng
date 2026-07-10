@@ -2,7 +2,7 @@ use crate::stremio_app::ipc;
 use crate::stremio_app::RPCResponse;
 use flume::{Receiver, Sender};
 use libmpv2::events::PropertyData;
-use libmpv2::{events::Event, Format, Mpv, SetData};
+use libmpv2::{events::Event, Format, Mpv};
 use native_windows_gui::{self as nwg, PartialUi};
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
@@ -69,7 +69,7 @@ pub static CURRENT_STREAM_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(Str
 /// Populated once during `on_init`.
 pub static PLAYER_CMD_TX: Lazy<Mutex<Option<Sender<String>>>> = Lazy::new(|| Mutex::new(None));
 
-static NEXT_MPV_COMMAND_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_MPV_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 const LOADFILE_START_TIMEOUT: Duration = Duration::from_secs(20);
 const MPV_COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(8);
@@ -153,6 +153,7 @@ struct PlayerController {
     post_end_stop_in_flight: bool,
     window_handle: isize,
     gpu_video_processing: bool,
+    managed_gpu_filter_applied: bool,
     last_display_output: Option<(DisplayOutputState, bool)>,
     next_display_refresh: Instant,
 }
@@ -191,7 +192,7 @@ enum RecoveryEvent {
 }
 
 #[derive(Clone, Copy)]
-struct MpvCommandHandle(*mut libmpv2_sys::mpv_handle);
+struct MpvClientHandle(*mut libmpv2_sys::mpv_handle);
 
 #[derive(Clone, Copy)]
 struct RecoveryClientHandle(usize);
@@ -229,6 +230,7 @@ impl PlayerController {
             post_end_stop_in_flight: false,
             window_handle,
             gpu_video_processing: false,
+            managed_gpu_filter_applied: false,
             last_display_output: None,
             next_display_refresh: Instant::now(),
         }
@@ -245,14 +247,16 @@ impl PlayerController {
         }
         self.next_display_refresh = now + Duration::from_millis(500);
 
-        let state = current_display_output_state(
-            mpv,
-            self.window_handle as HWND,
-            self.gpu_video_processing,
-        );
+        let state =
+            current_display_output_state(self.window_handle as HWND, self.gpu_video_processing);
         let key = (state, self.gpu_video_processing);
         if self.last_display_output != Some(key) {
-            apply_display_output_mode(mpv, state, self.gpu_video_processing);
+            self.managed_gpu_filter_applied = apply_display_output_mode(
+                mpv,
+                state,
+                self.gpu_video_processing,
+                self.managed_gpu_filter_applied,
+            );
             self.last_display_output = Some(key);
         }
     }
@@ -365,14 +369,13 @@ fn with_gpu_next_fallback(vo: String) -> String {
 }
 
 fn current_display_output_state(
-    mpv: &Mpv,
     window_handle: HWND,
     gpu_video_processing: bool,
 ) -> DisplayOutputState {
     DisplayOutputState {
         mode: current_display_output_mode(window_handle),
         scale_percent: if gpu_video_processing {
-            current_video_filter_scale(mpv, window_handle)
+            current_video_filter_scale(window_handle)
         } else {
             100
         },
@@ -388,8 +391,8 @@ fn current_display_output_mode(window_handle: HWND) -> DisplayOutputMode {
     }
 }
 
-fn current_video_filter_scale(mpv: &Mpv, window_handle: HWND) -> u32 {
-    let Some(video_height) = current_video_height(mpv) else {
+fn current_video_filter_scale(window_handle: HWND) -> u32 {
+    let Some(video_height) = current_video_height() else {
         return 100;
     };
     let Some(display_height) = current_monitor_height(window_handle) else {
@@ -402,9 +405,16 @@ fn current_video_filter_scale(mpv: &Mpv, window_handle: HWND) -> u32 {
     ((display_height / video_height).min(4.0) * 100.0).round() as u32
 }
 
-fn current_video_height(mpv: &Mpv) -> Option<f64> {
-    let video_params = mpv.get_property::<String>("video-params").ok()?;
-    let video_params = serde_json::from_str::<Value>(&video_params).ok()?;
+fn current_video_height() -> Option<f64> {
+    let video_params = CACHED_PLAYER_PROPS
+        .lock()
+        .unwrap()
+        .get("video-params")
+        .cloned()?;
+    let video_params = match video_params {
+        Value::String(value) => serde_json::from_str::<Value>(&value).ok()?,
+        value => value,
+    };
     video_params.get("h").and_then(Value::as_f64)
 }
 
@@ -423,7 +433,12 @@ fn current_monitor_height(window_handle: HWND) -> Option<f64> {
     Some((monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top) as f64)
 }
 
-fn apply_display_output_mode(mpv: &Mpv, state: DisplayOutputState, gpu_video_processing: bool) {
+fn apply_display_output_mode(
+    mpv: &Mpv,
+    state: DisplayOutputState,
+    gpu_video_processing: bool,
+    managed_filter_applied: bool,
+) -> bool {
     let gpu_filter = if gpu_video_processing {
         let scale = state.scale_percent as f64 / 100.0;
         let mut vf = format!("d3d11vpp=scaling-mode=nvidia:scale={scale:.2}");
@@ -449,19 +464,29 @@ fn apply_display_output_mode(mpv: &Mpv, state: DisplayOutputState, gpu_video_pro
         ],
     };
 
-    let (operation, filter) = match gpu_filter.as_deref() {
-        Some(filter) => ("add", filter),
-        None => ("remove", "@stremio-gpu-processing"),
-    };
-    if let Err(error) = mpv.command("vf", &[operation, filter]) {
-        eprintln!("mpv: cannot {operation} managed GPU filter: {error:?}");
+    let mut filter_applied = managed_filter_applied;
+    if managed_filter_applied
+        && send_command_parts(
+            mpv,
+            "vf".to_string(),
+            vec!["remove".to_string(), "@stremio-gpu-processing".to_string()],
+        )
+        .is_some()
+    {
+        filter_applied = false;
+    }
+
+    if let Some(filter) = gpu_filter {
+        if send_command_parts(mpv, "vf".to_string(), vec!["add".to_string(), filter]).is_some() {
+            filter_applied = true;
+        }
     }
 
     for (name, value) in color {
-        if let Err(error) = mpv.set_property(name, value) {
-            eprintln!("mpv: cannot set {name}={value}: {error:?}");
-        }
+        let _ = set_property_async(name, &PropVal::Str(value.to_string()), mpv);
     }
+
+    filter_applied
 }
 
 fn monitor_hdr_active(monitor: HMONITOR) -> Option<bool> {
@@ -603,6 +628,11 @@ fn create_event_thread(
             };
 
             let player_response = match event {
+                Event::GetPropertyReply { name, result, .. } => {
+                    emit_async_property_reply(&rpc_response_sender, name, &result);
+                    continue;
+                }
+                Event::SetPropertyReply(_) => continue,
                 Event::StartFile => {
                     println!("[MPV] StartFile");
                     controller.on_start_file();
@@ -612,7 +642,7 @@ fn create_event_thread(
                     let url = controller.current_url.clone();
                     println!("[MPV] FileLoaded url={url}");
                     controller.on_file_loaded(&mpv, &rpc_response_sender);
-                    emit_loaded_property_snapshot(&mpv, &rpc_response_sender);
+                    request_loaded_property_snapshot(&mpv);
 
                     if let Some(pos) = controller.take_pending_reload_seek_for(&url) {
                         println!("[MPV] Restoring position after reload: {}", pos);
@@ -642,6 +672,16 @@ fn create_event_thread(
                         reason, time, duration, url
                     );
 
+                    let error_retry_scheduled = if reason == libmpv2::mpv_end_file_reason::Error {
+                        let resume_position = controller
+                            .active_loadfile
+                            .as_ref()
+                            .and_then(|active| active.requested_start);
+                        controller
+                            .retry_local_stream_startup_failure("end-file error", resume_position)
+                    } else {
+                        false
+                    };
                     controller.on_end_file();
                     if controller.send_pending_loadfile(&mpv) {
                         continue;
@@ -673,16 +713,8 @@ fn create_event_thread(
                         }
                     }
 
-                    if reason == libmpv2::mpv_end_file_reason::Error {
-                        let resume_position = controller
-                            .active_loadfile
-                            .as_ref()
-                            .and_then(|active| active.requested_start);
-                        if controller
-                            .retry_local_stream_startup_failure("end-file error", resume_position)
-                        {
-                            continue;
-                        }
+                    if error_retry_scheduled {
+                        continue;
                     }
 
                     let stopped_at_media_end = reason == libmpv2::mpv_end_file_reason::Stop
@@ -724,7 +756,7 @@ fn create_event_thread(
 }
 
 fn run_mpv_command_async(
-    command_handle: MpvCommandHandle,
+    command_handle: MpvClientHandle,
     request_id: u64,
     name: &str,
     args: &[String],
@@ -747,6 +779,115 @@ fn run_mpv_command_async(
         Err(mpv_error_string(result))
     } else {
         Ok(())
+    }
+}
+
+fn run_mpv_set_property_async(
+    command_handle: MpvClientHandle,
+    request_id: u64,
+    name: &str,
+    value: &PropVal,
+) -> std::result::Result<(), String> {
+    let name = CString::new(name).map_err(|error| error.to_string())?;
+    let result = match value {
+        PropVal::Bool(value) => {
+            let mut data = i64::from(*value);
+            unsafe {
+                libmpv2_sys::mpv_set_property_async(
+                    command_handle.0,
+                    request_id,
+                    name.as_ptr(),
+                    libmpv2_sys::mpv_format_MPV_FORMAT_FLAG,
+                    (&mut data as *mut i64).cast(),
+                )
+            }
+        }
+        PropVal::Num(value) => {
+            let mut data = *value;
+            unsafe {
+                libmpv2_sys::mpv_set_property_async(
+                    command_handle.0,
+                    request_id,
+                    name.as_ptr(),
+                    libmpv2_sys::mpv_format_MPV_FORMAT_DOUBLE,
+                    (&mut data as *mut f64).cast(),
+                )
+            }
+        }
+        PropVal::Str(value) => {
+            let value = CString::new(value.as_str()).map_err(|error| error.to_string())?;
+            let mut data = value.as_ptr();
+            unsafe {
+                libmpv2_sys::mpv_set_property_async(
+                    command_handle.0,
+                    request_id,
+                    name.as_ptr(),
+                    libmpv2_sys::mpv_format_MPV_FORMAT_STRING,
+                    (&mut data as *mut *const c_char).cast(),
+                )
+            }
+        }
+    };
+
+    if result < 0 {
+        Err(mpv_error_string(result))
+    } else {
+        Ok(())
+    }
+}
+
+fn run_mpv_get_property_async(
+    command_handle: MpvClientHandle,
+    request_id: u64,
+    name: &str,
+    format: Format,
+) -> std::result::Result<(), String> {
+    let name = CString::new(name).map_err(|error| error.to_string())?;
+    let format = match format {
+        Format::String => libmpv2_sys::mpv_format_MPV_FORMAT_STRING,
+        Format::Flag => libmpv2_sys::mpv_format_MPV_FORMAT_FLAG,
+        Format::Int64 => libmpv2_sys::mpv_format_MPV_FORMAT_INT64,
+        Format::Double => libmpv2_sys::mpv_format_MPV_FORMAT_DOUBLE,
+        Format::Node => return Err("async node property reads are unsupported".to_string()),
+    };
+    let result = unsafe {
+        libmpv2_sys::mpv_get_property_async(command_handle.0, request_id, name.as_ptr(), format)
+    };
+
+    if result < 0 {
+        Err(mpv_error_string(result))
+    } else {
+        Ok(())
+    }
+}
+
+fn set_property_async(name: &str, value: &PropVal, mpv: &Mpv) -> bool {
+    // Synchronous client calls can wait for mpv's core during demuxer teardown,
+    // starving this same thread of the events and commands needed to recover.
+    let request_id = NEXT_MPV_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let command_handle = MpvClientHandle(mpv.ctx.as_ptr());
+    match run_mpv_set_property_async(command_handle, request_id, name, value) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "[MPV PROP ERROR] cannot queue {name}={value:?} request_id={request_id}: {error}"
+            );
+            false
+        }
+    }
+}
+
+fn request_property_async(mpv: &Mpv, name: &str, format: Format) -> bool {
+    let request_id = NEXT_MPV_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let command_handle = MpvClientHandle(mpv.ctx.as_ptr());
+    match run_mpv_get_property_async(command_handle, request_id, name, format) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "[MPV PROP ERROR] cannot queue read for {name} request_id={request_id}: {error}"
+            );
+            false
+        }
     }
 }
 
@@ -1511,16 +1652,17 @@ impl PlayerController {
         let url = self.current_url.clone();
         let time = *CURRENT_TIME.lock().unwrap();
         let duration = *TOTAL_DURATION.lock().unwrap();
-        let startup_load_in_flight = self
+        let active_load_state = self
             .active_loadfile
             .as_ref()
-            .map(|active| !active.start_file_seen)
-            .unwrap_or(false);
+            .map(|active| (active.start_file_seen, active.file_loaded));
+        let startup_load_in_flight = matches!(active_load_state, Some((true, false)));
 
-        if self.state == LoadState::Stopping
-            || !is_local_stream_url(&url)
-            || (time > 1.0 && !startup_load_in_flight)
-        {
+        if !should_retry_startup_failure_event(
+            self.state,
+            is_local_stream_url(&url),
+            active_load_state,
+        ) {
             println!(
                 "[MPV] Not retrying startup failure ({source}): state={:?}, url={url}, time={time}, duration={duration}, startup_load_in_flight={startup_load_in_flight}",
                 self.state
@@ -1635,6 +1777,16 @@ fn should_defer_property(state: LoadState, name: &str) -> bool {
     }
 
     state == LoadState::Stopping && is_startup_property(name)
+}
+
+fn should_retry_startup_failure_event(
+    state: LoadState,
+    is_local_stream: bool,
+    active_load_state: Option<(bool, bool)>,
+) -> bool {
+    state == LoadState::Loading
+        && is_local_stream
+        && matches!(active_load_state, Some((true, false)))
 }
 
 fn is_local_stream_url(url: &str) -> bool {
@@ -1778,8 +1930,8 @@ fn observe_and_emit_current_property(
 
 fn should_emit_current_property(name: &str) -> bool {
     // `@stremio/stremio-video` waits for mpv-version before it sends loadfile.
-    // Some transient playback props can block during stop/load transitions, so
-    // keep the synchronous snapshot path limited to stable option-like values.
+    // Emit cached stable values immediately and request missing values without
+    // blocking the player event loop.
     is_cached_immediate_property(name)
 }
 
@@ -1812,29 +1964,7 @@ fn emit_current_property(
         return;
     }
 
-    let value = match format {
-        Format::Flag => mpv.get_property::<bool>(name).map(Value::Bool),
-        Format::Int64 => mpv.get_property::<i64>(name).map(|value| json!(value)),
-        Format::Double => mpv.get_property::<f64>(name).map(|value| json!(value)),
-        Format::String => mpv
-            .get_property::<String>(name)
-            .map(|value| mpv_string_property_to_json(name, value)),
-        Format::Node => {
-            println!("[PLAYER] immediate prop skipped for unsupported node property: {name}");
-            return;
-        }
-    };
-
-    let value = match value {
-        Ok(value) => value,
-        Err(error) => {
-            println!("[PLAYER] immediate prop unavailable: {name}: {error:#}");
-            return;
-        }
-    };
-
-    cache_property_value(name, &value);
-    emit_property_value(rpc_response_sender, name, value);
+    let _ = request_property_async(mpv, name, format);
 }
 
 fn emit_property_value(rpc_response_sender: &Sender<String>, name: &str, value: Value) {
@@ -1886,61 +2016,43 @@ fn clear_file_scoped_cached_props() {
     }
 }
 
-fn emit_loaded_property_snapshot(mpv: &Mpv, rpc_response_sender: &Sender<String>) {
-    emit_loaded_double_property(mpv, rpc_response_sender, "duration", true);
-    emit_loaded_double_property(mpv, rpc_response_sender, "time-pos", false);
-    emit_loaded_flag_property(mpv, rpc_response_sender, "pause");
-    emit_loaded_double_property(mpv, rpc_response_sender, "volume", false);
-    emit_loaded_flag_property(mpv, rpc_response_sender, "mute");
-    emit_loaded_id_property(mpv, rpc_response_sender, "aid");
-    emit_loaded_id_property(mpv, rpc_response_sender, "vid");
-    emit_loaded_id_property(mpv, rpc_response_sender, "sid");
+fn request_loaded_property_snapshot(mpv: &Mpv) {
+    for (name, format) in [
+        ("duration", Format::Double),
+        ("time-pos", Format::Double),
+        ("pause", Format::Flag),
+        ("volume", Format::Double),
+        ("mute", Format::Flag),
+        ("aid", Format::String),
+        ("vid", Format::String),
+        ("sid", Format::String),
+    ] {
+        let _ = request_property_async(mpv, name, format);
+    }
 }
 
-fn emit_loaded_double_property(
-    mpv: &Mpv,
+fn emit_async_property_reply(
     rpc_response_sender: &Sender<String>,
     name: &str,
-    require_positive: bool,
+    result: &PropertyData,
 ) {
-    match mpv.get_property::<f64>(name) {
-        Ok(value) if value.is_finite() && (!require_positive || value > 0.0) => {
-            emit_loaded_snapshot_value(rpc_response_sender, name, json!(value));
-        }
-        Ok(value) => {
-            println!("[PLAYER] loaded snapshot prop skipped: {name}={value}");
-        }
-        Err(error) => {
-            println!("[PLAYER] loaded snapshot prop unavailable: {name}: {error:#}");
-        }
-    }
-}
-
-fn emit_loaded_flag_property(mpv: &Mpv, rpc_response_sender: &Sender<String>, name: &str) {
-    match mpv.get_property::<bool>(name) {
-        Ok(value) => emit_loaded_snapshot_value(rpc_response_sender, name, Value::Bool(value)),
-        Err(error) => {
-            println!("[PLAYER] loaded snapshot prop unavailable: {name}: {error:#}");
-        }
-    }
-}
-
-fn emit_loaded_id_property(mpv: &Mpv, rpc_response_sender: &Sender<String>, name: &str) {
-    if let Ok(value) = mpv.get_property::<String>(name) {
-        emit_loaded_snapshot_value(
-            rpc_response_sender,
-            name,
-            mpv_string_property_to_json(name, value),
-        );
+    let Some(value) = property_data_to_json(name, result) else {
+        return;
+    };
+    if name == "duration" && value.as_f64().map(|value| value <= 0.0).unwrap_or(true) {
         return;
     }
+    emit_loaded_snapshot_value(rpc_response_sender, name, value);
+}
 
-    match mpv.get_property::<i64>(name) {
-        Ok(value) => {
-            emit_loaded_snapshot_value(rpc_response_sender, name, Value::String(value.to_string()))
-        }
-        Err(error) => {
-            println!("[PLAYER] loaded snapshot prop unavailable: {name}: {error:#}");
+fn property_data_to_json(name: &str, value: &PropertyData) -> Option<Value> {
+    match value {
+        PropertyData::Flag(value) => Some(Value::Bool(*value)),
+        PropertyData::Int64(value) => Some(json!(*value)),
+        PropertyData::Double(value) if value.is_finite() => Some(json!(*value)),
+        PropertyData::Double(_) => None,
+        PropertyData::Str(value) | PropertyData::OsdStr(value) => {
+            Some(mpv_string_property_to_json(name, value.to_string()))
         }
     }
 }
@@ -1953,7 +2065,7 @@ fn emit_loaded_snapshot_value(rpc_response_sender: &Sender<String>, name: &str, 
 
 fn cache_property_value(name: &str, value: &Value) {
     let value = normalize_property_value_for_web(name, value);
-    if is_cached_immediate_property(name) {
+    if is_cached_immediate_property(name) || name == "video-params" {
         CACHED_PLAYER_PROPS
             .lock()
             .unwrap()
@@ -2009,7 +2121,7 @@ fn update_cached_property(name: &str, change: &PropertyData) {
         PropertyData::Int64(value) => Some(json!(*value)),
         PropertyData::Double(value) => Some(json!(*value)),
         PropertyData::Str(value) | PropertyData::OsdStr(value) => {
-            Some(Value::String(value.to_string()))
+            Some(mpv_string_property_to_json(name, value.to_string()))
         }
     };
 
@@ -2055,12 +2167,16 @@ fn update_cached_property(name: &str, change: &PropertyData) {
 
 fn send_command(mpv: &Mpv, cmd: CmdVal) -> Option<CommandSubmission> {
     let (name, args) = command_parts(cmd);
-    let request_id = NEXT_MPV_COMMAND_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    send_command_parts(mpv, name, args)
+}
+
+fn send_command_parts(mpv: &Mpv, name: String, args: Vec<String>) -> Option<CommandSubmission> {
+    let request_id = NEXT_MPV_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     println!(
         "[PLAYER] dispatching mpv command: {} {:?} request_id={} mode=async",
         name, args, request_id
     );
-    let command_handle = MpvCommandHandle(mpv.ctx.as_ptr());
+    let command_handle = MpvClientHandle(mpv.ctx.as_ptr());
     let started_at = Instant::now();
 
     println!("[MPV CMD START] {name} {args:?} request_id={request_id} mode=async");
@@ -2112,11 +2228,7 @@ fn set_prop_val(
 ) {
     let name = name.to_string();
     let value_json = normalize_property_value_for_web(&name, &prop_val_to_json(&value));
-    let ok = match &value {
-        PropVal::Bool(value) => set_property(&name, *value, mpv),
-        PropVal::Num(value) => set_property(&name, *value, mpv),
-        PropVal::Str(value) => set_property(&name, value.as_str(), mpv),
-    };
+    let ok = set_property_async(&name, &value, mpv);
 
     if !ok {
         return;
@@ -2158,20 +2270,14 @@ fn prop_val_to_json(value: &PropVal) -> Value {
     }
 }
 
-fn set_property(name: impl ToString, value: impl SetData, mpv: &Mpv) -> bool {
-    let name = name.to_string();
-    match mpv.set_property(&name, value) {
-        Ok(()) => true,
-        Err(error) => {
-            eprintln!("cannot set MPV property: '{error:#}'");
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{cache_busted_url_at, should_defer_property, LoadState};
+    use super::{
+        cache_busted_url_at, property_data_to_json, should_defer_property,
+        should_retry_startup_failure_event, LoadState,
+    };
+    use libmpv2::events::PropertyData;
+    use serde_json::json;
 
     #[test]
     fn cache_buster_adds_query_to_plain_stream_url() {
@@ -2215,5 +2321,41 @@ mod tests {
             assert!(should_defer_property(LoadState::Stopping, property));
             assert!(!should_defer_property(LoadState::Loaded, property));
         }
+    }
+
+    #[test]
+    fn startup_recovery_requires_a_started_local_load() {
+        assert!(should_retry_startup_failure_event(
+            LoadState::Loading,
+            true,
+            Some((true, false)),
+        ));
+        assert!(!should_retry_startup_failure_event(
+            LoadState::Loading,
+            true,
+            Some((false, false)),
+        ));
+        assert!(!should_retry_startup_failure_event(
+            LoadState::Loaded,
+            true,
+            Some((true, true)),
+        ));
+        assert!(!should_retry_startup_failure_event(
+            LoadState::Loading,
+            false,
+            Some((true, false)),
+        ));
+    }
+
+    #[test]
+    fn async_property_replies_preserve_structured_video_params() {
+        assert_eq!(
+            property_data_to_json("video-params", &PropertyData::Str(r#"{"h":1080}"#)),
+            Some(json!({ "h": 1080 }))
+        );
+        assert_eq!(
+            property_data_to_json("duration", &PropertyData::Double(f64::NAN)),
+            None
+        );
     }
 }
