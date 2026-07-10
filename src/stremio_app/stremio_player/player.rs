@@ -319,6 +319,7 @@ fn create_shareable_mpv(window_handle: HWND) -> Mpv {
         #[cfg(not(debug_assertions))]
         set_property!("msg-level", "all=no");
         set_property!("quiet", "yes");
+        set_property!("osd-bar-marker-style", "none");
         set_property!("hwdec", "auto");
         // `%23%` escapes the 23-byte HTTP status list as one mpv option value.
         set_property!(
@@ -328,7 +329,9 @@ fn create_shareable_mpv(window_handle: HWND) -> Mpv {
         // gpu-next: libplacebo VO with modern HDR tone-mapping; gpu, is the fallback.
         set_property!("vo", "gpu-next,gpu,");
         for (name, value) in [
-            ("gpu-context", "d3d11"),
+            // Let mpv.conf choose a backend. On Windows, auto still selects the
+            // appropriate native context when the user has not configured one.
+            ("gpu-context", "auto"),
             ("d3d11-output-format", "auto"),
             ("d3d11-output-csp", "auto"),
             ("target-colorspace-hint", "auto"),
@@ -427,15 +430,15 @@ fn current_monitor_height(window_handle: HWND) -> Option<f64> {
 }
 
 fn apply_display_output_mode(mpv: &Mpv, state: DisplayOutputState, gpu_video_processing: bool) {
-    let vf = if gpu_video_processing {
+    let gpu_filter = if gpu_video_processing {
         let scale = state.scale_percent as f64 / 100.0;
         let mut vf = format!("d3d11vpp=scaling-mode=nvidia:scale={scale:.2}");
         if state.mode == DisplayOutputMode::Hdr {
             vf.push_str(":format=x2bgr10:nvidia-true-hdr");
         }
-        vf
+        Some(format!("@stremio-gpu-processing:{vf}"))
     } else {
-        String::new()
+        None
     };
     let color = match state.mode {
         DisplayOutputMode::Hdr | DisplayOutputMode::Auto => [
@@ -452,7 +455,15 @@ fn apply_display_output_mode(mpv: &Mpv, state: DisplayOutputState, gpu_video_pro
         ],
     };
 
-    for (name, value) in std::iter::once(("vf", vf.as_str())).chain(color) {
+    let (operation, filter) = match gpu_filter.as_deref() {
+        Some(filter) => ("add", filter),
+        None => ("remove", "@stremio-gpu-processing"),
+    };
+    if let Err(error) = mpv.command("vf", &[operation, filter]) {
+        eprintln!("mpv: cannot {operation} managed GPU filter: {error:?}");
+    }
+
+    for (name, value) in color {
         if let Err(error) = mpv.set_property(name, value) {
             eprintln!("mpv: cannot set {name}={value}: {error:?}");
         }
@@ -1062,7 +1073,7 @@ impl PlayerController {
         self.startup_retry_attempts = 0;
         *IS_FILE_LOADED.lock().unwrap() = true;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
-        self.apply_pending_startup_properties(mpv, rpc_response_sender);
+        self.apply_pending_file_properties(mpv, rpc_response_sender);
         self.invalidate_display_output();
     }
 
@@ -1174,15 +1185,16 @@ impl PlayerController {
         self.stop_command_request_id = None;
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+        self.apply_pending_preload_properties(mpv);
         self.send_pending_loadfile(mpv);
     }
 
     fn should_defer_startup_property(&self, name: &PropKey) -> bool {
-        self.state != LoadState::Loaded && is_startup_property(name)
+        should_defer_property(self.state, &name.to_string())
     }
 
     fn queue_startup_property(&mut self, name: PropKey, value: PropVal) {
-        println!("[PLAYER] deferring startup property until file is loaded: {name:?}={value:?}");
+        println!("[PLAYER] deferring property until a safe playback phase: {name:?}={value:?}");
         if let Some((_, existing_value)) = self
             .pending_startup_props
             .iter_mut()
@@ -1194,14 +1206,23 @@ impl PlayerController {
         self.pending_startup_props.push((name, value));
     }
 
-    fn apply_pending_startup_properties(
-        &mut self,
-        mpv: &Mpv,
-        rpc_response_sender: &Sender<String>,
-    ) {
+    fn apply_pending_preload_properties(&mut self, mpv: &Mpv) {
         let pending = std::mem::take(&mut self.pending_startup_props);
         for (name, value) in pending {
-            println!("[PLAYER] applying deferred startup property: {name:?}={value:?}");
+            if is_file_scoped_property(&name.to_string()) {
+                self.pending_startup_props.push((name, value));
+                continue;
+            }
+
+            println!("[PLAYER] applying deferred pre-load property: {name:?}={value:?}");
+            set_prop_val(name, value, mpv, None);
+        }
+    }
+
+    fn apply_pending_file_properties(&mut self, mpv: &Mpv, rpc_response_sender: &Sender<String>) {
+        let pending = std::mem::take(&mut self.pending_startup_props);
+        for (name, value) in pending {
+            println!("[PLAYER] applying deferred file property: {name:?}={value:?}");
             set_prop_val(name, value, mpv, Some(rpc_response_sender));
         }
     }
@@ -1231,6 +1252,7 @@ impl PlayerController {
         let requested_start = loadfile_requested_start(&cmd);
         let active_cmd = cmd.clone();
         self.abort_active_loadfile(mpv, "superseded by a newer loadfile");
+        self.apply_pending_preload_properties(mpv);
         self.state = LoadState::Loading;
         self.stop_started_at = None;
         *IS_FILE_LOADED.lock().unwrap() = false;
@@ -1584,9 +1606,9 @@ fn loadfile_requested_start(cmd: &CmdVal) -> Option<f64> {
     }
 }
 
-fn is_startup_property(name: &PropKey) -> bool {
+fn is_startup_property(name: &str) -> bool {
     matches!(
-        name.to_string().as_str(),
+        name,
         "sub-scale"
             | "sub-pos"
             | "sub-color"
@@ -1607,6 +1629,18 @@ fn is_startup_property(name: &PropKey) -> bool {
             | "mute"
             | "speed"
     )
+}
+
+fn is_file_scoped_property(name: &str) -> bool {
+    matches!(name, "sid" | "aid" | "vid")
+}
+
+fn should_defer_property(state: LoadState, name: &str) -> bool {
+    if is_file_scoped_property(name) {
+        return state != LoadState::Loaded;
+    }
+
+    state == LoadState::Stopping && is_startup_property(name)
 }
 
 fn is_local_stream_url(url: &str) -> bool {
@@ -2143,7 +2177,7 @@ fn set_property(name: impl ToString, value: impl SetData, mpv: &Mpv) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::cache_busted_url_at;
+    use super::{cache_busted_url_at, should_defer_property, LoadState};
 
     #[test]
     fn cache_buster_adds_query_to_plain_stream_url() {
@@ -2162,5 +2196,30 @@ mod tests {
             ),
             "http://127.0.0.1:11470/hash/3?tr=tracker%3Audp%3A%2F%2Fhost&_reload=42"
         );
+    }
+
+    #[test]
+    fn global_properties_apply_before_loading() {
+        for property in ["vo", "hwdec", "pause", "volume", "mute", "speed"] {
+            assert!(!should_defer_property(LoadState::Idle, property));
+            assert!(!should_defer_property(LoadState::Loading, property));
+        }
+    }
+
+    #[test]
+    fn global_properties_wait_for_an_active_stop() {
+        for property in ["vo", "hwdec", "pause", "volume", "mute", "speed"] {
+            assert!(should_defer_property(LoadState::Stopping, property));
+        }
+    }
+
+    #[test]
+    fn track_selection_waits_for_file_loaded() {
+        for property in ["sid", "aid", "vid"] {
+            assert!(should_defer_property(LoadState::Idle, property));
+            assert!(should_defer_property(LoadState::Loading, property));
+            assert!(should_defer_property(LoadState::Stopping, property));
+            assert!(!should_defer_property(LoadState::Loaded, property));
+        }
     }
 }
