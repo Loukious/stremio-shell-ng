@@ -14,6 +14,8 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use urlencoding::decode;
 
+const END_OF_FILE_SEEK_GUARD_SECS: f64 = 0.5;
+
 #[derive(Debug, Clone, Default)]
 pub struct IntroSkipConfig {
     /// Master toggle for auto-skipping segments.
@@ -343,6 +345,13 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         }) {
             let target = effective_segment_end(seg.segment.end_sec);
             if let Some(target_sec) = target {
+                // Bad API timestamps occasionally extend past the actual media duration.
+                // If clamping leaves us at or behind the current position, natural EOF is safer.
+                if target_sec <= time_pos + 0.05 {
+                    skipped_segments.insert(seg.key());
+                    continue;
+                }
+
                 if send_seek_absolute(target_sec) {
                     skipped_segments.insert(seg.key());
 
@@ -824,17 +833,22 @@ fn parse_theintrodb_ranges(
 }
 
 fn effective_segment_end(end_sec: Option<f64>) -> Option<f64> {
-    match end_sec {
-        Some(end) => Some(end),
-        None => {
-            let duration = TOTAL_DURATION.lock().map(|d| *d).unwrap_or(0.0);
-            if duration.is_finite() && duration > 1.0 {
-                Some((duration - 0.25).max(0.0))
-            } else {
-                None
-            }
-        }
-    }
+    let duration = TOTAL_DURATION.lock().map(|d| *d).unwrap_or(0.0);
+    effective_segment_end_for_duration(end_sec, duration)
+}
+
+fn effective_segment_end_for_duration(end_sec: Option<f64>, duration: f64) -> Option<f64> {
+    let media_end = (duration.is_finite() && duration > END_OF_FILE_SEEK_GUARD_SECS)
+        .then_some(duration - END_OF_FILE_SEEK_GUARD_SECS);
+
+    let target = match (end_sec, media_end) {
+        (Some(end), Some(media_end)) if end.is_finite() => end.min(media_end),
+        (Some(end), None) if end.is_finite() => end,
+        (None, Some(media_end)) => media_end,
+        _ => return None,
+    };
+
+    (target >= 0.0).then_some(target)
 }
 
 fn is_plausible_outro(seg: &SkipSegment) -> bool {
@@ -1084,4 +1098,42 @@ fn looks_like_imdb_id(id: &str) -> bool {
     }
     let digits = &id[2..];
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_segment_end_for_duration, END_OF_FILE_SEEK_GUARD_SECS};
+
+    #[test]
+    fn segment_end_is_clamped_before_media_eof() {
+        assert_eq!(
+            effective_segment_end_for_duration(Some(2_835.0), 2_832.121),
+            Some(2_832.121 - END_OF_FILE_SEEK_GUARD_SECS)
+        );
+    }
+
+    #[test]
+    fn valid_segment_end_is_preserved() {
+        assert_eq!(
+            effective_segment_end_for_duration(Some(254.0), 2_832.121),
+            Some(254.0)
+        );
+    }
+
+    #[test]
+    fn media_duration_supplies_unknown_segment_end() {
+        assert_eq!(
+            effective_segment_end_for_duration(None, 100.0),
+            Some(100.0 - END_OF_FILE_SEEK_GUARD_SECS)
+        );
+    }
+
+    #[test]
+    fn invalid_end_without_duration_is_rejected() {
+        assert_eq!(
+            effective_segment_end_for_duration(Some(f64::NAN), 0.0),
+            None
+        );
+        assert_eq!(effective_segment_end_for_duration(None, 0.0), None);
+    }
 }
