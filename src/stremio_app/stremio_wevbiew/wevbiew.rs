@@ -293,7 +293,28 @@ impl PartialUi for WebView {
                             try{
                                 if(window.self === window.top && !window.__stremioShellRouteReporterInstalled) {
                                     window.__stremioShellRouteReporterInstalled = true;
+                                    let backgroundPlayerFocusHeld = false;
+                                    const isPlayerRoute = () =>
+                                        (window.location.hash || '').indexOf('/player/') !== -1;
+                                    const keepBackgroundPlayerActive = () => {
+                                        if (!isPlayerRoute()) {
+                                            backgroundPlayerFocusHeld = false;
+                                            return;
+                                        }
+                                        if (document.hasFocus()) {
+                                            backgroundPlayerFocusHeld = false;
+                                            return;
+                                        }
+                                        if (backgroundPlayerFocusHeld) return;
+
+                                        // The Web UI's useRouteFocused() unsubscribes every model when
+                                        // document.hasFocus() is false. Keep the embedded player subscribed
+                                        // in the background without activating the native window.
+                                        backgroundPlayerFocusHeld = true;
+                                        window.dispatchEvent(new Event('focus'));
+                                    };
                                     const reportRoute = () => {
+                                        setTimeout(keepBackgroundPlayerActive, 0);
                                         try {
                                             window.chrome.webview.postMessage(JSON.stringify({
                                                 id: 1,
@@ -313,6 +334,13 @@ impl PartialUi for WebView {
                                     wrapHistory('replaceState');
                                     window.addEventListener('popstate', reportRoute);
                                     window.addEventListener('hashchange', reportRoute);
+                                    window.addEventListener('blur', () => {
+                                        backgroundPlayerFocusHeld = false;
+                                        setTimeout(keepBackgroundPlayerActive, 0);
+                                    });
+                                    window.addEventListener('focus', (event) => {
+                                        if (event.isTrusted) backgroundPlayerFocusHeld = false;
+                                    }, true);
                                     reportRoute();
                                 }
                             }catch(e){}
