@@ -177,7 +177,11 @@ impl PartialUi for WebView {
         let controller_clone = data.controller.clone();
         let endpoint = data.endpoint.clone();
         let dev_tools = data.dev_tools.clone();
-        let webview_flags = "--autoplay-policy=no-user-gesture-required --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
+        let webview_flags = "--autoplay-policy=no-user-gesture-required \
+        --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion \
+        --disable-backgrounding-occluded-windows \
+        --disable-renderer-backgrounding \
+        --disable-background-timer-throttling";
         let result = webview2::EnvironmentBuilder::new()
             .with_additional_browser_arguments(webview_flags)
             .build(move |env| {
