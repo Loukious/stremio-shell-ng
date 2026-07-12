@@ -1,7 +1,5 @@
 use discord_rich_presence::{
-    activity::{
-        Activity, ActivityType, Assets, Button, Party, Secrets, Timestamps,
-    },
+    activity::{Activity, ActivityType, Assets, Button, Party, Secrets, Timestamps},
     DiscordIpc, DiscordIpcClient,
 };
 use flume::{Receiver, Sender};
@@ -91,7 +89,6 @@ use crate::stremio_app::{
     PipeServer,
 };
 
-use super::discord::DiscordRpc;
 use super::stremio_server::StremioServer;
 
 fn weserv_contain(url: &str) -> String {
@@ -768,17 +765,33 @@ fn run_souvlaki_media_keys(
 pub fn spawn_discordrpc_loop(
     app_start_time: SystemTime,
     _auto_host_lobby: bool,
+    control_rx: Receiver<bool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let config = load_or_create_config();
         let retry_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         loop {
+            // The Web UI owns the persisted setting. Stay fully disconnected until it asks us
+            // to connect, and consume repeated disconnect messages while disabled.
+            let enabled = loop {
+                match control_rx.recv() {
+                    Ok(enabled) => {
+                        let enabled = control_rx.try_iter().last().unwrap_or(enabled);
+                        if enabled {
+                            break true;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            };
+            debug_assert!(enabled);
+
             let current_retry = retry_count.clone();
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let mut drp = DiscordIpcClient::new("997798118185771059");
 
-                loop {
+                'connection: loop {
                     // Connection maintenance loop
                     // Attempt connection
                     match drp.connect() {
@@ -788,7 +801,10 @@ pub fn spawn_discordrpc_loop(
                         }
                         Err(e) => {
                             eprintln!("⚠️ Connection failed: {e}");
-                            thread::sleep(Duration::from_secs(5));
+                            match control_rx.recv_timeout(Duration::from_secs(5)) {
+                                Ok(false) | Err(flume::RecvTimeoutError::Disconnected) => break,
+                                Ok(true) | Err(flume::RecvTimeoutError::Timeout) => {}
+                            }
                             continue;
                         }
                     }
@@ -802,7 +818,13 @@ pub fn spawn_discordrpc_loop(
                     loop {
                         // Activity update loop
                         let sleep_time = Duration::from_secs(config.refresh_interval);
-                        thread::sleep(sleep_time);
+                        match control_rx.recv_timeout(sleep_time) {
+                            Ok(false) | Err(flume::RecvTimeoutError::Disconnected) => {
+                                let _ = drp.clear_activity();
+                                break 'connection;
+                            }
+                            Ok(true) | Err(flume::RecvTimeoutError::Timeout) => {}
+                        }
 
                         // Safely get current state with error handling
                         let (cur_url, cur_time, is_paused, total_duration) = match (
@@ -952,12 +974,11 @@ pub fn spawn_discordrpc_loop(
             // Handle panics and connection failures
             if let Err(e) = result {
                 eprintln!("⚠️ Critical error in Discord RPC: {:?}", e);
+                // Exponential backoff for panics. Normal disconnects return to the disabled wait.
+                let rc = retry_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let delay_secs = 5 * 2u64.pow(rc.min(5));
+                thread::sleep(Duration::from_secs(delay_secs));
             }
-
-            // Exponential backoff for reconnections
-            let rc = retry_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let delay_secs = 5 * 2u64.pow(rc.min(5));
-            thread::sleep(Duration::from_secs(delay_secs));
         }
     })
 }
@@ -1416,7 +1437,8 @@ impl MainWindow {
         let app_start_time = SystemTime::now();
         let auto_host_lobby = !self.command.starts_with("stremio://sync/");
         let config = load_or_create_config();
-        spawn_discordrpc_loop(app_start_time, auto_host_lobby);
+        let (discord_control_tx, discord_control_rx) = flume::unbounded::<bool>();
+        spawn_discordrpc_loop(app_start_time, auto_host_lobby, discord_control_rx);
         crate::stremio_app::intro_skip::spawn_intro_skip_loop(
             crate::stremio_app::intro_skip::IntroSkipConfig {
                 enabled: config.auto_skip_enabled,
@@ -1540,7 +1562,6 @@ impl MainWindow {
         let hide_splash_sender = self.hide_splash_notice.sender();
         let focus_sender = self.focus_notice.sender();
         let autoupdater_setup_mutex = self.autoupdater_setup_file.clone();
-        let discord_rpc = DiscordRpc::new(web_tx.clone());
         let requested_fullscreen = self.requested_fullscreen.clone();
         let requested_pip = self.requested_pip.clone();
         thread::spawn(move || loop {
@@ -1745,43 +1766,16 @@ impl MainWindow {
                         }
                     }
                     Some("discord-connect") => {
-                        if let Err(e) = discord_rpc.connect() {
-                            eprintln!("Discord connect error: {}", e);
-                            web_tx_web.send(RPCResponse::discord_status(false)).ok();
-                        }
+                        let accepted = discord_control_tx.send(true).is_ok();
+                        web_tx_web.send(RPCResponse::discord_status(accepted)).ok();
                     }
                     Some("discord-disconnect") => {
-                        if let Err(e) = discord_rpc.disconnect() {
-                            eprintln!("Discord disconnect error: {}", e);
-                        }
+                        discord_control_tx.send(false).ok();
                         web_tx_web.send(RPCResponse::discord_status(false)).ok();
                     }
-                    Some("discord-set-activity") => {
-                        if let Some(params) = msg.get_params() {
-                            let state = params.get("state").and_then(|v| v.as_str()).unwrap_or("");
-                            let details =
-                                params.get("details").and_then(|v| v.as_str()).unwrap_or("");
-                            let image = params.get("image").and_then(|v| v.as_str());
-                            let start_timestamp =
-                                params.get("startTimestamp").and_then(|v| v.as_i64());
-                            let end_timestamp = params.get("endTimestamp").and_then(|v| v.as_i64());
-
-                            if let Err(e) = discord_rpc.set_activity(
-                                state,
-                                details,
-                                image,
-                                start_timestamp,
-                                end_timestamp,
-                            ) {
-                                eprintln!("Discord set activity error: {}", e);
-                            }
-                        }
-                    }
-                    Some("discord-clear-activity") => {
-                        if let Err(e) = discord_rpc.clear_activity() {
-                            eprintln!("Discord clear activity error: {}", e);
-                        }
-                    }
+                    // Our presence derives richer activity from shell state. Consume the Web UI's
+                    // official activity messages so it cannot start a second Discord presence.
+                    Some("discord-set-activity" | "discord-clear-activity") => {}
                     Some(player_command) if player_command.starts_with("mpv-") => {
                         let player_command = player_command.to_string();
                         let resp_json = serde_json::to_string(

@@ -1,6 +1,5 @@
 pub mod app;
 pub use app::MainWindow;
-pub mod discord;
 pub mod gpu_video_processing;
 pub mod ipc;
 pub mod stremio_player;
