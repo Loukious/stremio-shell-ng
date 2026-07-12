@@ -9,10 +9,79 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: windows-release-candidate
+  cancel-in-progress: false
+
 jobs:
+  prepare:
+    name: Choose release candidate
+    runs-on: ubuntu-latest
+    outputs:
+      base_version: ${{ steps.rc.outputs.base_version }}
+      package_version: ${{ steps.rc.outputs.package_version }}
+      tag: ${{ steps.rc.outputs.tag }}
+      rc_number: ${{ steps.rc.outputs.rc_number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Choose release candidate version
+        id: rc
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          manifest_version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          base_version="${manifest_version%%-rc*}"
+          base_tag="v${base_version}"
+          current_tag=""
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            current_tag="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ "$current_tag" =~ ^v(.+)-rc([0-9]+)$ ]]; then
+            release_tag="$current_tag"
+            package_version="${release_tag#v}"
+            base_version="${package_version%-rc*}"
+          else
+            git fetch --tags --force
+            existing_numbers="$(
+              {
+                git tag -l "${base_tag}-rc*" | sed -En "s/^${base_tag}-rc([0-9]+)$/\1/p"
+                gh release list --limit 200 --json tagName --jq '.[].tagName' \
+                  | sed -En "s/^${base_tag}-rc([0-9]+)$/\1/p"
+              } | sort -n | uniq
+            )"
+            last_number="$(printf '%s\n' "$existing_numbers" | tail -n 1)"
+            if [[ -z "$last_number" ]]; then
+              next_number=1
+            else
+              next_number=$((last_number + 1))
+            fi
+            release_tag="${base_tag}-rc${next_number}"
+            package_version="${release_tag#v}"
+          fi
+
+          rc_number="${release_tag##*-rc}"
+          {
+            echo "base_version=${base_version}"
+            echo "package_version=${package_version}"
+            echo "tag=${release_tag}"
+            echo "rc_number=${rc_number}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Selected release candidate: ${release_tag} (package ${package_version})"
+
   build:
     name: Build ${{ matrix.arch }}
     runs-on: windows-latest
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -97,6 +166,37 @@ jobs:
             curl.exe --fail --location --silent --show-error --output $target $url
           }
 
+      - name: Embed release candidate version
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.package_version }}
+        run: |
+          $manifestPath = Resolve-Path "Cargo.toml"
+          $manifest = [IO.File]::ReadAllText($manifestPath)
+          $pattern = '(?m)^version = "[^"]+"'
+          if ([regex]::Matches($manifest, $pattern).Count -eq 0) {
+            throw "Could not find the package version in Cargo.toml"
+          }
+
+          $updatedManifest = [regex]::Replace(
+            $manifest,
+            $pattern,
+            "version = `"$env:PACKAGE_VERSION`"",
+            1
+          )
+          [IO.File]::WriteAllText(
+            $manifestPath,
+            $updatedManifest,
+            [Text.UTF8Encoding]::new($false)
+          )
+
+          $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $actualVersion = ($metadata.packages | Where-Object name -eq "stremio-shell-ng").version
+          if ($actualVersion -ne $env:PACKAGE_VERSION) {
+            throw "Expected package version $env:PACKAGE_VERSION, got $actualVersion"
+          }
+          Write-Host "Building package version $actualVersion"
+
       - name: Build shell
         shell: pwsh
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
@@ -134,7 +234,7 @@ jobs:
   release:
     name: Publish release candidate
     runs-on: ubuntu-latest
-    needs: build
+    needs: [prepare, build]
 
     steps:
       - name: Checkout
@@ -161,69 +261,25 @@ jobs:
           echo "Release assets:"
           ls -la dist
 
-      - name: Choose release candidate tag
-        id: rc
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
-          base_tag="v${version}"
-          current_tag=""
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            current_tag="${GITHUB_REF_NAME}"
-          fi
-
-          if [[ "$current_tag" =~ ^v[0-9]+(\.[0-9A-Za-z-]+)*-rc[0-9]+$ ]]; then
-            release_tag="$current_tag"
-            version="${release_tag#v}"
-            version="${version%-rc*}"
-          else
-            git fetch --tags --force
-            existing_numbers="$(
-              {
-                git tag -l "${base_tag}-rc*" | sed -En "s/^${base_tag}-rc([0-9]+)$/\1/p"
-                gh release list --limit 200 --json tagName --jq '.[].tagName' \
-                  | sed -En "s/^${base_tag}-rc([0-9]+)$/\1/p"
-              } | sort -n | uniq
-            )"
-            last_number="$(printf '%s\n' "$existing_numbers" | tail -n 1)"
-            if [[ -z "$last_number" ]]; then
-              next_number=1
-            else
-              next_number=$((last_number + 1))
-            fi
-            release_tag="${base_tag}-rc${next_number}"
-
-            if ! git rev-parse -q --verify "refs/tags/${release_tag}" >/dev/null; then
-              git tag "$release_tag" "$GITHUB_SHA"
-              git push origin "refs/tags/${release_tag}"
-            fi
-          fi
-
-          rc_number="${release_tag##*-rc}"
-          {
-            echo "version=${version}"
-            echo "tag=${release_tag}"
-            echo "rc_number=${rc_number}"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "Selected release candidate: ${release_tag}"
-
       - name: Create or update GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.rc.outputs.tag }}
-          RELEASE_VERSION: ${{ steps.rc.outputs.version }}
-          RC_NUMBER: ${{ steps.rc.outputs.rc_number }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.base_version }}
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.package_version }}
+          RC_NUMBER: ${{ needs.prepare.outputs.rc_number }}
         run: |
           set -euo pipefail
 
           title="Stremio RPC ${RELEASE_VERSION} RC${RC_NUMBER}"
-          notes="Release candidate ${RC_NUMBER} for v${RELEASE_VERSION}."
+          notes="Release candidate ${RC_NUMBER} for v${RELEASE_VERSION}. Embedded app version: ${PACKAGE_VERSION}."
+
+          git fetch --tags --force
+          if ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            git tag "$RELEASE_TAG" "$GITHUB_SHA"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release edit "$RELEASE_TAG" \
