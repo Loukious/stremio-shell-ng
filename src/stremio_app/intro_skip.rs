@@ -1,8 +1,8 @@
 use crate::stremio_app::app::{LobbyRole, LOBBY_ROLE};
 use crate::stremio_app::ipc::RPCResponse;
 use crate::stremio_app::stremio_player::player::{
-    CURRENT_CHAPTER, CURRENT_CHAPTER_COUNT, CURRENT_CHAPTER_TITLE, CURRENT_TIME, IS_FILE_LOADED,
-    IS_PAUSED, PLAYER_CMD_TX, TOTAL_DURATION,
+    CURRENT_CHAPTER, CURRENT_CHAPTER_COUNT, CURRENT_CHAPTER_TITLE, CURRENT_TIME, FILE_LOAD_EPOCH,
+    IS_FILE_LOADED, IS_PAUSED, PLAYER_CMD_TX, TOTAL_DURATION,
 };
 use crate::stremio_app::stremio_wevbiew::wevbiew::{CURRENT_URL, WEB_CMD_TX};
 use anyhow::Context;
@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, Instant};
 use urlencoding::decode;
 
@@ -191,7 +192,9 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         .build()
         .unwrap_or_else(|_| Client::new());
 
-    let mut last_video_id: Option<String> = None;
+    let mut last_player_route: Option<String> = None;
+    let mut bound_file_epoch: Option<u64> = None;
+    let mut required_file_epoch: Option<u64> = None;
     let mut current_media: Option<MediaKey> = None;
     let mut current_segments: Option<Vec<SkipSegment>> = None;
     let mut skipped_segments: HashSet<SegmentKey> = HashSet::new();
@@ -219,53 +222,36 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
 
         let cur_url = CURRENT_URL.lock().map(|s| s.clone()).unwrap_or_default();
         let maybe_video_id = extract_video_id_from_url(&cur_url);
+        let maybe_player_route = maybe_video_id.as_ref().map(|_| cur_url.clone());
 
-        if maybe_video_id != last_video_id {
-            last_video_id = maybe_video_id.clone();
+        if maybe_player_route != last_player_route {
+            last_player_route = maybe_player_route;
             current_media = None;
             current_segments = None;
             skipped_segments.clear();
             last_skipped_chapter = None;
             next_resolve_at = Instant::now();
+
+            required_file_epoch = maybe_video_id.as_ref().map(|_| {
+                let current_epoch = FILE_LOAD_EPOCH.load(AtomicOrdering::Acquire);
+                match bound_file_epoch {
+                    Some(previous_epoch) => previous_epoch.saturating_add(1),
+                    None => {
+                        let file_loaded = IS_FILE_LOADED.lock().map(|v| *v).unwrap_or(false);
+                        if file_loaded {
+                            current_epoch
+                        } else {
+                            current_epoch.saturating_add(1)
+                        }
+                    }
+                }
+            });
         }
 
         // Not in player -> nothing to do.
         let Some(video_id) = maybe_video_id.as_ref() else {
             continue;
         };
-
-        // Resolve media + fetch segments (with light retry).
-        if (current_media.is_none() || current_segments.is_none())
-            && Instant::now() >= next_resolve_at
-        {
-            match resolve_media_and_segments(
-                &client,
-                &config,
-                video_id,
-                &mut kitsu_cache,
-                &mut segments_cache,
-            ) {
-                Ok((media, segments)) => {
-                    current_media = media;
-                    current_segments = segments;
-                    // No more retries needed unless we change media.
-                    next_resolve_at = Instant::now() + Duration::from_secs(60 * 60);
-                }
-                Err(e) => {
-                    eprintln!("Intro skip: resolve failed: {}", format_error_chain(&e));
-                    // Back off a bit before retrying.
-                    next_resolve_at = Instant::now() + Duration::from_secs(15);
-                }
-            }
-        }
-
-        let Some(segments) = current_segments.as_ref() else {
-            continue;
-        };
-
-        if segments.is_empty() {
-            continue;
-        }
 
         let (time_pos, paused, file_loaded) = (
             CURRENT_TIME.lock().map(|t| *t).unwrap_or(0.0),
@@ -285,6 +271,12 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         if paused || !file_loaded {
             continue;
         }
+
+        let file_epoch = FILE_LOAD_EPOCH.load(AtomicOrdering::Acquire);
+        if required_file_epoch.is_some_and(|required| file_epoch < required) {
+            continue;
+        }
+        bound_file_epoch = Some(file_epoch);
 
         // --- Chapter-based skipping ---
         // Some files include named chapters like "Opening", "Logo", "Credits".
@@ -324,6 +316,33 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
                         );
                     }
                     continue;
+                }
+            }
+        }
+
+        // Remote segment databases are a fallback for files without useful chapters. Keep this
+        // blocking lookup after chapter handling so a slow or empty response cannot suppress
+        // mpv's local chapter metadata.
+        if (current_media.is_none() || current_segments.is_none())
+            && Instant::now() >= next_resolve_at
+        {
+            match resolve_media_and_segments(
+                &client,
+                &config,
+                video_id,
+                &mut kitsu_cache,
+                &mut segments_cache,
+            ) {
+                Ok((media, segments)) => {
+                    current_media = media;
+                    current_segments = segments;
+                    // No more retries needed unless we change media.
+                    next_resolve_at = Instant::now() + Duration::from_secs(60 * 60);
+                }
+                Err(e) => {
+                    eprintln!("Intro skip: resolve failed: {}", format_error_chain(&e));
+                    // Back off a bit before retrying.
+                    next_resolve_at = Instant::now() + Duration::from_secs(15);
                 }
             }
         }

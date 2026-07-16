@@ -54,6 +54,10 @@ pub static CACHED_PLAYER_PROPS: Lazy<Mutex<HashMap<String, Value>>> =
 
 pub static IS_FILE_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
+/// Monotonically increases after mpv finishes loading a new file.
+/// Consumers use this to avoid applying route-scoped actions to the previous file.
+pub static FILE_LOAD_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 pub static STOP_COMMAND_IN_FLIGHT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
 pub static MPV_VERSION: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
@@ -1324,6 +1328,7 @@ impl PlayerController {
         }
         self.pending_startup_retry = None;
         self.startup_retry_attempts = 0;
+        FILE_LOAD_EPOCH.fetch_add(1, Ordering::Release);
         *IS_FILE_LOADED.lock().unwrap() = true;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
         self.apply_pending_file_properties(mpv, rpc_response_sender);
