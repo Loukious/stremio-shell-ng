@@ -250,6 +250,7 @@ pub enum MpvCmd {
     Stop,
     Cycle,
     Seek,
+    Keypress,
 }
 stringable!(MpvCmd);
 

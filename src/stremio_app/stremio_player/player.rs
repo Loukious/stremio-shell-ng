@@ -1,5 +1,6 @@
 use crate::stremio_app::ipc;
 use crate::stremio_app::mpv_hwnd::find_exact_mpv_child_hwnd;
+use crate::stremio_app::stremio_wevbiew::wevbiew::set_bound_mpv_keys;
 use crate::stremio_app::RPCResponse;
 use flume::{Receiver, Sender};
 use libmpv2::events::PropertyData;
@@ -305,6 +306,9 @@ impl PartialUi for Player {
         data.channel = ipc::Channel::new(Some((in_msg_sender, rpc_response_receiver)));
 
         let mpv = create_shareable_mpv(window_handle);
+        // Player is built before WebView. Discover bindings here so the first document gets a
+        // complete key set instead of racing the event thread during WebView initialization.
+        query_and_set_bound_keys(mpv.ctx.as_ptr());
         let _event_thread = create_event_thread(
             mpv,
             window_handle as isize,
@@ -881,6 +885,136 @@ fn run_mpv_get_property_async(
     } else {
         Ok(())
     }
+}
+
+/// Query mpv's `input-bindings` property and populate the webview's
+/// bound-key set with every non-weak (user-defined) binding key.
+///
+/// `input-bindings` returns a `NODE_ARRAY` of `NODE_MAP` entries.
+/// Each map has at least:
+///   - "key"     (STRING)  – the mpv key name
+///   - "is_weak" (FLAG)    – true for built-in/default bindings
+///   - "priority" (INT64)  – negative for inactive bindings
+fn query_and_set_bound_keys(ctx: *mut libmpv2_sys::mpv_handle) {
+    use std::ffi::CStr;
+
+    let name = match CString::new("input-bindings") {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+
+    let mut node: libmpv2_sys::mpv_node = unsafe { mem::zeroed() };
+    let rc = unsafe {
+        libmpv2_sys::mpv_get_property(
+            ctx,
+            name.as_ptr(),
+            libmpv2_sys::mpv_format_MPV_FORMAT_NODE,
+            (&mut node as *mut libmpv2_sys::mpv_node).cast(),
+        )
+    };
+
+    if rc < 0 {
+        eprintln!(
+            "[MPV KEYS] failed to get input-bindings: {}",
+            mpv_error_string(rc)
+        );
+        return;
+    }
+
+    let mut keys = HashSet::new();
+    let mut has_sequences = false;
+
+    // The top-level node must be an array.
+    if node.format == libmpv2_sys::mpv_format_MPV_FORMAT_NODE_ARRAY {
+        let list_ptr = unsafe { node.u.list };
+        if !list_ptr.is_null() {
+            let list = unsafe { &*list_ptr };
+            for i in 0..list.num as usize {
+                let entry = unsafe { &*list.values.add(i) };
+                // Each entry should be a map.
+                if entry.format != libmpv2_sys::mpv_format_MPV_FORMAT_NODE_MAP {
+                    continue;
+                }
+                let map_ptr = unsafe { entry.u.list };
+                if map_ptr.is_null() {
+                    continue;
+                }
+                let map = unsafe { &*map_ptr };
+
+                let mut key_name = None;
+                let mut is_weak = true;
+                let mut priority = -1_i64;
+
+                for j in 0..map.num as usize {
+                    let field_key =
+                        unsafe { CStr::from_ptr(*map.keys.add(j)).to_str().unwrap_or("") };
+                    let field_val = unsafe { &*map.values.add(j) };
+
+                    match field_key {
+                        "key" if field_val.format == libmpv2_sys::mpv_format_MPV_FORMAT_STRING => {
+                            key_name = unsafe { CStr::from_ptr(field_val.u.string).to_str().ok() }
+                                .map(str::to_owned);
+                        }
+                        "is_weak"
+                            if field_val.format == libmpv2_sys::mpv_format_MPV_FORMAT_FLAG =>
+                        {
+                            is_weak = unsafe { field_val.u.flag } != 0;
+                        }
+                        "priority"
+                            if field_val.format == libmpv2_sys::mpv_format_MPV_FORMAT_INT64 =>
+                        {
+                            priority = unsafe { field_val.u.int64 };
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Negative-priority bindings are inactive. Weak bindings are defaults that the
+                // Web UI should continue to own unless the user overrides them.
+                if is_active_user_binding(is_weak, priority) {
+                    if let Some(key) = key_name {
+                        let parts = binding_sequence_parts(&key);
+                        has_sequences |= parts.len() > 1;
+                        for part in parts {
+                            keys.insert(part.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe { libmpv2_sys::mpv_free_node_contents(&mut node) };
+
+    set_bound_mpv_keys(keys, has_sequences);
+}
+
+fn is_active_user_binding(is_weak: bool, priority: i64) -> bool {
+    !is_weak && priority >= 0
+}
+
+fn binding_sequence_parts(key: &str) -> Vec<&str> {
+    let bytes = key.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+
+    while let Some(relative_end) = key[start..].find('-') {
+        let mut end = start + relative_end;
+        if end + 1 >= bytes.len() {
+            break;
+        }
+
+        // mpv treats the second dash as the sequence separator in `Ctrl+--a`, leaving
+        // `Ctrl+-` as the first key. Mirror input/keycodes.c here.
+        if bytes[end + 1] == b'-' {
+            end += 1;
+        }
+        parts.push(&key[start..end]);
+        start = end + 1;
+    }
+
+    parts.push(&key[start..]);
+    parts
 }
 
 fn set_property_async(name: &str, value: &PropVal, mpv: &Mpv) -> bool {
@@ -2163,8 +2297,9 @@ fn prop_val_to_json(value: &PropVal) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_busted_url_at, is_unchanged_persistent_render_property, property_data_to_json,
-        should_defer_property, should_retry_startup_failure_event, LoadState, PropVal,
+        binding_sequence_parts, cache_busted_url_at, is_active_user_binding,
+        is_unchanged_persistent_render_property, property_data_to_json, should_defer_property,
+        should_retry_startup_failure_event, LoadState, PropVal,
     };
     use libmpv2::events::PropertyData;
     use serde_json::json;
@@ -2187,6 +2322,22 @@ mod tests {
             ),
             "http://127.0.0.1:11470/hash/3?tr=tracker%3Audp%3A%2F%2Fhost&_reload=42"
         );
+    }
+
+    #[test]
+    fn input_binding_sequences_are_split_like_mpv() {
+        assert_eq!(binding_sequence_parts("a-b-c"), ["a", "b", "c"]);
+        assert_eq!(binding_sequence_parts("-"), ["-"]);
+        assert_eq!(binding_sequence_parts("Ctrl+-"), ["Ctrl+-"]);
+        assert_eq!(binding_sequence_parts("Ctrl+--a"), ["Ctrl+-", "a"]);
+    }
+
+    #[test]
+    fn only_active_user_input_bindings_are_forwarded() {
+        assert!(is_active_user_binding(false, 0));
+        assert!(is_active_user_binding(false, 10));
+        assert!(!is_active_user_binding(true, 10));
+        assert!(!is_active_user_binding(false, -1));
     }
 
     #[test]
