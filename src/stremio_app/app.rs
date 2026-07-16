@@ -354,9 +354,9 @@ fn load_or_create_config() -> Config {
             // Comma-separated keywords matched against the current chapter title (case-insensitive).
             // Each list is gated by the corresponding [AutoSkip] toggle (skip_intro/skip_recap/skip_outro).
             // Leave a value blank to disable matching for that kind.
-            .set("intro", "opening,intro,logo")
+            .set("intro", "opening,op,intro,logo")
             .set("recap", "recap")
-            .set("outro", "credits,outro,ending");
+            .set("outro", "credits,outro,ending,ed");
 
         default_config
             .with_section(Some("IntroDB"))
@@ -482,9 +482,9 @@ fn load_or_create_config() -> Config {
             )
         } else {
             (
-                parse_word_list("opening,intro,logo"),
+                parse_word_list("opening,op,intro,logo"),
                 parse_word_list("recap"),
-                parse_word_list("credits,outro,ending"),
+                parse_word_list("credits,outro,ending,ed"),
             )
         };
 

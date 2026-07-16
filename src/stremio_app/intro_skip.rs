@@ -295,19 +295,6 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         {
             let t = chapter_title.trim().to_lowercase();
             if let Some((kind, matched)) = segment_kind_from_chapter_title(&t, &config) {
-                if !chapter_skip_allowed(kind, time_pos) {
-                    last_skipped_chapter = Some(chapter_idx);
-                    println!(
-                        "AutoSkip chapter {} ignored as unsafe: '{}' at {:.3}s (chapter #{}, matched '{}')",
-                        kind.label(),
-                        chapter_title,
-                        time_pos,
-                        chapter_idx,
-                        matched
-                    );
-                    continue;
-                }
-
                 let is_final_outro =
                     kind == SegmentKind::Outro && is_final_chapter(chapter_idx, chapter_count);
                 let skip_sent = if is_final_outro {
@@ -927,28 +914,6 @@ fn is_plausible_outro(seg: &SkipSegment) -> bool {
     seg.segment.start_sec >= duration * 0.5
 }
 
-fn chapter_skip_allowed(kind: SegmentKind, time_pos: f64) -> bool {
-    if !time_pos.is_finite() || time_pos < 0.0 {
-        return false;
-    }
-
-    match kind {
-        // Chapter metadata is often coarse. Some files have an "Opening" chapter
-        // whose next chapter is the ending, so only trust intro/recap chapter jumps
-        // near the start of playback and let segment data handle later skips.
-        SegmentKind::Intro => time_pos <= 120.0,
-        SegmentKind::Recap => time_pos <= 180.0,
-        SegmentKind::Outro => {
-            let duration = TOTAL_DURATION.lock().map(|d| *d).unwrap_or(0.0);
-            if !duration.is_finite() || duration <= 0.0 {
-                return false;
-            }
-
-            time_pos >= duration * 0.75 || duration - time_pos <= 300.0
-        }
-    }
-}
-
 fn format_media_key(key: &MediaKey) -> String {
     match (key.season, key.episode) {
         (Some(season), Some(episode)) => format!("{} S{}E{}", key.imdb_id, season, episode),
@@ -1098,8 +1063,22 @@ fn find_matching_keyword<'a>(
 ) -> Option<&'a str> {
     keywords_lower
         .iter()
-        .find(|k| !k.is_empty() && haystack_lower.contains(k.as_str()))
+        .find(|keyword| chapter_keyword_matches(haystack_lower, keyword))
         .map(|k| k.as_str())
+}
+
+fn chapter_keyword_matches(haystack_lower: &str, keyword: &str) -> bool {
+    if keyword.is_empty() {
+        return false;
+    }
+
+    if keyword.len() <= 3 && keyword.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return haystack_lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| token == keyword);
+    }
+
+    haystack_lower.contains(keyword)
 }
 
 fn extract_video_id_from_url(cur_url: &str) -> Option<String> {
@@ -1168,7 +1147,10 @@ fn looks_like_imdb_id(id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_skip_action_for_duration, is_final_chapter, SegmentKind, SkipAction};
+    use super::{
+        chapter_keyword_matches, effective_skip_action_for_duration, is_final_chapter, SegmentKind,
+        SkipAction,
+    };
 
     #[test]
     fn terminal_outro_advances_without_seeking_to_media_tail() {
@@ -1219,5 +1201,14 @@ mod tests {
         assert!(is_final_chapter(3, 4));
         assert!(!is_final_chapter(2, 4));
         assert!(!is_final_chapter(-1, 0));
+    }
+
+    #[test]
+    fn short_chapter_keywords_match_whole_tokens_only() {
+        assert!(chapter_keyword_matches("op", "op"));
+        assert!(chapter_keyword_matches("op - opening theme", "op"));
+        assert!(!chapter_keyword_matches("hope", "op"));
+        assert!(chapter_keyword_matches("ed 1", "ed"));
+        assert!(!chapter_keyword_matches("credits", "ed"));
     }
 }
