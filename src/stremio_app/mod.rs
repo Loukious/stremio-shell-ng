@@ -7,17 +7,16 @@ pub mod stremio_server;
 pub mod stremio_wevbiew;
 pub use ipc::RPCResponse;
 pub mod named_pipe;
+pub mod shell_state;
 pub mod splash;
 pub mod systray;
 pub mod updater;
 pub mod window_helper;
-pub mod window_settings;
 pub use named_pipe::{PipeClient, PipeServer};
 pub mod constants;
 pub mod intro_skip;
 pub mod mpv_hwnd;
 pub mod pip_window;
-pub mod player_settings;
 #[cfg(feature = "steam-sync")]
 pub mod steam_sync;
 #[cfg(not(feature = "steam-sync"))]

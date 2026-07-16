@@ -76,16 +76,16 @@ use crate::stremio_app::{
     ipc::{RPCRequest, RPCResponse},
     mpv_hwnd::find_mpv_child_hwnd,
     pip_window::{PipBuildContext, PipWindow},
+    shell_state::{self, PipPlacement},
     splash::SplashImage,
     stremio_player::{
-        player::{CURRENT_TIME, IS_PAUSED, TOTAL_DURATION},
+        player::{CURRENT_TIME, CURRENT_VOLUME, IS_PAUSED, TOTAL_DURATION},
         Player,
     },
     stremio_wevbiew::{wevbiew::CURRENT_URL, WebView},
     systray::SystemTray,
     updater,
     window_helper::WindowStyle,
-    window_settings::{PipPlacement, WindowSettings},
     PipeServer,
 };
 
@@ -1263,14 +1263,22 @@ impl MainWindow {
                 run_souvlaki_media_keys(safe_hwnd.0, player_channel);
             });
 
+            let (window_settings, restore_fullscreen) = shell_state::load_window_state();
             if let Ok(mut saved_style) = self.saved_window_style.try_borrow_mut() {
                 saved_style.set_title_bar_color(hwnd);
-                if let Some(window_settings) = WindowSettings::load() {
+                if let Some(window_settings) = window_settings {
                     saved_style
                         .restore_window_placement(hwnd, window_settings.to_window_placement());
                 } else {
                     saved_style.center_window(hwnd, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT);
                 }
+                if restore_fullscreen {
+                    saved_style.set_full_screen(hwnd, true);
+                }
+                self.tray.tray_topmost.set_enabled(!saved_style.full_screen);
+                self.tray
+                    .tray_topmost
+                    .set_checked((saved_style.ex_style as u32 & WS_EX_TOPMOST) == WS_EX_TOPMOST);
             }
 
             // Make the title bar follow the Windows dark/light theme and
@@ -1815,16 +1823,14 @@ impl MainWindow {
         self.transmit_window_state_change();
     }
     fn save_window_settings(&self) {
-        if self
-            .saved_window_style
-            .try_borrow()
-            .map(|style| style.full_screen)
-            .unwrap_or(false)
-        {
+        let Ok(saved_style) = self.saved_window_style.try_borrow() else {
             return;
-        }
+        };
+        let fullscreen = saved_style.full_screen;
+        drop(saved_style);
+
         if let Some(hwnd) = self.window.handle.hwnd() {
-            if let Err(err) = WindowSettings::save(hwnd) {
+            if let Err(err) = shell_state::save_window_state(hwnd, fullscreen) {
                 eprintln!("Cannot save window settings: {err}");
             }
         }
@@ -1842,7 +1848,15 @@ impl MainWindow {
                     .unwrap()
                     .take()
                     .unwrap_or(!saved_style.full_screen);
+                if target && !saved_style.full_screen {
+                    if let Err(err) = shell_state::save_window_state(hwnd, false) {
+                        eprintln!("Cannot save window settings before fullscreen: {err}");
+                    }
+                }
                 saved_style.set_full_screen(hwnd, target);
+                if let Err(err) = shell_state::save_window_state(hwnd, saved_style.full_screen) {
+                    eprintln!("Cannot save fullscreen state: {err}");
+                }
                 self.tray.tray_topmost.set_enabled(!saved_style.full_screen);
                 self.tray
                     .tray_topmost
@@ -1916,13 +1930,15 @@ impl MainWindow {
         let Some((x, y, width, height)) = pip_ref.current_placement() else {
             return;
         };
-        let _ = PipPlacement::save(PipPlacement {
+        if let Err(err) = PipPlacement::save(PipPlacement {
             x,
             y,
             width,
             height,
             transparent: pip_ref.transparency_enabled(),
-        });
+        }) {
+            eprintln!("Cannot save picture-in-picture placement: {err}");
+        }
     }
     fn on_hide_splash_notice(&self) {
         self.splash_screen.hide();
@@ -2366,6 +2382,10 @@ impl MainWindow {
             self.save_pip_placement();
         }
         self.save_window_settings();
+        let volume = *CURRENT_VOLUME.lock().unwrap();
+        if let Err(err) = shell_state::save_volume_now(volume) {
+            eprintln!("Cannot save player volume: {err}");
+        }
         nwg::stop_thread_dispatch();
     }
 }

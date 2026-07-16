@@ -1,6 +1,6 @@
 use crate::stremio_app::ipc;
 use crate::stremio_app::mpv_hwnd::find_exact_mpv_child_hwnd;
-use crate::stremio_app::player_settings;
+use crate::stremio_app::shell_state;
 use crate::stremio_app::stremio_wevbiew::wevbiew::set_bound_mpv_keys;
 use crate::stremio_app::RPCResponse;
 use flume::{Receiver, Sender};
@@ -47,8 +47,7 @@ pub static TOTAL_DURATION: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(0.0));
 
 pub static IS_PAUSED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
-pub static CURRENT_VOLUME: Lazy<Mutex<f64>> =
-    Lazy::new(|| Mutex::new(player_settings::DEFAULT_VOLUME));
+pub static CURRENT_VOLUME: Lazy<Mutex<f64>> = Lazy::new(|| Mutex::new(shell_state::DEFAULT_VOLUME));
 
 pub static CACHED_PLAYER_PROPS: Lazy<Mutex<HashMap<String, Value>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -327,7 +326,7 @@ impl PartialUi for Player {
 }
 
 fn create_shareable_mpv(window_handle: HWND) -> Mpv {
-    let initial_volume = player_settings::load_volume();
+    let initial_volume = shell_state::load_volume();
     *CURRENT_VOLUME.lock().unwrap() = initial_volume;
 
     let mpv = Mpv::with_initializer(|initializer| {
@@ -2166,7 +2165,7 @@ fn update_cached_property(name: &str, change: &PropertyData) {
     if name == "volume" {
         if let PropertyData::Double(volume) = change {
             *CURRENT_VOLUME.lock().unwrap() = *volume;
-            player_settings::save_volume_debounced(*volume);
+            shell_state::save_volume_debounced(*volume);
         }
     }
     if name == "time-pos" {
