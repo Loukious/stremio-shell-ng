@@ -1,7 +1,7 @@
 use crate::stremio_app::app::{LobbyRole, LOBBY_ROLE};
 use crate::stremio_app::stremio_player::player::{
-    CURRENT_CHAPTER, CURRENT_CHAPTER_TITLE, CURRENT_TIME, IS_FILE_LOADED, IS_PAUSED, PLAYER_CMD_TX,
-    TOTAL_DURATION,
+    CURRENT_CHAPTER, CURRENT_CHAPTER_COUNT, CURRENT_CHAPTER_TITLE, CURRENT_TIME, IS_FILE_LOADED,
+    IS_PAUSED, PLAYER_CMD_TX, TOTAL_DURATION,
 };
 use crate::stremio_app::stremio_wevbiew::wevbiew::CURRENT_URL;
 use anyhow::Context;
@@ -266,8 +266,9 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
             IS_FILE_LOADED.lock().map(|v| *v).unwrap_or(false),
         );
 
-        let (chapter_idx, chapter_title) = (
+        let (chapter_idx, chapter_count, chapter_title) = (
             CURRENT_CHAPTER.lock().map(|v| *v).unwrap_or(-1),
+            CURRENT_CHAPTER_COUNT.lock().map(|v| *v).unwrap_or(0),
             CURRENT_CHAPTER_TITLE
                 .lock()
                 .map(|s| s.clone())
@@ -300,15 +301,38 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
                     continue;
                 }
 
-                if send_add_chapter(1) {
+                let is_final_outro =
+                    kind == SegmentKind::Outro && is_final_chapter(chapter_idx, chapter_count);
+                let final_outro_target = is_final_outro
+                    .then(|| effective_segment_end(None))
+                    .flatten();
+                let skip_sent = match (is_final_outro, final_outro_target) {
+                    (true, Some(target_sec)) => send_seek_absolute(target_sec),
+                    (true, None) => false,
+                    (false, _) => send_add_chapter(1),
+                };
+
+                if skip_sent {
                     last_skipped_chapter = Some(chapter_idx);
-                    println!(
-                        "⏭️ AutoSkip chapter {}: '{}' (chapter #{}, matched '{}')",
-                        kind.label(),
-                        chapter_title,
-                        chapter_idx,
-                        matched
-                    );
+                    if let Some(target_sec) = final_outro_target {
+                        println!(
+                            "⏭️ AutoSkip final chapter {}: '{}' (chapter #{}/{}, matched '{}') -> {:.3}s",
+                            kind.label(),
+                            chapter_title,
+                            chapter_idx,
+                            chapter_count,
+                            matched,
+                            target_sec
+                        );
+                    } else {
+                        println!(
+                            "⏭️ AutoSkip chapter {}: '{}' (chapter #{}, matched '{}')",
+                            kind.label(),
+                            chapter_title,
+                            chapter_idx,
+                            matched
+                        );
+                    }
                     continue;
                 }
             }
@@ -851,6 +875,10 @@ fn effective_segment_end_for_duration(end_sec: Option<f64>, duration: f64) -> Op
     (target >= 0.0).then_some(target)
 }
 
+fn is_final_chapter(chapter_idx: i64, chapter_count: i64) -> bool {
+    chapter_count > 0 && chapter_idx == chapter_count - 1
+}
+
 fn is_plausible_outro(seg: &SkipSegment) -> bool {
     if seg.kind != SegmentKind::Outro {
         return true;
@@ -1102,7 +1130,9 @@ fn looks_like_imdb_id(id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_segment_end_for_duration, END_OF_FILE_SEEK_GUARD_SECS};
+    use super::{
+        effective_segment_end_for_duration, is_final_chapter, END_OF_FILE_SEEK_GUARD_SECS,
+    };
 
     #[test]
     fn segment_end_is_clamped_before_media_eof() {
@@ -1135,5 +1165,12 @@ mod tests {
             None
         );
         assert_eq!(effective_segment_end_for_duration(None, 0.0), None);
+    }
+
+    #[test]
+    fn final_chapter_detection_uses_zero_based_index() {
+        assert!(is_final_chapter(3, 4));
+        assert!(!is_final_chapter(2, 4));
+        assert!(!is_final_chapter(-1, 0));
     }
 }

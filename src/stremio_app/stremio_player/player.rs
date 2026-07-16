@@ -62,6 +62,9 @@ pub static FFMPEG_VERSION: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new
 /// Current chapter index as reported by mpv (or -1 if unknown / no chapters).
 pub static CURRENT_CHAPTER: Lazy<Mutex<i64>> = Lazy::new(|| Mutex::new(-1));
 
+/// Number of chapters in the current file.
+pub static CURRENT_CHAPTER_COUNT: Lazy<Mutex<i64>> = Lazy::new(|| Mutex::new(0));
+
 /// Current chapter title (from `chapter-metadata/by-key/title`).
 pub static CURRENT_CHAPTER_TITLE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 
@@ -623,6 +626,7 @@ fn create_event_thread(
             ("duration", Format::Double),
             ("pause", Format::Flag),
             ("chapter", Format::Int64),
+            ("chapters", Format::Int64),
             ("chapter-metadata/by-key/title", Format::String),
         ] {
             observe_property(&mpv, name, format);
@@ -1306,6 +1310,7 @@ impl PlayerController {
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
         clear_file_scoped_cached_props();
         *CURRENT_CHAPTER.lock().unwrap() = -1;
+        *CURRENT_CHAPTER_COUNT.lock().unwrap() = 0;
         *CURRENT_CHAPTER_TITLE.lock().unwrap() = String::new();
     }
 
@@ -2176,6 +2181,11 @@ fn update_cached_property(name: &str, change: &PropertyData) {
     if name == "chapter" {
         if let PropertyData::Int64(chapter_idx) = change {
             *CURRENT_CHAPTER.lock().unwrap() = *chapter_idx;
+        }
+    }
+    if name == "chapters" {
+        if let PropertyData::Int64(chapter_count) = change {
+            *CURRENT_CHAPTER_COUNT.lock().unwrap() = *chapter_count;
         }
     }
     if name == "chapter-metadata/by-key/title" {
