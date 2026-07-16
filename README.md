@@ -21,6 +21,7 @@
     * You can change the MPV input config by editing the `input.conf` file in the app's data directory (by default this is the same folder as `stremio-shell-ng.exe`, e.g. `%LOCALAPPDATA%\Programs\Stremio`)
 * IntroDB and TheIntroDB support
 * Auto-chapter skipping based on chapter titles (configurable keywords in `RPCconfig.ini`)
+* Picture in Picture support
 
 
 
