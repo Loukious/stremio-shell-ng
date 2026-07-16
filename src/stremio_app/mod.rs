@@ -17,6 +17,7 @@ pub mod constants;
 pub mod intro_skip;
 pub mod mpv_hwnd;
 pub mod pip_window;
+pub mod player_settings;
 #[cfg(feature = "steam-sync")]
 pub mod steam_sync;
 #[cfg(not(feature = "steam-sync"))]
