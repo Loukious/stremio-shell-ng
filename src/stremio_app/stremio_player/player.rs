@@ -752,17 +752,12 @@ fn create_event_thread(
                         continue;
                     }
 
-                    let stopped_at_media_end = reason == libmpv2::mpv_end_file_reason::Stop
-                        && duration > 0.0
-                        && time >= duration - 1.0;
-
                     if matches!(
                         reason,
                         libmpv2::mpv_end_file_reason::Stop
                             | libmpv2::mpv_end_file_reason::Quit
                             | libmpv2::mpv_end_file_reason::Redirect
-                    ) && !stopped_at_media_end
-                    {
+                    ) {
                         println!("[MPV] Suppressing non-terminal EndFile reason={:?}", reason);
                         continue;
                     }

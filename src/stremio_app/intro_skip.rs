@@ -1,9 +1,10 @@
 use crate::stremio_app::app::{LobbyRole, LOBBY_ROLE};
+use crate::stremio_app::ipc::RPCResponse;
 use crate::stremio_app::stremio_player::player::{
     CURRENT_CHAPTER, CURRENT_CHAPTER_COUNT, CURRENT_CHAPTER_TITLE, CURRENT_TIME, IS_FILE_LOADED,
     IS_PAUSED, PLAYER_CMD_TX, TOTAL_DURATION,
 };
-use crate::stremio_app::stremio_wevbiew::wevbiew::CURRENT_URL;
+use crate::stremio_app::stremio_wevbiew::wevbiew::{CURRENT_URL, WEB_CMD_TX};
 use anyhow::Context;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -14,7 +15,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use urlencoding::decode;
 
-const END_OF_FILE_SEEK_GUARD_SECS: f64 = 0.5;
+const END_OF_FILE_THRESHOLD_SECS: f64 = 0.5;
 
 #[derive(Debug, Clone, Default)]
 pub struct IntroSkipConfig {
@@ -53,6 +54,12 @@ enum SegmentKind {
     Intro,
     Recap,
     Outro,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SkipAction {
+    Seek(f64),
+    NextTrack,
 }
 
 impl SegmentKind {
@@ -303,26 +310,22 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
 
                 let is_final_outro =
                     kind == SegmentKind::Outro && is_final_chapter(chapter_idx, chapter_count);
-                let final_outro_target = is_final_outro
-                    .then(|| effective_segment_end(None))
-                    .flatten();
-                let skip_sent = match (is_final_outro, final_outro_target) {
-                    (true, Some(target_sec)) => send_seek_absolute(target_sec),
-                    (true, None) => false,
-                    (false, _) => send_add_chapter(1),
+                let skip_sent = if is_final_outro {
+                    send_next_track()
+                } else {
+                    send_add_chapter(1)
                 };
 
                 if skip_sent {
                     last_skipped_chapter = Some(chapter_idx);
-                    if let Some(target_sec) = final_outro_target {
+                    if is_final_outro {
                         println!(
-                            "⏭️ AutoSkip final chapter {}: '{}' (chapter #{}/{}, matched '{}') -> {:.3}s",
+                            "⏭️ AutoSkip final chapter {}: '{}' (chapter #{}/{}, matched '{}') -> next track",
                             kind.label(),
                             chapter_title,
                             chapter_idx,
                             chapter_count,
-                            matched,
-                            target_sec
+                            matched
                         );
                     } else {
                         println!(
@@ -367,34 +370,49 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
             let end = seg.segment.end_sec.unwrap_or(f64::INFINITY);
             time_pos + epsilon >= start && time_pos < end
         }) {
-            let target = effective_segment_end(seg.segment.end_sec);
-            if let Some(target_sec) = target {
-                // Bad API timestamps occasionally extend past the actual media duration.
-                // If clamping leaves us at or behind the current position, natural EOF is safer.
-                if target_sec <= time_pos + 0.05 {
-                    skipped_segments.insert(seg.key());
-                    continue;
-                }
+            let action = effective_skip_action(seg.kind, seg.segment.end_sec);
+            if let Some(action) = action {
+                let action_sent = match action {
+                    SkipAction::Seek(target_sec) if target_sec <= time_pos + 0.05 => {
+                        skipped_segments.insert(seg.key());
+                        continue;
+                    }
+                    SkipAction::Seek(target_sec) => send_seek_absolute(target_sec),
+                    SkipAction::NextTrack => send_next_track(),
+                };
 
-                if send_seek_absolute(target_sec) {
+                if action_sent {
                     skipped_segments.insert(seg.key());
 
                     let media_text = current_media
                         .as_ref()
                         .map(format_media_key)
                         .unwrap_or_else(|| "<unknown media>".to_string());
-                    println!(
-                        "⏭️ AutoSkip {} ({}) {} -> {:.3}s (segment {:.3}-{})",
-                        seg.kind.label(),
-                        seg.api.label(),
-                        media_text,
-                        target_sec,
-                        seg.segment.start_sec,
-                        seg.segment
-                            .end_sec
-                            .map(|v| format!("{v:.3}"))
-                            .unwrap_or_else(|| "end".to_string())
-                    );
+                    match action {
+                        SkipAction::Seek(target_sec) => println!(
+                            "⏭️ AutoSkip {} ({}) {} -> {:.3}s (segment {:.3}-{})",
+                            seg.kind.label(),
+                            seg.api.label(),
+                            media_text,
+                            target_sec,
+                            seg.segment.start_sec,
+                            seg.segment
+                                .end_sec
+                                .map(|v| format!("{v:.3}"))
+                                .unwrap_or_else(|| "end".to_string())
+                        ),
+                        SkipAction::NextTrack => println!(
+                            "⏭️ AutoSkip {} ({}) {} -> next track (segment {:.3}-{})",
+                            seg.kind.label(),
+                            seg.api.label(),
+                            media_text,
+                            seg.segment.start_sec,
+                            seg.segment
+                                .end_sec
+                                .map(|v| format!("{v:.3}"))
+                                .unwrap_or_else(|| "end".to_string())
+                        ),
+                    }
                 }
             } else {
                 // End is unknown and duration isn't available yet.
@@ -856,23 +874,33 @@ fn parse_theintrodb_ranges(
     out
 }
 
-fn effective_segment_end(end_sec: Option<f64>) -> Option<f64> {
+fn effective_skip_action(kind: SegmentKind, end_sec: Option<f64>) -> Option<SkipAction> {
     let duration = TOTAL_DURATION.lock().map(|d| *d).unwrap_or(0.0);
-    effective_segment_end_for_duration(end_sec, duration)
+    effective_skip_action_for_duration(kind, end_sec, duration)
 }
 
-fn effective_segment_end_for_duration(end_sec: Option<f64>, duration: f64) -> Option<f64> {
-    let media_end = (duration.is_finite() && duration > END_OF_FILE_SEEK_GUARD_SECS)
-        .then_some(duration - END_OF_FILE_SEEK_GUARD_SECS);
+fn effective_skip_action_for_duration(
+    kind: SegmentKind,
+    end_sec: Option<f64>,
+    duration: f64,
+) -> Option<SkipAction> {
+    if kind == SegmentKind::Outro && end_sec.is_none() {
+        return Some(SkipAction::NextTrack);
+    }
 
-    let target = match (end_sec, media_end) {
-        (Some(end), Some(media_end)) if end.is_finite() => end.min(media_end),
-        (Some(end), None) if end.is_finite() => end,
-        (None, Some(media_end)) => media_end,
-        _ => return None,
-    };
+    let end_sec = end_sec.filter(|end| end.is_finite() && *end >= 0.0)?;
+    let has_duration = duration.is_finite() && duration > END_OF_FILE_THRESHOLD_SECS;
+    if has_duration && end_sec > duration {
+        return (kind == SegmentKind::Outro).then_some(SkipAction::NextTrack);
+    }
+    if kind == SegmentKind::Outro
+        && has_duration
+        && end_sec >= duration - END_OF_FILE_THRESHOLD_SECS
+    {
+        return Some(SkipAction::NextTrack);
+    }
 
-    (target >= 0.0).then_some(target)
+    Some(SkipAction::Seek(end_sec))
 }
 
 fn is_final_chapter(chapter_idx: i64, chapter_count: i64) -> bool {
@@ -1029,6 +1057,16 @@ fn send_add_chapter(delta: i64) -> bool {
     false
 }
 
+fn send_next_track() -> bool {
+    if let Ok(guard) = WEB_CMD_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            return tx.send(RPCResponse::media_key("next-track")).is_ok();
+        }
+    }
+
+    false
+}
+
 fn segment_kind_from_chapter_title<'a>(
     title_lower: &str,
     config: &'a IntroSkipConfig,
@@ -1130,41 +1168,50 @@ fn looks_like_imdb_id(id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        effective_segment_end_for_duration, is_final_chapter, END_OF_FILE_SEEK_GUARD_SECS,
-    };
+    use super::{effective_skip_action_for_duration, is_final_chapter, SegmentKind, SkipAction};
 
     #[test]
-    fn segment_end_is_clamped_before_media_eof() {
+    fn terminal_outro_advances_without_seeking_to_media_tail() {
         assert_eq!(
-            effective_segment_end_for_duration(Some(2_835.0), 2_832.121),
-            Some(2_832.121 - END_OF_FILE_SEEK_GUARD_SECS)
+            effective_skip_action_for_duration(SegmentKind::Outro, Some(2_835.0), 2_832.121),
+            Some(SkipAction::NextTrack)
+        );
+        assert_eq!(
+            effective_skip_action_for_duration(SegmentKind::Outro, None, 0.0),
+            Some(SkipAction::NextTrack)
         );
     }
 
     #[test]
     fn valid_segment_end_is_preserved() {
         assert_eq!(
-            effective_segment_end_for_duration(Some(254.0), 2_832.121),
-            Some(254.0)
+            effective_skip_action_for_duration(SegmentKind::Intro, Some(254.0), 2_832.121),
+            Some(SkipAction::Seek(254.0))
         );
     }
 
     #[test]
-    fn media_duration_supplies_unknown_segment_end() {
+    fn nonterminal_outro_still_seeks_to_its_explicit_end() {
         assert_eq!(
-            effective_segment_end_for_duration(None, 100.0),
-            Some(100.0 - END_OF_FILE_SEEK_GUARD_SECS)
+            effective_skip_action_for_duration(SegmentKind::Outro, Some(90.0), 100.0),
+            Some(SkipAction::Seek(90.0))
         );
     }
 
     #[test]
-    fn invalid_end_without_duration_is_rejected() {
+    fn invalid_non_outro_end_is_rejected() {
         assert_eq!(
-            effective_segment_end_for_duration(Some(f64::NAN), 0.0),
+            effective_skip_action_for_duration(SegmentKind::Intro, Some(f64::NAN), 0.0),
             None
         );
-        assert_eq!(effective_segment_end_for_duration(None, 0.0), None);
+        assert_eq!(
+            effective_skip_action_for_duration(SegmentKind::Recap, None, 100.0),
+            None
+        );
+        assert_eq!(
+            effective_skip_action_for_duration(SegmentKind::Intro, Some(101.0), 100.0),
+            None
+        );
     }
 
     #[test]
