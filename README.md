@@ -17,6 +17,8 @@
     * Supports lua scripts
         * You can add lua scripts to the `scripts` directory in mpv's data directory (by default it's in `%appdata%\mpv\scripts`)
         * Script example: [To skip intros](https://raw.githubusercontent.com/Loukious/auto_skip_anime_intro/refs/heads/main/auto_skip_anime_intro.lua)
+* Unlocked MPV input config:
+    * You can change the MPV input config by editing the `input.conf` file in the app's data directory (by default this is the same folder as `stremio-shell-ng.exe`, e.g. `%LOCALAPPDATA%\Programs\Stremio`)
 * IntroDB and TheIntroDB support
 * Auto-chapter skipping based on chapter titles (configurable keywords in `RPCconfig.ini`)
 
