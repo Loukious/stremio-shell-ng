@@ -197,9 +197,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
     let mut required_file_epoch: Option<u64> = None;
     let mut current_media: Option<MediaKey> = None;
     let mut current_segments: Option<Vec<SkipSegment>> = None;
-    let mut skipped_segments: HashSet<SegmentKey> = HashSet::new();
-
-    let mut last_skipped_chapter: Option<i64> = None;
+    let mut skip_history = SkipHistory::default();
 
     let mut next_resolve_at = Instant::now();
 
@@ -228,8 +226,6 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
             last_player_route = maybe_player_route;
             current_media = None;
             current_segments = None;
-            skipped_segments.clear();
-            last_skipped_chapter = None;
             next_resolve_at = Instant::now();
 
             required_file_epoch = maybe_video_id.as_ref().map(|_| {
@@ -281,10 +277,8 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         // --- Chapter-based skipping ---
         // Some files include named chapters like "Opening", "Logo", "Credits".
         // When detected, jump to the next chapter.
-        if chapter_idx >= 0
-            && Some(chapter_idx) != last_skipped_chapter
-            && !chapter_title.trim().is_empty()
-        {
+        let chapter_was_skipped = skip_history.chapter_was_skipped(video_id, chapter_idx);
+        if chapter_idx >= 0 && !chapter_was_skipped && !chapter_title.trim().is_empty() {
             let t = chapter_title.trim().to_lowercase();
             if let Some((kind, matched)) = segment_kind_from_chapter_title(&t, &config) {
                 let is_final_outro =
@@ -296,7 +290,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
                 };
 
                 if skip_sent {
-                    last_skipped_chapter = Some(chapter_idx);
+                    skip_history.remember_chapter(video_id, chapter_idx);
                     if is_final_outro {
                         println!(
                             "⏭️ AutoSkip final chapter {}: '{}' (chapter #{}/{}, matched '{}') -> next track",
@@ -361,7 +355,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         let epsilon = 1.0_f64;
 
         if let Some(seg) = segments.iter().find(|seg| {
-            if skipped_segments.contains(&seg.key()) {
+            if skip_history.segment_was_skipped(video_id, seg.key()) {
                 return false;
             }
             if !config.segment_enabled(seg.kind) {
@@ -380,7 +374,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
             if let Some(action) = action {
                 let action_sent = match action {
                     SkipAction::Seek(target_sec) if target_sec <= time_pos + 0.05 => {
-                        skipped_segments.insert(seg.key());
+                        skip_history.remember_segment(video_id, seg.key());
                         continue;
                     }
                     SkipAction::Seek(target_sec) => send_seek_absolute(target_sec),
@@ -388,7 +382,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
                 };
 
                 if action_sent {
-                    skipped_segments.insert(seg.key());
+                    skip_history.remember_segment(video_id, seg.key());
 
                     let media_text = current_media
                         .as_ref()
@@ -439,6 +433,47 @@ struct SegmentKey {
     kind: SegmentKind,
     start_ms: i64,
     end_ms: i64,
+}
+
+#[derive(Default)]
+struct VideoSkipHistory {
+    chapters: HashSet<i64>,
+    segments: HashSet<SegmentKey>,
+}
+
+#[derive(Default)]
+struct SkipHistory {
+    videos: HashMap<String, VideoSkipHistory>,
+}
+
+impl SkipHistory {
+    fn chapter_was_skipped(&self, video_id: &str, chapter_idx: i64) -> bool {
+        self.videos
+            .get(video_id)
+            .is_some_and(|history| history.chapters.contains(&chapter_idx))
+    }
+
+    fn remember_chapter(&mut self, video_id: &str, chapter_idx: i64) {
+        self.videos
+            .entry(video_id.to_string())
+            .or_default()
+            .chapters
+            .insert(chapter_idx);
+    }
+
+    fn segment_was_skipped(&self, video_id: &str, segment: SegmentKey) -> bool {
+        self.videos
+            .get(video_id)
+            .is_some_and(|history| history.segments.contains(&segment))
+    }
+
+    fn remember_segment(&mut self, video_id: &str, segment: SegmentKey) {
+        self.videos
+            .entry(video_id.to_string())
+            .or_default()
+            .segments
+            .insert(segment);
+    }
 }
 
 impl SkipSegment {
@@ -1167,9 +1202,29 @@ fn looks_like_imdb_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        chapter_keyword_matches, effective_skip_action_for_duration, is_final_chapter, SegmentKind,
-        SkipAction,
+        chapter_keyword_matches, effective_skip_action_for_duration, is_final_chapter, SegmentKey,
+        SegmentKind, SkipAction, SkipHistory,
     };
+
+    #[test]
+    fn skip_history_keeps_manual_rewinds_opted_in_for_the_session() {
+        let mut history = SkipHistory::default();
+        let video_id = "tt1234567:1:2";
+        let intro = SegmentKey {
+            kind: SegmentKind::Intro,
+            start_ms: 0,
+            end_ms: 90_000,
+        };
+
+        history.remember_chapter(video_id, 0);
+        history.remember_chapter(video_id, 1);
+        history.remember_segment(video_id, intro);
+
+        assert!(history.chapter_was_skipped(video_id, 0));
+        assert!(history.chapter_was_skipped(video_id, 1));
+        assert!(history.segment_was_skipped(video_id, intro));
+        assert!(!history.chapter_was_skipped("tt1234567:1:3", 0));
+    }
 
     #[test]
     fn terminal_outro_advances_without_seeking_to_media_tail() {
