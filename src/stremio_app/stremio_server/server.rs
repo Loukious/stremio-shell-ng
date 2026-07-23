@@ -177,7 +177,13 @@ impl StremioServer {
 
         // The bundled runtime is a child of this desktop process, so the
         // WebUI should always reach it through the local loopback interface.
-        let server_url = rx.recv().unwrap();
+        let server_url = match rx.recv() {
+            Ok(server_url) => server_url,
+            Err(err) => {
+                eprintln!("Stremio runtime exited before advertising its endpoint: {err}");
+                return None;
+            }
+        };
         if let Ok(mut stored_url) = self.server_url.lock() {
             *stored_url = Some(server_url.clone());
         }
@@ -238,8 +244,11 @@ impl PartialUi for StremioServer {
             .parent(data.parent)
             .build(&mut data.crash_notice)
             .ok();
-        let _ = data.start();
-        println!("Stremio server started");
+        if data.start().is_some() {
+            println!("Stremio server started");
+        } else {
+            eprintln!("Stremio server failed to start");
+        }
         Ok(())
     }
     fn process_event<'a>(
