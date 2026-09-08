@@ -139,6 +139,59 @@ fn is_on_player_page() -> bool {
         .unwrap_or(false)
 }
 
+const DISCORD_RPC_DEFAULT_SCRIPT: &str = r##"
+;(function(){
+    if (window.self !== window.top) return;
+    if (window.__stremioShellDiscordDefaultInstalled) return;
+    window.__stremioShellDiscordDefaultInstalled = true;
+
+    var attempts = 0;
+    function reportApplied(){
+        try {
+            window.chrome.webview.postMessage(JSON.stringify({
+                id: 1,
+                args: ['shell-discord-default-applied', {}]
+            }));
+        } catch (_) {}
+    }
+
+    async function applyDefault(){
+        attempts += 1;
+        if (!window.core || typeof window.core.getState !== 'function' ||
+            typeof window.core.dispatch !== 'function') {
+            if (attempts < 120) setTimeout(applyDefault, 250);
+            return;
+        }
+
+        try {
+            var ctx = await window.core.getState('ctx');
+            var profile = ctx && ctx.profile;
+            var settings = profile && profile.settings;
+            if (!settings) {
+                if (attempts < 120) setTimeout(applyDefault, 250);
+                return;
+            }
+
+            if (settings.discordRpcEnabled !== true) {
+                await window.core.dispatch({
+                    action: 'Ctx',
+                    args: {
+                        action: 'UpdateSettings',
+                        args: Object.assign({}, settings, { discordRpcEnabled: true })
+                    }
+                });
+            }
+
+            reportApplied();
+        } catch (_) {
+            if (attempts < 120) setTimeout(applyDefault, 500);
+        }
+    }
+
+    applyDefault();
+})();
+"##;
+
 const PIP_BUTTON_SCRIPT: &str = r##"
 ;(function(){
     if (window.self !== window.top) return;
@@ -591,6 +644,10 @@ impl PartialUi for WebView {
                                 }
                             }catch(e){}
                             "##, |_| Ok(())).expect("Cannot add script to webview");
+                            if crate::stremio_app::shell_state::should_apply_discord_rpc_default() {
+                                wv.execute_script(DISCORD_RPC_DEFAULT_SCRIPT, |_| Ok(()))
+                                    .expect("Cannot apply Discord RPC default in webview");
+                            }
                             wv.execute_script(PIP_BUTTON_SCRIPT, |_| Ok(()))
                                 .expect("Cannot add PiP button script to webview");
                             let mpv_keydown_js = build_mpv_keydown_script();

@@ -17,7 +17,7 @@ const SHELL_STATE_FILE: &str = "shell-state.json";
 const LEGACY_WINDOW_STATE_FILE: &str = "window-state.json";
 const LEGACY_PIP_STATE_FILE: &str = "pip-state.json";
 const LEGACY_PLAYER_STATE_FILE: &str = "player-state.json";
-const SHELL_STATE_VERSION: u32 = 1;
+const SHELL_STATE_VERSION: u32 = 2;
 const VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 pub const DEFAULT_VOLUME: f64 = 100.0;
 const MAX_VOLUME: f64 = 130.0;
@@ -130,6 +130,8 @@ struct ShellState {
     pip: Option<PipPlacement>,
     #[serde(default = "default_volume")]
     volume: f64,
+    #[serde(default)]
+    discord_rpc_default_applied: bool,
 }
 
 impl Default for ShellState {
@@ -140,6 +142,7 @@ impl Default for ShellState {
             fullscreen: false,
             pip: None,
             volume: DEFAULT_VOLUME,
+            discord_rpc_default_applied: false,
         }
     }
 }
@@ -212,6 +215,14 @@ pub fn save_volume_debounced(volume: f64) {
 pub fn save_volume_now(volume: f64) -> io::Result<()> {
     let volume = sanitize_volume(volume);
     update_shell_state(|state| state.volume = volume)
+}
+
+pub fn should_apply_discord_rpc_default() -> bool {
+    !shell_state_lock().discord_rpc_default_applied
+}
+
+pub fn mark_discord_rpc_default_applied() -> io::Result<()> {
+    update_shell_state(|state| state.discord_rpc_default_applied = true)
 }
 
 fn volume_save_loop(rx: Receiver<f64>) {
@@ -441,6 +452,7 @@ mod tests {
                 transparent: true,
             }),
             volume: 47.25,
+            discord_rpc_default_applied: true,
             ..ShellState::default()
         };
 
@@ -448,6 +460,13 @@ mod tests {
         assert_eq!(read_json::<ShellState>(&paths.current), Some(state));
 
         fs::remove_dir_all(paths.current.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn existing_state_receives_pending_discord_rpc_default() {
+        let state: ShellState = serde_json::from_str(r#"{"version":1,"volume":100.0}"#).unwrap();
+
+        assert!(!state.discord_rpc_default_applied);
     }
 
     #[test]

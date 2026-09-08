@@ -1781,6 +1781,11 @@ impl MainWindow {
                         discord_control_tx.send(false).ok();
                         web_tx_web.send(RPCResponse::discord_status(false)).ok();
                     }
+                    Some("shell-discord-default-applied") => {
+                        if let Err(error) = shell_state::mark_discord_rpc_default_applied() {
+                            eprintln!("Cannot save Discord RPC default state: {error}");
+                        }
+                    }
                     // Our presence derives richer activity from shell state. Consume the Web UI's
                     // official activity messages so it cannot start a second Discord presence.
                     Some("discord-set-activity" | "discord-clear-activity") => {}
