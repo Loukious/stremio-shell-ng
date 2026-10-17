@@ -208,11 +208,18 @@ const PIP_BUTTON_SCRIPT: &str = r##"
         return (location.hash || '').indexOf('/player') !== -1;
     }
 
+    function isFullscreenControl(el){
+        if (!el) return false;
+        var hint = ((el.getAttribute('title') || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+        return hint.indexOf('fullscreen') !== -1
+            || hint.indexOf('full screen') !== -1
+            || hint.indexOf('pantalla completa') !== -1;
+    }
+
     function findFullscreenBtn(){
-        var els = document.querySelectorAll('[title]');
+        var els = document.querySelectorAll('[title],[aria-label]');
         for (var i = 0; i < els.length; i++){
-            var title = (els[i].getAttribute('title') || '').toLowerCase();
-            if (title.indexOf('fullscreen') !== -1){
+            if (isFullscreenControl(els[i])){
                 var rect = els[i].getBoundingClientRect();
                 if (rect.width > 0 && rect.height > 0) return els[i];
             }
@@ -278,6 +285,8 @@ const PIP_BUTTON_SCRIPT: &str = r##"
     } catch (_) {}
 })();
 "##;
+
+const INTRO_SKIP_CONTROLS_SCRIPT: &str = include_str!("intro_skip.js");
 
 /// Build the JavaScript that translates layout-aware `keydown` events into
 /// mpv key names. It forwards active bindings and, when sequences exist, the
@@ -650,6 +659,8 @@ impl PartialUi for WebView {
                             }
                             wv.execute_script(PIP_BUTTON_SCRIPT, |_| Ok(()))
                                 .expect("Cannot add PiP button script to webview");
+                            wv.execute_script(INTRO_SKIP_CONTROLS_SCRIPT, |_| Ok(()))
+                                .expect("Cannot add intro skip controls script to webview");
                             let mpv_keydown_js = build_mpv_keydown_script();
                             wv.execute_script(&mpv_keydown_js, |_| Ok(()))
                                 .expect("Cannot add mpv keydown script to webview");

@@ -6,13 +6,16 @@ use crate::stremio_app::stremio_player::player::{
 };
 use crate::stremio_app::stremio_wevbiew::wevbiew::{CURRENT_URL, WEB_CMD_TX};
 use anyhow::Context;
+use once_cell::sync::Lazy;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde::Deserialize;
+use serde_json::json;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use urlencoding::decode;
 
@@ -27,6 +30,10 @@ pub struct IntroSkipConfig {
     pub skip_intro: bool,
     pub skip_recap: bool,
     pub skip_outro: bool,
+
+    /// Show a manual player button for intros/outros instead of skipping them immediately.
+    /// Recaps keep using the normal automatic behavior.
+    pub manual_intro_outro: bool,
 
     /// Chapter-title keyword lists (case-insensitive substring matches).
     /// Loaded from `[AutoSkipChapters] intro/recap/outro` in `RPCconfig.ini`.
@@ -61,6 +68,68 @@ enum SegmentKind {
 enum SkipAction {
     Seek(f64),
     NextTrack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ManualSkipAction {
+    AddChapter(i64),
+    Seek(f64),
+    NextTrack,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ManualSkipOffer {
+    route: String,
+    file_epoch: u64,
+    kind: SegmentKind,
+    action: ManualSkipAction,
+    area: ManualSkipArea,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ManualSkipArea {
+    Chapter(i64),
+    Segment(SegmentKey),
+}
+
+struct ManualSkipState {
+    offer: ManualSkipOffer,
+    requested: bool,
+}
+
+static MANUAL_SKIP_OFFER: Lazy<Mutex<Option<ManualSkipState>>> = Lazy::new(|| Mutex::new(None));
+static MANUAL_INTRO_OUTRO_ENABLED: AtomicBool = AtomicBool::new(false);
+
+impl ManualSkipOffer {
+    fn matches_playback(&self, route: &str, file_epoch: u64, chapter: i64, time: f64) -> bool {
+        self.route == route
+            && self.file_epoch == file_epoch
+            && match self.area {
+                ManualSkipArea::Chapter(expected) => chapter == expected,
+                ManualSkipArea::Segment(segment) => {
+                    time.is_finite()
+                        && time + 1.0 >= segment.start_ms as f64 / 1000.0
+                        && (segment.end_ms < 0 || time < segment.end_ms as f64 / 1000.0)
+                }
+            }
+    }
+
+    fn is_current(&self) -> bool {
+        manual_intro_outro_enabled()
+            && LOBBY_ROLE
+                .lock()
+                .is_ok_and(|role| *role != LobbyRole::Guest)
+            && IS_FILE_LOADED.lock().is_ok_and(|loaded| *loaded)
+            && self.matches_playback(
+                &CURRENT_URL
+                    .lock()
+                    .map(|url| url.clone())
+                    .unwrap_or_default(),
+                FILE_LOAD_EPOCH.load(AtomicOrdering::Acquire),
+                CURRENT_CHAPTER.lock().map(|chapter| *chapter).unwrap_or(-1),
+                CURRENT_TIME.lock().map(|time| *time).unwrap_or(f64::NAN),
+            )
+    }
 }
 
 impl SegmentKind {
@@ -176,6 +245,7 @@ struct KitsuVideo {
 }
 
 pub fn spawn_intro_skip_loop(config: IntroSkipConfig) -> std::thread::JoinHandle<()> {
+    MANUAL_INTRO_OUTRO_ENABLED.store(config.manual_intro_outro, AtomicOrdering::Release);
     std::thread::spawn(move || run_intro_skip_loop(config))
 }
 
@@ -208,6 +278,21 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
     loop {
         std::thread::sleep(Duration::from_millis(250));
 
+        let invalid_offer = MANUAL_SKIP_OFFER.lock().is_ok_and(|mut state| {
+            if state
+                .as_ref()
+                .is_some_and(|state| !state.offer.is_current())
+            {
+                state.take();
+                true
+            } else {
+                false
+            }
+        });
+        if invalid_offer {
+            send_manual_skip_state(false, None);
+        }
+
         if !config.enabled {
             continue;
         }
@@ -223,6 +308,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         let maybe_player_route = maybe_video_id.as_ref().map(|_| cur_url.clone());
 
         if maybe_player_route != last_player_route {
+            clear_manual_skip_offer();
             last_player_route = maybe_player_route;
             current_media = None;
             current_segments = None;
@@ -246,6 +332,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
 
         // Not in player -> nothing to do.
         let Some(video_id) = maybe_video_id.as_ref() else {
+            clear_manual_skip_offer();
             continue;
         };
 
@@ -278,11 +365,30 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         // Some files include named chapters like "Opening", "Logo", "Credits".
         // When detected, jump to the next chapter.
         let chapter_was_skipped = skip_history.chapter_was_skipped(video_id, chapter_idx);
-        if chapter_idx >= 0 && !chapter_was_skipped && !chapter_title.trim().is_empty() {
+        if chapter_idx >= 0 && !chapter_title.trim().is_empty() {
             let t = chapter_title.trim().to_lowercase();
-            if let Some((kind, matched)) = segment_kind_from_chapter_title(&t, &config) {
+            if let Some((kind, matched)) = segment_kind_from_chapter_title(&t, &config)
+                .filter(|(kind, _)| !chapter_was_skipped || manual_skip_enabled_for(*kind))
+            {
                 let is_final_outro =
                     kind == SegmentKind::Outro && is_final_chapter(chapter_idx, chapter_count);
+
+                if manual_skip_enabled_for(kind) {
+                    let action = if is_final_outro {
+                        ManualSkipAction::NextTrack
+                    } else {
+                        ManualSkipAction::AddChapter(1)
+                    };
+                    set_manual_skip_offer(ManualSkipOffer {
+                        route: cur_url.clone(),
+                        file_epoch,
+                        kind,
+                        action,
+                        area: ManualSkipArea::Chapter(chapter_idx),
+                    });
+                    continue;
+                }
+
                 let skip_sent = if is_final_outro {
                     send_next_track()
                 } else {
@@ -291,6 +397,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
 
                 if skip_sent {
                     skip_history.remember_chapter(video_id, chapter_idx);
+                    send_auto_skip_notification(kind);
                     if is_final_outro {
                         println!(
                             "⏭️ AutoSkip final chapter {}: '{}' (chapter #{}/{}, matched '{}') -> next track",
@@ -343,10 +450,12 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
 
         // --- Segment-based skipping (IntroDB / TheIntroDB) ---
         let Some(segments) = current_segments.as_ref() else {
+            clear_manual_skip_offer();
             continue;
         };
 
         if segments.is_empty() {
+            clear_manual_skip_offer();
             continue;
         }
 
@@ -355,7 +464,9 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         let epsilon = 1.0_f64;
 
         if let Some(seg) = segments.iter().find(|seg| {
-            if skip_history.segment_was_skipped(video_id, seg.key()) {
+            if skip_history.segment_was_skipped(video_id, seg.key())
+                && !manual_skip_enabled_for(seg.kind)
+            {
                 return false;
             }
             if !config.segment_enabled(seg.kind) {
@@ -372,6 +483,25 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         }) {
             let action = effective_skip_action(seg.kind, seg.segment.end_sec);
             if let Some(action) = action {
+                if manual_skip_enabled_for(seg.kind) {
+                    let manual_action = match action {
+                        SkipAction::Seek(target_sec) if target_sec <= time_pos + 0.05 => {
+                            clear_manual_skip_offer();
+                            continue;
+                        }
+                        SkipAction::Seek(target_sec) => ManualSkipAction::Seek(target_sec),
+                        SkipAction::NextTrack => ManualSkipAction::NextTrack,
+                    };
+                    set_manual_skip_offer(ManualSkipOffer {
+                        route: cur_url.clone(),
+                        file_epoch,
+                        kind: seg.kind,
+                        action: manual_action,
+                        area: ManualSkipArea::Segment(seg.key()),
+                    });
+                    continue;
+                }
+
                 let action_sent = match action {
                     SkipAction::Seek(target_sec) if target_sec <= time_pos + 0.05 => {
                         skip_history.remember_segment(video_id, seg.key());
@@ -383,6 +513,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
 
                 if action_sent {
                     skip_history.remember_segment(video_id, seg.key());
+                    send_auto_skip_notification(seg.kind);
 
                     let media_text = current_media
                         .as_ref()
@@ -417,6 +548,8 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
             } else {
                 // End is unknown and duration isn't available yet.
             }
+        } else {
+            clear_manual_skip_offer();
         }
     }
 }
@@ -1086,6 +1219,139 @@ fn send_next_track() -> bool {
     false
 }
 
+fn send_auto_skip_notification(kind: SegmentKind) {
+    if !matches!(kind, SegmentKind::Intro | SegmentKind::Outro) {
+        return;
+    }
+    if let Ok(guard) = WEB_CMD_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            tx.send(RPCResponse::response_message(Some(json!([
+                "shell-auto-skip",
+                { "kind": kind.label() }
+            ]))))
+            .ok();
+        }
+    }
+}
+
+fn send_manual_skip_state(visible: bool, kind: Option<SegmentKind>) {
+    let label = kind.map(|value| value.label()).unwrap_or_default();
+    if let Ok(guard) = WEB_CMD_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            tx.send(RPCResponse::response_message(Some(json!([
+                "shell-manual-skip-state",
+                {
+                    "visible": visible,
+                    "kind": label,
+                }
+            ]))))
+            .ok();
+        }
+    }
+}
+
+pub fn manual_intro_outro_enabled() -> bool {
+    MANUAL_INTRO_OUTRO_ENABLED.load(AtomicOrdering::Acquire)
+}
+
+fn manual_skip_enabled_for(kind: SegmentKind) -> bool {
+    manual_intro_outro_enabled() && matches!(kind, SegmentKind::Intro | SegmentKind::Outro)
+}
+
+pub fn send_intro_skip_mode_state(error: bool) {
+    let mode = if manual_intro_outro_enabled() {
+        "manual"
+    } else {
+        "auto"
+    };
+
+    if let Ok(guard) = WEB_CMD_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            tx.send(RPCResponse::response_message(Some(json!([
+                "shell-intro-skip-mode-state",
+                { "mode": mode, "error": error }
+            ]))))
+            .ok();
+        }
+    }
+}
+
+pub fn set_manual_intro_outro_enabled(enabled: bool) {
+    MANUAL_INTRO_OUTRO_ENABLED.store(enabled, AtomicOrdering::Release);
+    if !enabled {
+        clear_manual_skip_offer();
+    }
+    send_intro_skip_mode_state(false);
+}
+
+fn set_manual_skip_offer(offer: ManualSkipOffer) {
+    if !offer.is_current() {
+        return;
+    }
+    let kind = offer.kind;
+    if let Ok(mut guard) = MANUAL_SKIP_OFFER.lock() {
+        if guard.as_ref().is_some_and(|state| state.offer == offer) {
+            return;
+        }
+        *guard = Some(ManualSkipState {
+            offer,
+            requested: false,
+        });
+    } else {
+        return;
+    }
+
+    send_manual_skip_state(true, Some(kind));
+}
+
+fn clear_manual_skip_offer() {
+    let had_offer = MANUAL_SKIP_OFFER
+        .lock()
+        .map(|mut guard| guard.take().is_some())
+        .unwrap_or(false);
+
+    if had_offer {
+        send_manual_skip_state(false, None);
+    }
+}
+
+pub fn trigger_manual_skip() -> bool {
+    let offer = MANUAL_SKIP_OFFER.lock().ok().and_then(|mut guard| {
+        let state = guard.as_mut()?;
+        if state.requested || !state.offer.is_current() {
+            return None;
+        }
+        // Keep the offer latched until MPV actually leaves its chapter/segment.
+        state.requested = true;
+        Some(state.offer.clone())
+    });
+
+    let Some(offer) = offer else {
+        return false;
+    };
+
+    let sent = match offer.action {
+        ManualSkipAction::AddChapter(delta) => send_add_chapter(delta),
+        ManualSkipAction::Seek(target_sec) => send_seek_absolute(target_sec),
+        ManualSkipAction::NextTrack => send_next_track(),
+    };
+
+    if sent {
+        send_manual_skip_state(false, None);
+        println!(
+            "⏭️ ManualSkip {} requested for {}",
+            offer.kind.label(),
+            offer.route
+        );
+    } else if let Ok(mut guard) = MANUAL_SKIP_OFFER.lock() {
+        if let Some(state) = guard.as_mut().filter(|state| state.offer == offer) {
+            state.requested = false;
+        }
+    }
+
+    sent
+}
+
 fn segment_kind_from_chapter_title<'a>(
     title_lower: &str,
     config: &'a IntroSkipConfig,
@@ -1205,6 +1471,95 @@ mod tests {
         chapter_keyword_matches, effective_skip_action_for_duration, is_final_chapter, SegmentKey,
         SegmentKind, SkipAction, SkipHistory,
     };
+
+    #[test]
+    fn auto_skip_notifications_only_include_openings_and_endings() {
+        use super::{send_auto_skip_notification, WEB_CMD_TX};
+        let (tx, rx) = flume::unbounded();
+        *WEB_CMD_TX.lock().unwrap() = Some(tx);
+        send_auto_skip_notification(SegmentKind::Intro);
+        send_auto_skip_notification(SegmentKind::Recap);
+        send_auto_skip_notification(SegmentKind::Outro);
+        *WEB_CMD_TX.lock().unwrap() = None;
+        let notifications: Vec<_> = rx
+            .try_iter()
+            .map(|message| serde_json::from_str::<serde_json::Value>(&message).unwrap())
+            .filter(|message| message["args"][0] == "shell-auto-skip")
+            .map(|message| message["args"][1]["kind"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(notifications, ["intro", "outro"]);
+    }
+
+    #[test]
+    fn manual_offer_expires_on_seek_chapter_route_or_file_change() {
+        use super::{ManualSkipAction, ManualSkipArea, ManualSkipOffer};
+        let mut offer = ManualSkipOffer {
+            route: "episode-one".into(),
+            file_epoch: 4,
+            kind: SegmentKind::Intro,
+            action: ManualSkipAction::Seek(90.0),
+            area: ManualSkipArea::Segment(SegmentKey {
+                kind: SegmentKind::Intro,
+                start_ms: 10_000,
+                end_ms: 90_000,
+            }),
+        };
+        assert!(offer.matches_playback("episode-one", 4, 1, 10.0));
+        assert!(!offer.matches_playback("episode-one", 4, 1, 120.0));
+        assert!(!offer.matches_playback("episode-one", 4, 1, 0.0));
+        assert!(!offer.matches_playback("episode-two", 4, 1, 10.0));
+        assert!(!offer.matches_playback("episode-one", 5, 1, 10.0));
+        assert!(!offer.matches_playback("episode-one", 4, 1, f64::NAN));
+        offer.area = ManualSkipArea::Chapter(1);
+        assert!(offer.matches_playback("episode-one", 4, 1, 10.0));
+        assert!(!offer.matches_playback("episode-one", 4, 2, 10.0));
+    }
+
+    #[test]
+    fn manual_skip_rejects_stale_and_guest_offers_and_suppresses_repeat_clicks() {
+        use super::*;
+        let (tx, rx) = flume::unbounded();
+        *PLAYER_CMD_TX.lock().unwrap() = Some(tx);
+        *CURRENT_URL.lock().unwrap() = "episode-one".into();
+        *IS_FILE_LOADED.lock().unwrap() = true;
+        *CURRENT_TIME.lock().unwrap() = 30.0;
+        set_manual_intro_outro_enabled(true);
+        let offer = ManualSkipOffer {
+            route: "episode-one".into(),
+            file_epoch: FILE_LOAD_EPOCH.load(AtomicOrdering::Acquire),
+            kind: SegmentKind::Intro,
+            action: ManualSkipAction::Seek(90.0),
+            area: ManualSkipArea::Segment(SegmentKey {
+                kind: SegmentKind::Intro,
+                start_ms: 0,
+                end_ms: 90_000,
+            }),
+        };
+        set_manual_skip_offer(offer.clone());
+        *CURRENT_TIME.lock().unwrap() = 120.0;
+        assert!(!trigger_manual_skip());
+        assert!(rx.is_empty());
+        *CURRENT_TIME.lock().unwrap() = 30.0;
+        *LOBBY_ROLE.lock().unwrap() = LobbyRole::Guest;
+        assert!(!trigger_manual_skip());
+        *LOBBY_ROLE.lock().unwrap() = LobbyRole::None;
+        assert!(trigger_manual_skip());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            r#"["mpv-command",["seek","90","absolute"]]"#
+        );
+        set_manual_skip_offer(offer.clone());
+        assert!(!trigger_manual_skip());
+        assert!(rx.is_empty());
+        clear_manual_skip_offer();
+        set_manual_skip_offer(offer);
+        assert!(trigger_manual_skip());
+        set_manual_intro_outro_enabled(false);
+        *PLAYER_CMD_TX.lock().unwrap() = None;
+        *CURRENT_URL.lock().unwrap() = String::new();
+        *IS_FILE_LOADED.lock().unwrap() = false;
+        *CURRENT_TIME.lock().unwrap() = 0.0;
+    }
 
     #[test]
     fn skip_history_keeps_manual_rewinds_opted_in_for_the_session() {
