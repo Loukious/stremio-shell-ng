@@ -21,7 +21,7 @@
     * You can change the MPV input config by editing the `input.conf` file in the app's data directory (by default this is the same folder as `stremio-shell-ng.exe`, e.g. `%LOCALAPPDATA%\Programs\Stremio`)
 * IntroDB and TheIntroDB support
 * Auto-chapter skipping based on chapter titles (configurable keywords in `RPCconfig.ini`)
-* Choose automatic opening/ending skipping or a manual skip button from the player controls. The manual button hides after 8 seconds; the choice is saved in `RPCconfig.ini` (`[AutoSkip] manual_intro_outro`, defaults to `false`). Recaps remain automatic.
+* Choose automatic opening/ending skipping or a manual skip button from the player controls. The manual button hides after 8 seconds; the choice is saved in `RPCconfig.ini` (`[AutoSkip] manual_intro_outro`, defaults to `false`). Automatic opening/ending skips show a brief notification. Recaps remain automatic.
 * Picture in Picture support
 
 

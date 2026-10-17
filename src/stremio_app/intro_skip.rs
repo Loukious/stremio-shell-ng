@@ -397,6 +397,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
 
                 if skip_sent {
                     skip_history.remember_chapter(video_id, chapter_idx);
+                    send_auto_skip_notification(kind);
                     if is_final_outro {
                         println!(
                             "⏭️ AutoSkip final chapter {}: '{}' (chapter #{}/{}, matched '{}') -> next track",
@@ -512,6 +513,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
 
                 if action_sent {
                     skip_history.remember_segment(video_id, seg.key());
+                    send_auto_skip_notification(seg.kind);
 
                     let media_text = current_media
                         .as_ref()
@@ -1217,6 +1219,21 @@ fn send_next_track() -> bool {
     false
 }
 
+fn send_auto_skip_notification(kind: SegmentKind) {
+    if !matches!(kind, SegmentKind::Intro | SegmentKind::Outro) {
+        return;
+    }
+    if let Ok(guard) = WEB_CMD_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            tx.send(RPCResponse::response_message(Some(json!([
+                "shell-auto-skip",
+                { "kind": kind.label() }
+            ]))))
+            .ok();
+        }
+    }
+}
+
 fn send_manual_skip_state(visible: bool, kind: Option<SegmentKind>) {
     let label = kind.map(|value| value.label()).unwrap_or_default();
     if let Ok(guard) = WEB_CMD_TX.lock() {
@@ -1454,6 +1471,24 @@ mod tests {
         chapter_keyword_matches, effective_skip_action_for_duration, is_final_chapter, SegmentKey,
         SegmentKind, SkipAction, SkipHistory,
     };
+
+    #[test]
+    fn auto_skip_notifications_only_include_openings_and_endings() {
+        use super::{send_auto_skip_notification, WEB_CMD_TX};
+        let (tx, rx) = flume::unbounded();
+        *WEB_CMD_TX.lock().unwrap() = Some(tx);
+        send_auto_skip_notification(SegmentKind::Intro);
+        send_auto_skip_notification(SegmentKind::Recap);
+        send_auto_skip_notification(SegmentKind::Outro);
+        *WEB_CMD_TX.lock().unwrap() = None;
+        let notifications: Vec<_> = rx
+            .try_iter()
+            .map(|message| serde_json::from_str::<serde_json::Value>(&message).unwrap())
+            .filter(|message| message["args"][0] == "shell-auto-skip")
+            .map(|message| message["args"][1]["kind"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(notifications, ["intro", "outro"]);
+    }
 
     #[test]
     fn manual_offer_expires_on_seek_chapter_route_or_file_change() {

@@ -3,19 +3,21 @@
     window.__stremioShellIntroSkipInstalled = true;
 
     var state = { mode: 'auto', visible: false, kind: '', hidden: false, language: '', error: false, pendingMode: null };
-    var hideTimer, closeTimer;
+    var hideTimer, closeTimer, toastTimer;
     var panelOpen = false;
-    var settingsButton, skipButton, panel;
+    var settingsButton, skipButton, panel, toast;
     var icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M5 5v14l10-7L5 5zm12 0v14h2V5h-2z"/></svg>';
 
     function strings() {
         var es = /^(spa|es)([-_]|$)/i.test(state.language);
         return es ? {
             title: 'Saltar opening / ending', auto: 'Automático', manual: 'Mostrar botón (8 segundos)',
-            intro: 'Saltar opening', outro: 'Saltar ending', error: 'No se pudo guardar la preferencia.'
+            intro: 'Saltar opening', outro: 'Saltar ending', error: 'No se pudo guardar la preferencia.',
+            introSkipped: 'Opening saltado', outroSkipped: 'Ending saltado'
         } : {
             title: 'Skip opening / ending', auto: 'Automatic', manual: 'Show button (8 seconds)',
-            intro: 'Skip opening', outro: 'Skip ending', error: 'Could not save the preference.'
+            intro: 'Skip opening', outro: 'Skip ending', error: 'Could not save the preference.',
+            introSkipped: 'Opening skipped', outroSkipped: 'Ending skipped'
         };
     }
 
@@ -25,6 +27,21 @@
 
     function isPlayer() {
         return (location.hash || '').indexOf('/player') !== -1;
+    }
+
+    function showAutoSkipToast(kind) {
+        if (kind !== 'intro' && kind !== 'outro') return;
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'stremio-shell-auto-skip-toast';
+            toast.setAttribute('role', 'status');
+            toast.setAttribute('aria-atomic', 'true');
+            document.body.appendChild(toast);
+        }
+        clearTimeout(toastTimer);
+        toast.textContent = strings()[kind + 'Skipped'];
+        toast.hidden = false;
+        toastTimer = setTimeout(function () { toast.hidden = true; }, 3000);
     }
 
     function closePanel(restoreFocus) {
@@ -124,6 +141,13 @@
             #stremio-shell-intro-skip-panel .skip-mode-check { width:1.25rem; height:1.25rem; flex:none; fill:currentColor; visibility:hidden; }
             #stremio-shell-intro-skip-panel label[data-selected="true"] .skip-mode-check { visibility:visible; }
             #stremio-shell-intro-skip-panel [role="alert"]:empty { display:none; }
+            #stremio-shell-auto-skip-toast {
+                position:fixed; z-index:12; top:calc(1.2 * var(--horizontal-nav-bar-size, 5.5rem)); right:2rem;
+                padding:1rem; max-width:calc(100vw - 4rem); box-sizing:border-box; pointer-events:none;
+                border-radius:var(--border-radius); background:var(--modal-background-color);
+                color:var(--primary-foreground-color); font:inherit;
+            }
+            #stremio-shell-auto-skip-toast[hidden] { display:none; }
             @media (max-width:720px) { #stremio-shell-manual-skip-btn { right:1rem; bottom:6rem; } }
         `;
         document.head.appendChild(style);
@@ -195,7 +219,10 @@
         var args = data && data.args;
         if (!Array.isArray(args)) return;
         var next = args[1] || {};
-        if (args[0] === 'shell-manual-skip-state') {
+        if (args[0] === 'shell-auto-skip') {
+            showAutoSkipToast(next.kind);
+            return;
+        } else if (args[0] === 'shell-manual-skip-state') {
             clearTimeout(hideTimer);
             state.visible = !!next.visible;
             state.kind = next.kind;
@@ -228,6 +255,10 @@
     window.addEventListener('hashchange', function () {
         state.visible = false;
         clearTimeout(hideTimer);
+        if (toast && !isPlayer()) {
+            clearTimeout(toastTimer);
+            toast.hidden = true;
+        }
         closePanel(false);
         render();
         placeButton();
