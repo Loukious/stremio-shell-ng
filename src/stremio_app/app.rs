@@ -120,6 +120,7 @@ struct Config {
     auto_skip_intro: bool,
     auto_skip_recap: bool,
     auto_skip_outro: bool,
+    manual_intro_outro: bool,
     chapter_intro_words: Vec<String>,
     chapter_recap_words: Vec<String>,
     chapter_outro_words: Vec<String>,
@@ -347,7 +348,8 @@ fn load_or_create_config() -> Config {
             .set("enabled", "true")
             .set("skip_intro", "true")
             .set("skip_recap", "true")
-            .set("skip_outro", "true");
+            .set("skip_outro", "true")
+            .set("manual_intro_outro", "false");
 
         default_config
             .with_section(Some("AutoSkipChapters"))
@@ -471,6 +473,12 @@ fn load_or_create_config() -> Config {
         .map(|value| value == "true")
         .unwrap_or(true);
 
+    let manual_intro_outro = config
+        .section(Some("AutoSkip"))
+        .and_then(|sec| sec.get("manual_intro_outro"))
+        .map(|value| value == "true")
+        .unwrap_or(false);
+
     // Chapter-title keyword lists (comma-separated)
     // Matches are case-insensitive substring checks against `chapter-metadata/by-key/title`.
     let (chapter_intro_words, chapter_recap_words, chapter_outro_words) =
@@ -513,11 +521,66 @@ fn load_or_create_config() -> Config {
         auto_skip_intro,
         auto_skip_recap,
         auto_skip_outro,
+        manual_intro_outro,
         chapter_intro_words,
         chapter_recap_words,
         chapter_outro_words,
         introdb_api_key,
         theintrodb_api_key,
+    }
+}
+
+fn persist_manual_intro_outro(enabled: bool) -> Result<(), String> {
+    let exe_path = env::current_exe().map_err(|err| err.to_string())?;
+    let exe_dir = exe_path
+        .parent()
+        .ok_or_else(|| "Failed to get executable directory".to_string())?;
+    let config_path = exe_dir.join("RPCconfig.ini");
+    persist_manual_intro_outro_to(&config_path, enabled)
+}
+
+fn persist_manual_intro_outro_to(config_path: &Path, enabled: bool) -> Result<(), String> {
+    let mut config = Ini::load_from_file(config_path).map_err(|err| err.to_string())?;
+    config
+        .with_section(Some("AutoSkip"))
+        .set("manual_intro_outro", if enabled { "true" } else { "false" });
+    config
+        .write_to_file(config_path)
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod intro_skip_config_tests {
+    use super::*;
+
+    #[test]
+    fn persists_mode_without_losing_other_settings_and_reports_write_errors() {
+        let path = env::temp_dir().join(format!("stremio-intro-skip-{}.ini", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            "[AutoSkip]\nskip_recap=false\n[IntroDB]\napi_key=example\n",
+        )
+        .unwrap();
+        persist_manual_intro_outro_to(&path, true).unwrap();
+        let config = Ini::load_from_file(&path).unwrap();
+        assert_eq!(
+            config.get_from(Some("AutoSkip"), "manual_intro_outro"),
+            Some("true")
+        );
+        assert_eq!(
+            config.get_from(Some("AutoSkip"), "skip_recap"),
+            Some("false")
+        );
+        assert_eq!(config.get_from(Some("IntroDB"), "api_key"), Some("example"));
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let result = persist_manual_intro_outro_to(&path, false);
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_err());
     }
 }
 
@@ -1453,6 +1516,7 @@ impl MainWindow {
                 skip_intro: config.auto_skip_intro,
                 skip_recap: config.auto_skip_recap,
                 skip_outro: config.auto_skip_outro,
+                manual_intro_outro: config.manual_intro_outro,
                 chapter_intro_words: config.chapter_intro_words.clone(),
                 chapter_recap_words: config.chapter_recap_words.clone(),
                 chapter_outro_words: config.chapter_outro_words.clone(),
@@ -1609,6 +1673,38 @@ impl MainWindow {
                             .and_then(|value| value.as_bool());
                         *requested_pip.lock().unwrap() = target;
                         toggle_pip_sender.notice();
+                    }
+                    Some("shell-manual-skip") => {
+                        crate::stremio_app::intro_skip::trigger_manual_skip();
+                    }
+                    Some("shell-intro-skip-mode-get") => {
+                        crate::stremio_app::intro_skip::send_intro_skip_mode_state(false);
+                    }
+                    Some("shell-set-intro-skip-mode") => {
+                        let mode = msg
+                            .get_params()
+                            .and_then(|params| params.get("mode"))
+                            .and_then(|value| value.as_str());
+                        let enabled = match mode {
+                            Some("manual") => Some(true),
+                            Some("auto") => Some(false),
+                            _ => None,
+                        };
+                        if let Some(enabled) = enabled {
+                            match persist_manual_intro_outro(enabled) {
+                                Ok(()) => {
+                                    crate::stremio_app::intro_skip::set_manual_intro_outro_enabled(
+                                        enabled,
+                                    )
+                                }
+                                Err(error) => {
+                                    eprintln!("Could not save intro skip mode: {error}");
+                                    crate::stremio_app::intro_skip::send_intro_skip_mode_state(
+                                        true,
+                                    );
+                                }
+                            }
+                        }
                     }
                     Some("quit") => quit_sender.notice(),
                     Some("shell-route-changed") => {
