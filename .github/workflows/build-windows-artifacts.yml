@@ -15,8 +15,8 @@ concurrency:
 
 env:
   RUNTIME_REPOSITORY: Loukious/stremio-runtime
-  # Pin the tested native runtime, including the November 2026 server ports.
-  RUNTIME_REVISION: da0263ced209b9601d82ffae2c266056d98d4d21
+  # Pin the tested native runtime, including server ports and bounded media probing.
+  RUNTIME_REVISION: 7e4b6cacedfd272490c5cc8d3d7622fd4e8da7e9
 
 jobs:
   prepare:
