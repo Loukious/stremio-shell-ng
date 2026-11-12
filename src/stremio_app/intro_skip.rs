@@ -364,11 +364,12 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         // --- Chapter-based skipping ---
         // Some files include named chapters like "Opening", "Logo", "Credits".
         // When detected, jump to the next chapter.
-        let chapter_was_skipped = skip_history.chapter_was_skipped(video_id, chapter_idx);
+        let playback_was_skipped =
+            skip_history.playback_was_skipped(video_id, chapter_idx, time_pos);
         if chapter_idx >= 0 && !chapter_title.trim().is_empty() {
             let t = chapter_title.trim().to_lowercase();
             if let Some((kind, matched)) = segment_kind_from_chapter_title(&t, &config)
-                .filter(|(kind, _)| !chapter_was_skipped || manual_skip_enabled_for(*kind))
+                .filter(|(kind, _)| !playback_was_skipped || manual_skip_enabled_for(*kind))
             {
                 let is_final_outro =
                     kind == SegmentKind::Outro && is_final_chapter(chapter_idx, chapter_count);
@@ -464,7 +465,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         let epsilon = 1.0_f64;
 
         if let Some(seg) = segments.iter().find(|seg| {
-            if skip_history.segment_was_skipped(video_id, seg.key())
+            if (playback_was_skipped || skip_history.segment_was_skipped(video_id, seg.key()))
                 && !manual_skip_enabled_for(seg.kind)
             {
                 return false;
@@ -580,6 +581,20 @@ struct SkipHistory {
 }
 
 impl SkipHistory {
+    /// Both detectors must respect areas already skipped by either source. Otherwise a
+    /// rewind into a skipped chapter can fall through to an overlapping database segment,
+    /// or a database seek across chapters can leave those chapters eligible to skip again.
+    fn playback_was_skipped(&self, video_id: &str, chapter_idx: i64, time: f64) -> bool {
+        self.chapter_was_skipped(video_id, chapter_idx)
+            || self.videos.get(video_id).is_some_and(|history| {
+                time.is_finite()
+                    && history.segments.iter().any(|segment| {
+                        time + 1.0 >= segment.start_ms as f64 / 1000.0
+                            && (segment.end_ms < 0 || time < segment.end_ms as f64 / 1000.0)
+                    })
+            })
+    }
+
     fn chapter_was_skipped(&self, video_id: &str, chapter_idx: i64) -> bool {
         self.videos
             .get(video_id)
@@ -1579,6 +1594,54 @@ mod tests {
         assert!(history.chapter_was_skipped(video_id, 1));
         assert!(history.segment_was_skipped(video_id, intro));
         assert!(!history.chapter_was_skipped("tt1234567:1:3", 0));
+    }
+
+    #[test]
+    fn rewinding_two_skipped_chapters_blocks_overlapping_database_detection() {
+        let mut history = SkipHistory::default();
+        let video_id = "tt1234567:1:2";
+        let database_intro = SegmentKey {
+            kind: SegmentKind::Intro,
+            start_ms: 0,
+            end_ms: 90_000,
+        };
+
+        // Logo and opening were handled locally before the database fallback ran.
+        history.remember_chapter(video_id, 0);
+        history.remember_chapter(video_id, 1);
+        assert!(!history.segment_was_skipped(video_id, database_intro));
+        assert!(history.playback_was_skipped(video_id, 0, 5.0));
+        assert!(history.playback_was_skipped(video_id, 1, 30.0));
+        assert!(!history.playback_was_skipped(video_id, 2, 100.0));
+        assert!(!history.playback_was_skipped("tt1234567:1:3", 0, 5.0));
+    }
+
+    #[test]
+    fn rewinding_database_skips_blocks_chapters_bypassed_by_the_seek() {
+        let mut history = SkipHistory::default();
+        let video_id = "tt1234567:1:2";
+        for (kind, start_ms, end_ms) in [
+            (SegmentKind::Recap, 0, 30_000),
+            (SegmentKind::Intro, 30_000, 90_000),
+        ] {
+            history.remember_segment(
+                video_id,
+                SegmentKey {
+                    kind,
+                    start_ms,
+                    end_ms,
+                },
+            );
+        }
+
+        // A database seek crossed these chapters without visiting their metadata.
+        assert!(!history.chapter_was_skipped(video_id, 0));
+        assert!(!history.chapter_was_skipped(video_id, 1));
+        assert!(history.playback_was_skipped(video_id, 0, 5.0));
+        assert!(history.playback_was_skipped(video_id, 1, 45.0));
+        assert!(!history.playback_was_skipped(video_id, 2, 90.0));
+        assert!(!history.playback_was_skipped(video_id, -1, f64::NAN));
+        assert!(!history.playback_was_skipped("tt1234567:1:3", 1, 45.0));
     }
 
     #[test]
