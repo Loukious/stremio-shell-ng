@@ -35,6 +35,8 @@ fn propr_change_tokens() {
     tokens_by_type(&tokens, prop, PropertyData::Double(1.0), Token::F64(1.0));
     tokens_by_type(&tokens, prop, PropertyData::OsdStr("ok"), Token::Str("ok"));
     tokens_by_type(&tokens, prop, PropertyData::Str("ok"), Token::Str("ok"));
+    tokens_by_type(&tokens, prop, PropertyData::None, Token::Unit);
+    tokens_by_type(&tokens, "metadata", PropertyData::None, Token::Unit);
 
     // JSON response
     tokens_by_type(

@@ -15,6 +15,7 @@ pub struct PlayerProprChange {
 impl PlayerProprChange {
     fn value_from_format(data: PropertyData, as_json: bool) -> serde_json::Value {
         match data {
+            PropertyData::None => serde_json::Value::Null,
             PropertyData::Flag(d) => serde_json::Value::Bool(d),
             PropertyData::Int64(d) => serde_json::Value::Number(
                 serde_json::Number::from_f64(d as f64).expect("MPV returned invalid number"),

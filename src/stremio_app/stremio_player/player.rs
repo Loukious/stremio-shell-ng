@@ -89,6 +89,7 @@ const LOCAL_LOADFILE_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const LOCAL_STREAM_STARTUP_RETRY_LIMIT: u32 = 60;
 const LOCAL_STREAM_STARTUP_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MPV_COMMAND_QUEUE_RECOVERY_LIMIT: u32 = 3;
+const DIRECT_HTTP_PREMATURE_END_RETRY_LIMIT: u32 = 3;
 const DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2: u32 = 15;
 const DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR: u32 = 2;
 
@@ -138,6 +139,29 @@ enum LoadState {
     Loading,
     Loaded,
     Stopping,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrematureEndRecovery {
+    Local,
+    DirectHttp,
+}
+
+impl PrematureEndRecovery {
+    fn retry_limit(self) -> u32 {
+        match self {
+            Self::Local => 1,
+            Self::DirectHttp => DIRECT_HTTP_PREMATURE_END_RETRY_LIMIT,
+        }
+    }
+
+    fn reload_url(self, url: &str) -> String {
+        match self {
+            Self::Local => cache_busted_url(url),
+            // Debrid/CDN query strings may be signed. Reload them byte-for-byte.
+            Self::DirectHttp => url.to_string(),
+        }
+    }
 }
 
 struct PlayerController {
@@ -452,10 +476,11 @@ fn wait_player_event(mpv: &Mpv, timeout: f64) -> Option<Result<PlayerMpvEvent, S
         libmpv2_sys::mpv_event_id_MPV_EVENT_END_FILE if !event.data.is_null() => {
             let end = unsafe { &*(event.data as *const mpv_event_end_file) };
             if end.error < 0 {
-                Err(self::mpv_error_string(end.error))
-            } else {
-                Ok(PlayerMpvEvent::EndFile(end.reason))
+                eprintln!("[MPV] EndFile error: {}", self::mpv_error_string(end.error));
             }
+            // The reason still needs the normal EndFile handling, including recovery
+            // and notifying the frontend when playback cannot continue.
+            Ok(PlayerMpvEvent::EndFile(end.reason))
         }
         libmpv2_sys::mpv_event_id_MPV_EVENT_GET_PROPERTY_REPLY
         | libmpv2_sys::mpv_event_id_MPV_EVENT_PROPERTY_CHANGE
@@ -463,6 +488,8 @@ fn wait_player_event(mpv: &Mpv, timeout: f64) -> Option<Result<PlayerMpvEvent, S
         {
             let property = unsafe { &*(event.data as *const mpv_event_property) };
             if property.format == libmpv2_sys::mpv_format_MPV_FORMAT_NONE {
+                // Unload notifications can precede EndFile. Keep the last valid
+                // playback position, duration, and seekability for recovery.
                 return None;
             }
             if property.name.is_null() || property.data.is_null() {
@@ -1071,6 +1098,7 @@ fn create_event_thread(
         for (name, format) in [
             ("time-pos", Format::Double),
             ("duration", Format::Double),
+            ("seekable", Format::Flag),
             ("pause", Format::Flag),
             ("chapter", Format::Int64),
             ("chapters", Format::Int64),
@@ -1169,6 +1197,18 @@ fn create_event_thread(
                     let url = controller.current_url.clone();
                     let time = *CURRENT_TIME.lock().unwrap();
                     let duration = *TOTAL_DURATION.lock().unwrap();
+                    let replacement_queued = controller.pending_media_command.is_some()
+                        || controller.pending_loadfile.is_some();
+                    let recovery = premature_end_recovery(
+                        controller.state,
+                        reason,
+                        &url,
+                        time,
+                        duration,
+                        cached_property_value("seekable").and_then(|value| value.as_bool())
+                            == Some(true),
+                    )
+                    .filter(|_| !replacement_queued);
                     println!(
                         "[MPV] EndFile reason={:?}, time={}, duration={}, url={}",
                         reason, time, duration, url
@@ -1189,30 +1229,11 @@ fn create_event_thread(
                         continue;
                     }
 
-                    // Implement reload-on-stuck behavior for local torrent URLs
-                    if reason == libmpv2::mpv_end_file_reason::Eof {
-                        let premature = is_local_stream_url(&url)
-                            && duration > 30.0
-                            && time > 0.0
-                            && time < duration - 10.0;
-
-                        if premature && controller.premature_eof_reloads < 1 {
-                            controller.premature_eof_reloads += 1;
-                            println!("[MPV] Premature EOF detected on local stream. Reloading...");
-
-                            let url2 = cache_busted_url(&url);
-
-                            controller.set_current_url(url2.clone());
-                            controller.pending_reload_url = Some(url2.clone());
-                            controller.pending_reload_seek = Some(time);
-                            let cmd =
-                                CmdVal::Tripple(MpvCmd::Loadfile, url2, "replace".to_string());
-                            controller.handle_command(&mpv, cmd);
-
-                            // Do not propagate this premature EndFile to the frontend,
-                            // otherwise the autoplay logic might trigger next episode.
-                            continue;
-                        }
+                    if recovery.is_some_and(|recovery| {
+                        controller.recover_premature_end(&mpv, recovery, &url, time)
+                    }) {
+                        // Suppress completion only after a replacement was actually queued.
+                        continue;
                     }
 
                     if error_retry_scheduled {
@@ -1231,7 +1252,9 @@ fn create_event_thread(
 
                     PlayerResponse(
                         "mpv-event-ended",
-                        PlayerEvent::End(PlayerEnded::from_end_reason(reason)),
+                        PlayerEvent::End(PlayerEnded::from_end_reason(unrecovered_end_reason(
+                            reason, recovery,
+                        ))),
                     )
                 }
                 PlayerMpvEvent::Shutdown => {
@@ -1659,6 +1682,8 @@ impl PlayerController {
             if is_stop_command(&cmd) {
                 self.pending_loadfile = None;
                 self.pending_startup_retry = None;
+                self.pending_reload_url = None;
+                self.pending_reload_seek = None;
             }
             if let Some(sender) = &self.subtitle_request_sender {
                 self.pending_media_command = Some(cmd);
@@ -1826,7 +1851,8 @@ impl PlayerController {
             return;
         };
 
-        let is_reload = url.contains("_reload=");
+        let is_reload = self.pending_reload_url.as_deref() == Some(url)
+            || (is_local_stream_url(url) && url.contains("_reload="));
         if !is_reload {
             if self.current_url == url {
                 println!("[PLAYER] restarting current non-reload stream: {url}");
@@ -1978,13 +2004,53 @@ impl PlayerController {
                 self.pending_reload_url = None;
                 self.pending_reload_seek.take()
             }
-            Some(_) => {
-                self.pending_reload_url = None;
-                self.pending_reload_seek = None;
-                None
-            }
-            None => None,
+            // A stale FileLoaded event must not consume another file's resume position.
+            Some(_) | None => None,
         }
+    }
+
+    fn recover_premature_end(
+        &mut self,
+        mpv: &Mpv,
+        recovery: PrematureEndRecovery,
+        url: &str,
+        position: f64,
+    ) -> bool {
+        if self.premature_eof_reloads >= recovery.retry_limit() {
+            return false;
+        }
+
+        let reload_url = recovery.reload_url(url);
+        self.pending_reload_url = Some(reload_url.clone());
+        self.pending_reload_seek = Some(position);
+        self.handle_command(
+            mpv,
+            CmdVal::Tripple(MpvCmd::Loadfile, reload_url.clone(), "replace".to_string()),
+        );
+
+        if self.has_queued_loadfile_for(&reload_url) {
+            self.premature_eof_reloads += 1;
+            let origin = url::Url::parse(url)
+                .map(|url| url.origin().ascii_serialization())
+                .unwrap_or_else(|_| "unknown".to_string());
+            println!(
+                "[MPV] Recovering premature end ({recovery:?}), origin={origin}, attempt={}, position={position}",
+                self.premature_eof_reloads
+            );
+            true
+        } else {
+            self.pending_reload_url = None;
+            self.pending_reload_seek = None;
+            false
+        }
+    }
+
+    fn has_queued_loadfile_for(&self, url: &str) -> bool {
+        self.active_loadfile
+            .as_ref()
+            .is_some_and(|active| active.url == url)
+            || self.pending_loadfile.as_ref().and_then(loadfile_url) == Some(url)
+            || self.pending_media_command.as_ref().and_then(loadfile_url) == Some(url)
     }
 
     fn set_current_url(&mut self, url: String) {
@@ -2400,6 +2466,53 @@ fn is_local_stream_url(url: &str) -> bool {
     })
 }
 
+fn premature_end_recovery(
+    state: LoadState,
+    reason: libmpv2::EndFileReason,
+    url: &str,
+    time: f64,
+    duration: f64,
+    seekable: bool,
+) -> Option<PrematureEndRecovery> {
+    if !time.is_finite()
+        || !duration.is_finite()
+        || duration <= 30.0
+        || time <= 0.0
+        || time >= duration - 10.0
+    {
+        return None;
+    }
+
+    if is_local_stream_url(url) {
+        return (reason == libmpv2::mpv_end_file_reason::Eof)
+            .then_some(PrematureEndRecovery::Local);
+    }
+
+    (state == LoadState::Loaded
+        && seekable
+        && matches!(
+            reason,
+            libmpv2::mpv_end_file_reason::Eof | libmpv2::mpv_end_file_reason::Error
+        )
+        && url::Url::parse(url)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host()))
+    .then_some(PrematureEndRecovery::DirectHttp)
+}
+
+fn unrecovered_end_reason(
+    reason: libmpv2::EndFileReason,
+    recovery: Option<PrematureEndRecovery>,
+) -> libmpv2::EndFileReason {
+    if reason == libmpv2::mpv_end_file_reason::Eof
+        && recovery == Some(PrematureEndRecovery::DirectHttp)
+    {
+        // Exhausted or failed recovery must not report a truncated VOD as completed.
+        libmpv2::mpv_end_file_reason::Error
+    } else {
+        reason
+    }
+}
+
 fn cache_busted_url(url: &str) -> String {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2553,6 +2666,7 @@ fn is_cached_immediate_property(name: &str) -> bool {
             | "sid"
             | "aid"
             | "vid"
+            | "seekable"
             | "sub-scale"
             | "sub-pos"
             | "sub-delay"
@@ -2607,6 +2721,7 @@ fn clear_file_scoped_cached_props() {
     for name in [
         "time-pos",
         "duration",
+        "seekable",
         "paused-for-cache",
         "cache-buffering-state",
         "demuxer-cache-time",
@@ -2626,6 +2741,7 @@ fn clear_file_scoped_cached_props() {
 fn request_loaded_property_snapshot(mpv: &Mpv) {
     for (name, format) in [
         ("duration", Format::Double),
+        ("seekable", Format::Flag),
         ("time-pos", Format::Double),
         ("pause", Format::Flag),
         ("volume", Format::Double),
@@ -2654,6 +2770,7 @@ fn emit_async_property_reply(
 
 fn property_data_to_json(name: &str, value: &PropertyData) -> Option<Value> {
     match value {
+        PropertyData::None => None,
         PropertyData::Flag(value) => Some(Value::Bool(*value)),
         PropertyData::Int64(value) => Some(json!(*value)),
         PropertyData::Double(value) if value.is_finite() => Some(json!(*value)),
@@ -2724,6 +2841,7 @@ fn mpv_string_property_to_json(name: &str, value: String) -> Value {
 
 fn update_cached_property(name: &str, change: &PropertyData) {
     let cached_value = match change {
+        PropertyData::None => None,
         PropertyData::Flag(value) => Some(Value::Bool(*value)),
         PropertyData::Int64(value) => Some(json!(*value)),
         PropertyData::Double(value) => Some(json!(*value)),
@@ -2911,6 +3029,303 @@ mod tests {
         ] {
             assert!(!super::is_local_stream_url(url));
         }
+    }
+
+    #[test]
+    fn premature_http_end_requires_seekable_loaded_vod() {
+        use libmpv2::mpv_end_file_reason::{Eof, Error, Quit, Redirect, Stop};
+
+        for reason in [Eof, Error] {
+            for url in [
+                "http://cdn.example/video",
+                "https://cdn.example/video?token=a%2Fb",
+            ] {
+                assert_eq!(
+                    super::premature_end_recovery(
+                        LoadState::Loaded,
+                        reason,
+                        url,
+                        120.0,
+                        7200.0,
+                        true,
+                    ),
+                    Some(super::PrematureEndRecovery::DirectHttp),
+                );
+            }
+        }
+        for state in [LoadState::Idle, LoadState::Loading, LoadState::Stopping] {
+            assert_eq!(
+                super::premature_end_recovery(
+                    state,
+                    Eof,
+                    "https://cdn.example/video",
+                    120.0,
+                    7200.0,
+                    true,
+                ),
+                None,
+            );
+        }
+        for reason in [Stop, Quit, Redirect] {
+            assert_eq!(
+                super::premature_end_recovery(
+                    LoadState::Loaded,
+                    reason,
+                    "https://cdn.example/video",
+                    120.0,
+                    7200.0,
+                    true,
+                ),
+                None,
+            );
+        }
+        for url in ["file:///C:/video.mp4", "rtsp://cdn.example/live", "invalid"] {
+            assert_eq!(
+                super::premature_end_recovery(LoadState::Loaded, Eof, url, 120.0, 7200.0, true,),
+                None,
+            );
+        }
+        assert_eq!(
+            super::premature_end_recovery(
+                LoadState::Loaded,
+                Eof,
+                "https://cdn.example/live",
+                120.0,
+                7200.0,
+                false,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn premature_http_end_excludes_unknown_duration_and_real_completion() {
+        use libmpv2::mpv_end_file_reason::Eof;
+
+        for (time, duration) in [
+            (120.0, 0.0),
+            (1.0, 30.0),
+            (0.0, 7200.0),
+            (-1.0, 7200.0),
+            (7190.0, 7200.0),
+            (7200.0, 7200.0),
+            (7201.0, 7200.0),
+            (f64::NAN, 7200.0),
+            (f64::INFINITY, 7200.0),
+            (120.0, f64::NAN),
+            (120.0, f64::INFINITY),
+        ] {
+            assert_eq!(
+                super::premature_end_recovery(
+                    LoadState::Loaded,
+                    Eof,
+                    "https://cdn.example/video",
+                    time,
+                    duration,
+                    true,
+                ),
+                None,
+                "time={time}, duration={duration}",
+            );
+        }
+    }
+
+    #[test]
+    fn premature_http_reload_preserves_signed_url_and_local_retry_policy() {
+        use super::PrematureEndRecovery;
+        use libmpv2::mpv_end_file_reason::{Eof, Error};
+
+        let signed_url = "https://CDN.example:443/a%2fb?token=a%2Fb+z&x=1&x=2&_reload=signed#part";
+        assert_eq!(
+            PrematureEndRecovery::DirectHttp.reload_url(signed_url),
+            signed_url
+        );
+        assert_eq!(PrematureEndRecovery::DirectHttp.retry_limit(), 3);
+        assert_eq!(PrematureEndRecovery::Local.retry_limit(), 1);
+        let local = "http://127.0.0.1:45821/hash/3";
+        assert!(PrematureEndRecovery::Local
+            .reload_url(local)
+            .starts_with(local));
+        assert!(PrematureEndRecovery::Local
+            .reload_url(local)
+            .contains("?_reload="));
+        assert_eq!(
+            super::premature_end_recovery(LoadState::Loaded, Eof, local, 120.0, 7200.0, false),
+            Some(PrematureEndRecovery::Local),
+        );
+        assert_eq!(
+            super::premature_end_recovery(LoadState::Loaded, Error, local, 120.0, 7200.0, true),
+            None,
+        );
+    }
+
+    #[test]
+    fn premature_http_recovery_budget_and_resume_survive_same_url_reload() {
+        use super::{CmdVal, PlayerController, PrematureEndRecovery};
+        use libmpv2::Mpv;
+
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vo", "null")?;
+            init.set_property("ao", "null")?;
+            init.set_property("config", "no")?;
+            Ok(())
+        })
+        .unwrap();
+        let url = "https://cdn.example/video?token=a%2fb+z&x=1&x=2";
+        let mut controller = PlayerController::new(0);
+        let (subtitle_tx, _subtitle_rx) = flume::unbounded();
+        let (rpc_tx, _rpc_rx) = flume::unbounded();
+        controller.subtitle_request_sender = Some(subtitle_tx);
+        controller.set_current_url(url.to_string());
+
+        for attempt in 1..=PrematureEndRecovery::DirectHttp.retry_limit() {
+            let position = 120.0 * f64::from(attempt);
+            assert!(controller.recover_premature_end(
+                &mpv,
+                PrematureEndRecovery::DirectHttp,
+                url,
+                position,
+            ));
+            assert_eq!(controller.premature_eof_reloads, attempt);
+            let command: CmdVal = controller.pending_media_command.take().unwrap();
+            controller.pending_subtitle_ack = None;
+            assert_eq!(super::loadfile_url(&command), Some(url));
+            controller.capture_loadfile_url(&command);
+            controller.on_end_file();
+            controller.on_start_file(0);
+            assert!(controller.on_file_loaded(&mpv, &rpc_tx));
+            assert_eq!(controller.premature_eof_reloads, attempt);
+            assert_eq!(controller.pending_reload_seek, Some(position));
+            assert_eq!(
+                controller.take_pending_reload_seek_for("https://old.example/video"),
+                None
+            );
+            assert_eq!(controller.take_pending_reload_seek_for(url), Some(position));
+            assert_eq!(controller.take_pending_reload_seek_for(url), None);
+        }
+        assert!(!controller.recover_premature_end(
+            &mpv,
+            PrematureEndRecovery::DirectHttp,
+            url,
+            600.0,
+        ));
+        assert!(controller.pending_media_command.is_none());
+        assert!(controller.pending_reload_seek.is_none());
+
+        // A provider-owned _reload parameter does not identify a shell recovery.
+        controller.capture_loadfile_url(&CmdVal::Double(
+            super::MpvCmd::Loadfile,
+            "https://cdn.example/other?_reload=signed&token=a%2Fb".to_string(),
+        ));
+        assert_eq!(controller.premature_eof_reloads, 0);
+    }
+
+    #[test]
+    fn failed_premature_http_recovery_keeps_error_visible() {
+        use super::{PlayerController, PrematureEndRecovery};
+        use libmpv2::{
+            mpv_end_file_reason::{Eof, Error},
+            Mpv,
+        };
+
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vo", "null")?;
+            init.set_property("ao", "null")?;
+            init.set_property("config", "no")?;
+            Ok(())
+        })
+        .unwrap();
+        let mut controller = PlayerController::new(0);
+        let (subtitle_tx, subtitle_rx) = flume::unbounded();
+        drop(subtitle_rx);
+        controller.subtitle_request_sender = Some(subtitle_tx);
+        assert!(!controller.recover_premature_end(
+            &mpv,
+            PrematureEndRecovery::DirectHttp,
+            "https://cdn.example/video",
+            120.0,
+        ));
+        assert_eq!(controller.premature_eof_reloads, 0);
+        assert!(controller.pending_reload_url.is_none());
+        assert!(controller.pending_reload_seek.is_none());
+        assert_eq!(
+            super::unrecovered_end_reason(Eof, Some(PrematureEndRecovery::DirectHttp)),
+            Error
+        );
+        assert_eq!(
+            super::unrecovered_end_reason(Eof, Some(PrematureEndRecovery::Local)),
+            Eof
+        );
+        assert_eq!(super::unrecovered_end_reason(Eof, None), Eof);
+    }
+
+    #[test]
+    fn premature_http_recovery_cannot_reuse_previous_files_seekable_property() {
+        super::cache_property_value("seekable", &json!(true));
+        assert_eq!(super::cached_property_value("seekable"), Some(json!(true)));
+        super::clear_file_scoped_cached_props();
+        assert_eq!(super::cached_property_value("seekable"), None);
+    }
+
+    #[test]
+    fn unavailable_mpv_properties_preserve_premature_end_recovery_state() {
+        *super::CURRENT_TIME.lock().unwrap() = 4.9;
+        *super::TOTAL_DURATION.lock().unwrap() = 40.0;
+        super::cache_property_value("seekable", &json!(true));
+
+        for name in ["time-pos", "duration", "seekable"] {
+            super::update_cached_property(name, &PropertyData::None);
+            assert_eq!(property_data_to_json(name, &PropertyData::None), None);
+        }
+        assert_eq!(*super::CURRENT_TIME.lock().unwrap(), 4.9);
+        assert_eq!(*super::TOTAL_DURATION.lock().unwrap(), 40.0);
+        assert_eq!(super::cached_property_value("seekable"), Some(json!(true)));
+        assert_eq!(
+            super::premature_end_recovery(
+                LoadState::Loaded,
+                libmpv2::mpv_end_file_reason::Eof,
+                "https://cdn.example/video",
+                *super::CURRENT_TIME.lock().unwrap(),
+                *super::TOTAL_DURATION.lock().unwrap(),
+                super::cached_property_value("seekable").and_then(|value| value.as_bool())
+                    == Some(true),
+            ),
+            Some(super::PrematureEndRecovery::DirectHttp),
+        );
+        super::clear_file_scoped_cached_props();
+    }
+
+    #[test]
+    fn raw_event_adapter_preserves_failed_http_end_reason() {
+        use super::{wait_player_event, PlayerMpvEvent};
+        use libmpv2::{mpv_end_file_reason::Error, Mpv};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vo", "null")?;
+            init.set_property("ao", "null")?;
+            init.set_property("config", "no")?;
+            Ok(())
+        })
+        .unwrap();
+        mpv.command("loadfile", &[&format!("http://{address}/video.mp4")])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match wait_player_event(&mpv, 0.01) {
+                Some(Ok(PlayerMpvEvent::EndFile(reason))) => {
+                    assert_eq!(reason, Error);
+                    return;
+                }
+                Some(Err(error)) => panic!("failed HTTP EndFile lost its reason: {}", error),
+                _ => {}
+            }
+        }
+        panic!("failed HTTP load did not emit EndFile");
     }
 
     #[test]
