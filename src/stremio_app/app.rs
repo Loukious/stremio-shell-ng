@@ -1675,7 +1675,13 @@ impl MainWindow {
                         toggle_pip_sender.notice();
                     }
                     Some("shell-manual-skip") => {
-                        crate::stremio_app::intro_skip::trigger_manual_skip();
+                        if let Some(offer_id) = msg
+                            .get_params()
+                            .and_then(|params| params.get("offer_id"))
+                            .and_then(|value| value.as_str())
+                        {
+                            crate::stremio_app::intro_skip::trigger_manual_skip(offer_id);
+                        }
                     }
                     Some("shell-intro-skip-mode-get") => {
                         crate::stremio_app::intro_skip::send_intro_skip_mode_state(false);

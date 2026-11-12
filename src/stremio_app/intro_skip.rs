@@ -93,6 +93,7 @@ enum ManualSkipArea {
 }
 
 struct ManualSkipState {
+    id: String,
     offer: ManualSkipOffer,
     requested: bool,
 }
@@ -278,19 +279,15 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
     loop {
         std::thread::sleep(Duration::from_millis(250));
 
-        let invalid_offer = MANUAL_SKIP_OFFER.lock().is_ok_and(|mut state| {
+        if let Ok(mut state) = MANUAL_SKIP_OFFER.lock() {
             if state
                 .as_ref()
                 .is_some_and(|state| !state.offer.is_current())
             {
-                state.take();
-                true
-            } else {
-                false
+                if let Some(expired) = state.take() {
+                    send_manual_skip_state(false, None, Some(&expired.id));
+                }
             }
-        });
-        if invalid_offer {
-            send_manual_skip_state(false, None);
         }
 
         if !config.enabled {
@@ -1249,7 +1246,7 @@ fn send_auto_skip_notification(kind: SegmentKind) {
     }
 }
 
-fn send_manual_skip_state(visible: bool, kind: Option<SegmentKind>) {
+fn send_manual_skip_state(visible: bool, kind: Option<SegmentKind>, offer_id: Option<&str>) {
     let label = kind.map(|value| value.label()).unwrap_or_default();
     if let Ok(guard) = WEB_CMD_TX.lock() {
         if let Some(tx) = guard.as_ref() {
@@ -1258,6 +1255,7 @@ fn send_manual_skip_state(visible: bool, kind: Option<SegmentKind>) {
                 {
                     "visible": visible,
                     "kind": label,
+                    "offer_id": offer_id,
                 }
             ]))))
             .ok();
@@ -1300,40 +1298,37 @@ pub fn set_manual_intro_outro_enabled(enabled: bool) {
 }
 
 fn set_manual_skip_offer(offer: ManualSkipOffer) {
-    if !offer.is_current() {
-        return;
-    }
     let kind = offer.kind;
     if let Ok(mut guard) = MANUAL_SKIP_OFFER.lock() {
+        if !offer.is_current() {
+            return;
+        }
         if guard.as_ref().is_some_and(|state| state.offer == offer) {
             return;
         }
         *guard = Some(ManualSkipState {
+            id: uuid::Uuid::new_v4().to_string(),
             offer,
             requested: false,
         });
-    } else {
-        return;
+        if let Some(state) = guard.as_ref() {
+            send_manual_skip_state(true, Some(kind), Some(&state.id));
+        }
     }
-
-    send_manual_skip_state(true, Some(kind));
 }
 
 fn clear_manual_skip_offer() {
-    let had_offer = MANUAL_SKIP_OFFER
-        .lock()
-        .map(|mut guard| guard.take().is_some())
-        .unwrap_or(false);
-
-    if had_offer {
-        send_manual_skip_state(false, None);
+    if let Ok(mut guard) = MANUAL_SKIP_OFFER.lock() {
+        if let Some(state) = guard.take() {
+            send_manual_skip_state(false, None, Some(&state.id));
+        }
     }
 }
 
-pub fn trigger_manual_skip() -> bool {
+pub fn trigger_manual_skip(offer_id: &str) -> bool {
     let offer = MANUAL_SKIP_OFFER.lock().ok().and_then(|mut guard| {
         let state = guard.as_mut()?;
-        if state.requested || !state.offer.is_current() {
+        if state.id != offer_id || state.requested || !state.offer.is_current() {
             return None;
         }
         // Keep the offer latched until MPV actually leaves its chapter/segment.
@@ -1352,14 +1347,14 @@ pub fn trigger_manual_skip() -> bool {
     };
 
     if sent {
-        send_manual_skip_state(false, None);
+        send_manual_skip_state(false, None, Some(offer_id));
         println!(
             "⏭️ ManualSkip {} requested for {}",
             offer.kind.label(),
             offer.route
         );
     } else if let Ok(mut guard) = MANUAL_SKIP_OFFER.lock() {
-        if let Some(state) = guard.as_mut().filter(|state| state.offer == offer) {
+        if let Some(state) = guard.as_mut().filter(|state| state.id == offer_id) {
             state.requested = false;
         }
     }
@@ -1487,9 +1482,12 @@ mod tests {
         SegmentKind, SkipAction, SkipHistory,
     };
 
+    static GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn auto_skip_notifications_only_include_openings_and_endings() {
         use super::{send_auto_skip_notification, WEB_CMD_TX};
+        let _test_guard = GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let (tx, rx) = flume::unbounded();
         *WEB_CMD_TX.lock().unwrap() = Some(tx);
         send_auto_skip_notification(SegmentKind::Intro);
@@ -1533,8 +1531,23 @@ mod tests {
     #[test]
     fn manual_skip_rejects_stale_and_guest_offers_and_suppresses_repeat_clicks() {
         use super::*;
+        let _test_guard = GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let (tx, rx) = flume::unbounded();
+        let (web_tx, web_rx) = flume::unbounded();
         *PLAYER_CMD_TX.lock().unwrap() = Some(tx);
+        *WEB_CMD_TX.lock().unwrap() = Some(web_tx);
+        let published_offer_id = || {
+            web_rx
+                .try_iter()
+                .map(|message| serde_json::from_str::<serde_json::Value>(&message).unwrap())
+                .filter(|message| {
+                    message["args"][0] == "shell-manual-skip-state"
+                        && message["args"][1]["visible"] == true
+                })
+                .map(|message| message["args"][1]["offer_id"].as_str().unwrap().to_owned())
+                .last()
+                .expect("manual offer must include an ID")
+        };
         *CURRENT_URL.lock().unwrap() = "episode-one".into();
         *IS_FILE_LOADED.lock().unwrap() = true;
         *CURRENT_TIME.lock().unwrap() = 30.0;
@@ -1551,26 +1564,65 @@ mod tests {
             }),
         };
         set_manual_skip_offer(offer.clone());
+        let offer_id = published_offer_id();
+        set_manual_skip_offer(offer.clone());
+        assert!(
+            web_rx.is_empty(),
+            "unchanged offers keep their ID and timeout"
+        );
         *CURRENT_TIME.lock().unwrap() = 120.0;
-        assert!(!trigger_manual_skip());
+        assert!(!trigger_manual_skip(&offer_id));
         assert!(rx.is_empty());
         *CURRENT_TIME.lock().unwrap() = 30.0;
         *LOBBY_ROLE.lock().unwrap() = LobbyRole::Guest;
-        assert!(!trigger_manual_skip());
+        assert!(!trigger_manual_skip(&offer_id));
         *LOBBY_ROLE.lock().unwrap() = LobbyRole::None;
-        assert!(trigger_manual_skip());
+        assert!(!trigger_manual_skip(""));
+        assert!(!trigger_manual_skip("unknown-offer"));
+        assert!(trigger_manual_skip(&offer_id));
         assert_eq!(
             rx.try_recv().unwrap(),
             r#"["mpv-command",["seek","90","absolute"]]"#
         );
         set_manual_skip_offer(offer.clone());
-        assert!(!trigger_manual_skip());
+        assert!(!trigger_manual_skip(&offer_id));
         assert!(rx.is_empty());
         clear_manual_skip_offer();
-        set_manual_skip_offer(offer);
-        assert!(trigger_manual_skip());
+        set_manual_skip_offer(offer.clone());
+        let renewed_id = published_offer_id();
+        assert_ne!(renewed_id, offer_id);
+        assert!(!trigger_manual_skip(&offer_id));
+        assert!(rx.is_empty());
+
+        // Playback has moved to an ending while the old opening click is in transit.
+        *CURRENT_TIME.lock().unwrap() = 120.0;
+        set_manual_skip_offer(ManualSkipOffer {
+            kind: SegmentKind::Outro,
+            action: ManualSkipAction::NextTrack,
+            area: ManualSkipArea::Segment(SegmentKey {
+                kind: SegmentKind::Outro,
+                start_ms: 100_000,
+                end_ms: -1,
+            }),
+            ..offer
+        });
+        let ending_id = published_offer_id();
+        assert!(!trigger_manual_skip(&renewed_id));
+        assert!(
+            web_rx.is_empty(),
+            "stale opening click must not advance the episode"
+        );
+        assert!(trigger_manual_skip(&ending_id));
+        let messages: Vec<serde_json::Value> = web_rx
+            .try_iter()
+            .map(|message| serde_json::from_str(&message).unwrap())
+            .collect();
+        assert_eq!(messages[0]["args"], json!(["media-key", "next-track"]));
+        assert_eq!(messages[1]["args"][1]["offer_id"], ending_id);
+        assert!(!trigger_manual_skip(&ending_id));
         set_manual_intro_outro_enabled(false);
         *PLAYER_CMD_TX.lock().unwrap() = None;
+        *WEB_CMD_TX.lock().unwrap() = None;
         *CURRENT_URL.lock().unwrap() = String::new();
         *IS_FILE_LOADED.lock().unwrap() = false;
         *CURRENT_TIME.lock().unwrap() = 0.0;

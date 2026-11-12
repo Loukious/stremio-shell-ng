@@ -2,7 +2,7 @@
     if (window.self !== window.top || window.__stremioShellIntroSkipInstalled) return;
     window.__stremioShellIntroSkipInstalled = true;
 
-    var state = { mode: 'auto', visible: false, kind: '', hidden: false, language: '', error: false, pendingMode: null };
+    var state = { mode: 'auto', visible: false, offerId: null, kind: '', hidden: false, language: '', error: false, pendingMode: null };
     var hideTimer, closeTimer, toastTimer;
     var panelOpen = false;
     var settingsButton, skipButton, panel, toast;
@@ -36,8 +36,9 @@
             toast.id = 'stremio-shell-auto-skip-toast';
             toast.setAttribute('role', 'status');
             toast.setAttribute('aria-atomic', 'true');
-            document.body.appendChild(toast);
+            if (document.body) document.body.appendChild(toast);
         }
+        placeButton();
         clearTimeout(toastTimer);
         toast.textContent = strings()[kind + 'Skipped'];
         toast.hidden = false;
@@ -87,7 +88,7 @@
             input.disabled = state.pendingMode !== null;
         });
         skipButton.querySelector('span').textContent = copy[state.kind] || copy.intro;
-        skipButton.hidden = !isPlayer() || !state.visible || state.hidden;
+        skipButton.hidden = !isPlayer() || !state.visible || state.hidden || !state.offerId;
     }
 
     function positionPanel() {
@@ -100,16 +101,10 @@
     function findAnchor() {
         var pip = document.getElementById('stremio-shell-pip-btn');
         if (pip && pip.isConnected) return pip;
-        var elements = document.querySelectorAll('[title],[aria-label]');
-        for (var i = 0; i < elements.length; i++) {
-            var el = elements[i];
-            var hint = (el.getAttribute('title') || '') + ' ' + (el.getAttribute('aria-label') || '');
-            if (/fullscreen|full screen|pantalla completa/i.test(hint) && el.getBoundingClientRect().width > 0) return el;
-        }
-        return null;
+        return window.__stremioShellFindFullscreenControl();
     }
 
-    function install(anchor) {
+    function install() {
         var style = document.createElement('style');
         style.textContent = `
             .shell-intro-control { border:0; font:inherit; color:var(--primary-foreground-color); cursor:pointer; }
@@ -154,7 +149,7 @@
         settingsButton = document.createElement('button');
         settingsButton.type = 'button';
         settingsButton.id = 'stremio-shell-intro-skip-settings-btn';
-        settingsButton.className = anchor.className + ' shell-intro-control';
+        settingsButton.className = 'shell-intro-control';
         settingsButton.innerHTML = icon;
         settingsButton.setAttribute('aria-controls', 'stremio-shell-intro-skip-panel');
         settingsButton.setAttribute('aria-expanded', 'false');
@@ -190,8 +185,10 @@
         skipButton.innerHTML = icon + '<span></span>';
         skipButton.addEventListener('click', function (event) {
             event.stopPropagation();
-            post('shell-manual-skip');
+            if (!isPlayer() || !state.visible || state.hidden || !state.offerId) return;
+            post('shell-manual-skip', { offer_id: state.offerId });
             state.hidden = true;
+            state.offerId = null;
             render();
         });
         document.body.appendChild(skipButton);
@@ -199,6 +196,9 @@
     }
 
     function placeButton() {
+        if (!document.head || !document.body) return;
+        if (!panel) install();
+        if (toast && !toast.isConnected) document.body.appendChild(toast);
         if (!isPlayer()) {
             if (settingsButton) settingsButton.remove();
             closePanel(false);
@@ -206,7 +206,6 @@
         }
         var anchor = findAnchor();
         if (!anchor || !anchor.parentElement) return;
-        if (!settingsButton) install(anchor);
         if (settingsButton.parentElement !== anchor.parentElement || settingsButton.nextElementSibling !== anchor) {
             settingsButton.className = anchor.className + ' shell-intro-control';
             anchor.parentElement.insertBefore(settingsButton, anchor);
@@ -223,11 +222,13 @@
             showAutoSkipToast(next.kind);
             return;
         } else if (args[0] === 'shell-manual-skip-state') {
+            if (!next.visible && typeof next.offer_id === 'string' && next.offer_id !== state.offerId) return;
             clearTimeout(hideTimer);
-            state.visible = !!next.visible;
+            state.visible = !!next.visible && typeof next.offer_id === 'string' && next.offer_id.length > 0;
+            state.offerId = state.visible ? next.offer_id : null;
             state.kind = next.kind;
             state.hidden = false;
-            if (state.visible) hideTimer = setTimeout(function () { state.hidden = true; render(); }, 8000);
+            if (state.visible) hideTimer = setTimeout(function () { state.hidden = true; state.offerId = null; render(); }, 8000);
         } else if (args[0] === 'shell-intro-skip-mode-state') {
             if (next.mode === 'auto' || next.mode === 'manual') state.mode = next.mode;
             state.error = !!next.error;
@@ -254,6 +255,7 @@
     }, true);
     window.addEventListener('hashchange', function () {
         state.visible = false;
+        state.offerId = null;
         clearTimeout(hideTimer);
         if (toast && !isPlayer()) {
             clearTimeout(toastTimer);
@@ -275,7 +277,8 @@
         } catch (_) {}
     }
     setInterval(refresh, 1000);
-    new MutationObserver(placeButton).observe(document.documentElement, { childList: true, subtree: true });
+    document.addEventListener('DOMContentLoaded', placeButton);
+    new MutationObserver(placeButton).observe(document, { childList: true, subtree: true });
     refresh();
     post('shell-intro-skip-mode-get');
 })();

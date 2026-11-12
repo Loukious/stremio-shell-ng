@@ -192,6 +192,8 @@ const DISCORD_RPC_DEFAULT_SCRIPT: &str = r##"
 })();
 "##;
 
+const PLAYER_CONTROLS_SCRIPT: &str = include_str!("player_controls.js");
+
 const PIP_BUTTON_SCRIPT: &str = r##"
 ;(function(){
     if (window.self !== window.top) return;
@@ -208,23 +210,8 @@ const PIP_BUTTON_SCRIPT: &str = r##"
         return (location.hash || '').indexOf('/player') !== -1;
     }
 
-    function isFullscreenControl(el){
-        if (!el) return false;
-        var hint = ((el.getAttribute('title') || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
-        return hint.indexOf('fullscreen') !== -1
-            || hint.indexOf('full screen') !== -1
-            || hint.indexOf('pantalla completa') !== -1;
-    }
-
     function findFullscreenBtn(){
-        var els = document.querySelectorAll('[title],[aria-label]');
-        for (var i = 0; i < els.length; i++){
-            if (isFullscreenControl(els[i])){
-                var rect = els[i].getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) return els[i];
-            }
-        }
-        return null;
+        return window.__stremioShellFindFullscreenControl();
     }
 
     function buildPipButton(fsBtn){
@@ -657,6 +644,8 @@ impl PartialUi for WebView {
                                 wv.execute_script(DISCORD_RPC_DEFAULT_SCRIPT, |_| Ok(()))
                                     .expect("Cannot apply Discord RPC default in webview");
                             }
+                            wv.execute_script(PLAYER_CONTROLS_SCRIPT, |_| Ok(()))
+                                .expect("Cannot add player controls helper to webview");
                             wv.execute_script(PIP_BUTTON_SCRIPT, |_| Ok(()))
                                 .expect("Cannot add PiP button script to webview");
                             wv.execute_script(INTRO_SKIP_CONTROLS_SCRIPT, |_| Ok(()))
