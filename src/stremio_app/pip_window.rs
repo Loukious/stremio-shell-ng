@@ -581,6 +581,21 @@ impl PipWindow {
                     }
                     None
                 }
+                winapi::um::winuser::WM_DPICHANGED => {
+                    let rect = unsafe { &*(l as *const RECT) };
+                    unsafe {
+                        SetWindowPos(
+                            hwnd,
+                            ptr::null_mut(),
+                            rect.left,
+                            rect.top,
+                            rect.right - rect.left,
+                            rect.bottom - rect.top,
+                            SWP_NOACTIVATE | winapi::um::winuser::SWP_NOZORDER,
+                        );
+                    }
+                    Some(0)
+                }
                 WM_NCHITTEST => Some(hit_test(hwnd, l)),
                 WM_SIZE => {
                     unsafe {

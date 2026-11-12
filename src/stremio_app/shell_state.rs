@@ -21,6 +21,7 @@ const SHELL_STATE_VERSION: u32 = 2;
 const VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 pub const DEFAULT_VOLUME: f64 = 100.0;
 const MAX_VOLUME: f64 = 130.0;
+pub const DEFAULT_INTERFACE_SCALE: u64 = 100;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PipPlacement {
@@ -132,6 +133,8 @@ struct ShellState {
     volume: f64,
     #[serde(default)]
     discord_rpc_default_applied: bool,
+    #[serde(default = "default_interface_scale")]
+    interface_scale: u64,
 }
 
 impl Default for ShellState {
@@ -143,6 +146,7 @@ impl Default for ShellState {
             pip: None,
             volume: DEFAULT_VOLUME,
             discord_rpc_default_applied: false,
+            interface_scale: DEFAULT_INTERFACE_SCALE,
         }
     }
 }
@@ -206,6 +210,36 @@ pub fn load_volume() -> f64 {
     sanitize_volume(shell_state_lock().volume)
 }
 
+pub fn valid_interface_scale(scale: u64) -> bool {
+    (75..=175).contains(&scale)
+}
+
+fn default_interface_scale() -> u64 {
+    DEFAULT_INTERFACE_SCALE
+}
+
+fn sanitize_interface_scale(scale: u64) -> u64 {
+    if valid_interface_scale(scale) {
+        scale
+    } else {
+        DEFAULT_INTERFACE_SCALE
+    }
+}
+
+pub fn load_interface_scale() -> u64 {
+    sanitize_interface_scale(shell_state_lock().interface_scale)
+}
+
+pub fn save_interface_scale(scale: u64) -> io::Result<()> {
+    if !valid_interface_scale(scale) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Interface scale must be between 75 and 175 percent",
+        ));
+    }
+    update_shell_state(|state| state.interface_scale = scale)
+}
+
 pub fn save_volume_debounced(volume: f64) {
     if volume.is_finite() {
         VOLUME_SAVE_TX.send(sanitize_volume(volume)).ok();
@@ -249,6 +283,7 @@ fn update_shell_state(update: impl FnOnce(&mut ShellState)) -> io::Result<()> {
     update(&mut state);
     state.version = SHELL_STATE_VERSION;
     state.volume = sanitize_volume(state.volume);
+    state.interface_scale = sanitize_interface_scale(state.interface_scale);
     save_state_to_path(&state_paths().current, &state)
 }
 
@@ -262,6 +297,7 @@ fn load_or_migrate_state(paths: &StatePaths) -> ShellState {
     if let Some(mut state) = read_json::<ShellState>(&paths.current) {
         state.version = SHELL_STATE_VERSION;
         state.volume = sanitize_volume(state.volume);
+        state.interface_scale = sanitize_interface_scale(state.interface_scale);
         return state;
     }
 
@@ -453,6 +489,7 @@ mod tests {
             }),
             volume: 47.25,
             discord_rpc_default_applied: true,
+            interface_scale: 125,
             ..ShellState::default()
         };
 
@@ -467,6 +504,26 @@ mod tests {
         let state: ShellState = serde_json::from_str(r#"{"version":1,"volume":100.0}"#).unwrap();
 
         assert!(!state.discord_rpc_default_applied);
+        assert_eq!(state.interface_scale, DEFAULT_INTERFACE_SCALE);
+    }
+
+    #[test]
+    fn invalid_saved_interface_scale_uses_default() {
+        let paths = test_paths("interface-scale");
+        let state = ShellState {
+            interface_scale: 500,
+            ..ShellState::default()
+        };
+        save_state_to_path(&paths.current, &state).unwrap();
+        assert_eq!(
+            load_or_migrate_state(&paths).interface_scale,
+            DEFAULT_INTERFACE_SCALE
+        );
+        assert!(valid_interface_scale(75));
+        assert!(valid_interface_scale(175));
+        assert!(!valid_interface_scale(74));
+        assert!(!valid_interface_scale(176));
+        fs::remove_dir_all(paths.current.parent().unwrap()).ok();
     }
 
     #[test]

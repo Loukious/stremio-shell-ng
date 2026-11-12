@@ -82,17 +82,31 @@ impl PlayerEnded {
 pub struct PlayerError {
     pub error: String,
 }
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerVideoReady {
+    pub load_id: u64,
+    pub ready: bool,
+}
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum PlayerEvent {
     PropChange(PlayerProprChange),
     End(PlayerEnded),
     Error(PlayerError),
+    VideoReady(PlayerVideoReady),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PlayerResponse<'a>(pub &'a str, pub PlayerEvent);
 impl PlayerResponse<'_> {
+    pub fn video_ready(load_id: u64, ready: bool) -> PlayerResponse<'static> {
+        PlayerResponse(
+            "mpv-event-video-ready",
+            PlayerEvent::VideoReady(PlayerVideoReady { load_id, ready }),
+        )
+    }
+
     pub fn to_value(&self) -> Option<serde_json::Value> {
         serde_json::to_value(self).ok()
     }
@@ -251,17 +265,81 @@ pub enum MpvCmd {
     Cycle,
     Seek,
     Keypress,
+    SubAdd,
+    SubRemove,
 }
 stringable!(MpvCmd);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
-#[serde(untagged)]
+#[serde(try_from = "Vec<String>", into = "Vec<String>")]
 pub enum CmdVal {
     Single((MpvCmd,)),
     Double(MpvCmd, String),
     Tripple(MpvCmd, String, String),
     Quadruple(MpvCmd, String, String, String),
     Quintuple(MpvCmd, String, String, String, String),
+}
+impl TryFrom<Vec<String>> for CmdVal {
+    type Error = String;
+
+    fn try_from(parts: Vec<String>) -> Result<Self, Self::Error> {
+        if parts.iter().any(|part| part.contains('\0')) {
+            return Err("MPV command contains a NUL byte".to_string());
+        }
+        let name = parts
+            .first()
+            .ok_or("empty MPV command")?
+            .parse::<MpvCmd>()
+            .map_err(|_| "unsupported MPV command")?;
+        let supported = match name {
+            MpvCmd::Loadfile => match parts.as_slice() {
+                [_, _] => true,
+                [_, _, mode] => mode == "replace",
+                [_, _, mode, start] => mode == "replace" && is_safe_start_option(start),
+                [_, _, mode, index, start] => {
+                    mode == "replace" && index == "-1" && is_safe_start_option(start)
+                }
+                _ => false,
+            },
+            MpvCmd::Stop => parts.len() == 1,
+            MpvCmd::SubAdd => parts.len() == 5 && parts[2] == "auto",
+            MpvCmd::SubRemove => parts.len() == 2 && parts[1].parse::<u64>().is_ok_and(|id| id > 0),
+            // These commands are also used by the shell's key bindings and watch parties.
+            MpvCmd::Add | MpvCmd::Cycle | MpvCmd::Seek | MpvCmd::Keypress => {
+                (2..=5).contains(&parts.len())
+            }
+        };
+        if !supported {
+            return Err("unsupported MPV command arguments".to_string());
+        }
+        let mut args = parts.into_iter().skip(1);
+        Ok(match args.len() {
+            0 => Self::Single((name,)),
+            1 => Self::Double(name, args.next().unwrap()),
+            2 => Self::Tripple(name, args.next().unwrap(), args.next().unwrap()),
+            3 => Self::Quadruple(
+                name,
+                args.next().unwrap(),
+                args.next().unwrap(),
+                args.next().unwrap(),
+            ),
+            4 => Self::Quintuple(
+                name,
+                args.next().unwrap(),
+                args.next().unwrap(),
+                args.next().unwrap(),
+                args.next().unwrap(),
+            ),
+            _ => unreachable!(),
+        })
+    }
+}
+
+fn is_safe_start_option(option: &str) -> bool {
+    option
+        .strip_prefix("start=+")
+        .and_then(|start| start.parse::<f64>().ok())
+        .is_some_and(|start| start.is_finite() && start >= 0.0)
 }
 impl From<CmdVal> for Vec<String> {
     fn from(cmd: CmdVal) -> Vec<String> {

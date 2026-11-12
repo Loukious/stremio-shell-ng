@@ -55,7 +55,7 @@ pub struct RPCResponse {
 }
 
 impl RPCResponse {
-    pub fn get_handshake() -> String {
+    pub fn get_handshake(streaming_server_url: Option<&str>) -> String {
         let resp = RPCResponse {
             id: 0,
             object: "transport".to_string(),
@@ -75,6 +75,30 @@ impl RPCResponse {
                             "gpuVideoProcessing".to_string(),
                             "".to_string(),
                             gpu_video_processing::gpu_video_processing_supported().to_string(),
+                        ],
+                        vec![
+                            "".to_string(),
+                            "cacheDirectoryPicker".to_string(),
+                            "".to_string(),
+                            streaming_server_url.is_some().to_string(),
+                        ],
+                        vec![
+                            "".to_string(),
+                            "streamingServerUrl".to_string(),
+                            "".to_string(),
+                            streaming_server_url.unwrap_or_default().to_string(),
+                        ],
+                        vec![
+                            "".to_string(),
+                            "nativeInterfaceScale".to_string(),
+                            "".to_string(),
+                            "true".to_string(),
+                        ],
+                        vec![
+                            "".to_string(),
+                            "nativeAssSubtitles".to_string(),
+                            "".to_string(),
+                            "true".to_string(),
                         ],
                     ],
                     signals: vec![],
@@ -107,6 +131,7 @@ impl RPCResponse {
             "state": state,
         }])))
     }
+    #[cfg(feature = "steam-sync")]
     pub fn open_media(url: String) -> String {
         Self::response_message(Some(json!(["open-media", url])))
     }

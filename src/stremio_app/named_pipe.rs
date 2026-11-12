@@ -5,6 +5,8 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::os::windows::prelude::OsStrExt;
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 use winapi::shared::minwindef::{DWORD, LPCVOID, LPVOID};
 use winapi::shared::winerror;
 use winapi::um::fileapi::OPEN_EXISTING;
@@ -204,6 +206,41 @@ impl PipeServer {
     }
 }
 
+pub enum SingleInstance {
+    Forwarded,
+    Primary(PipeServer),
+    Unavailable(io::Error),
+}
+
+// Retry while another instance owns the pipe (bind fails with ERROR_ACCESS_DENIED).
+pub fn acquire_single_instance(
+    path: &Path,
+    command: &[u8],
+    attempts: u32,
+    delay: Duration,
+) -> SingleInstance {
+    let mut attempt = 1;
+    loop {
+        if let Ok(mut stream) = PipeClient::connect(path) {
+            match stream.write_all(command).and_then(|_| stream.flush()) {
+                Ok(()) => return SingleInstance::Forwarded,
+                Err(error) => {
+                    eprintln!("Failed to forward command to existing Stremio instance: {error}")
+                }
+            }
+        }
+        match PipeServer::bind(path) {
+            Ok(server) => return SingleInstance::Primary(server),
+            Err(error)
+                if attempt < attempts
+                    && error.raw_os_error() == Some(winerror::ERROR_ACCESS_DENIED as i32) => {}
+            Err(error) => return SingleInstance::Unavailable(error),
+        }
+        attempt += 1;
+        thread::sleep(delay);
+    }
+}
+
 #[derive(Debug)]
 struct Handle {
     inner: HANDLE,
@@ -221,7 +258,7 @@ unsafe impl Send for Handle {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
+    use std::{collections::HashSet, iter, path::PathBuf, thread, time::Instant};
 
     #[test]
     fn duplex_communication() {
@@ -248,5 +285,126 @@ mod tests {
         drop(stream);
 
         thread.join().unwrap();
+    }
+
+    const SHORT_DELAY: Duration = Duration::from_millis(20);
+
+    fn pipe_path(name: &str) -> PathBuf {
+        PathBuf::from(format!(
+            "//./pipe/stremio-test-{}-{name}",
+            std::process::id()
+        ))
+    }
+
+    fn receive(listener: &mut PipeServer) -> Vec<u8> {
+        let mut stream = listener.accept().unwrap();
+        let mut buf = vec![];
+        stream.read_to_end(&mut buf).ok();
+        buf
+    }
+
+    #[test]
+    fn single_instance_becomes_primary_without_owner() {
+        let path = pipe_path("primary");
+        let mut listener = match acquire_single_instance(&path, b"", 1, SHORT_DELAY) {
+            SingleInstance::Primary(listener) => listener,
+            _ => panic!("Expected the first launch to become primary"),
+        };
+        let receiver = thread::spawn(move || receive(&mut listener));
+        assert!(matches!(
+            acquire_single_instance(&path, b"stremio:///detail", 1, SHORT_DELAY),
+            SingleInstance::Forwarded
+        ));
+        assert_eq!(receiver.join().unwrap(), b"stremio:///detail");
+    }
+
+    #[test]
+    fn single_instance_retries_until_busy_owner_releases_pipe() {
+        let path = pipe_path("released");
+        let owner = PipeServer::bind(&path).unwrap();
+        let busy = PipeClient::connect(&path).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            drop(busy);
+            drop(owner);
+        });
+        assert!(matches!(
+            acquire_single_instance(&path, b"", 50, SHORT_DELAY),
+            SingleInstance::Primary(_)
+        ));
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn single_instance_stops_after_bounded_attempts() {
+        let path = pipe_path("exhausted");
+        let _owner = PipeServer::bind(&path).unwrap();
+        let _busy = PipeClient::connect(&path).unwrap();
+        let started = Instant::now();
+        match acquire_single_instance(&path, b"", 3, SHORT_DELAY) {
+            SingleInstance::Unavailable(error) => assert_eq!(
+                error.raw_os_error(),
+                Some(winerror::ERROR_ACCESS_DENIED as i32)
+            ),
+            _ => panic!("Expected the busy pipe to stay unavailable"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn single_instance_does_not_retry_other_errors() {
+        let path = Path::new("//./not-a-pipe/stremio-test");
+        let started = Instant::now();
+        match acquire_single_instance(path, b"", 10, Duration::from_secs(1)) {
+            SingleInstance::Unavailable(error) => assert_ne!(
+                error.raw_os_error(),
+                Some(winerror::ERROR_ACCESS_DENIED as i32)
+            ),
+            _ => panic!("Expected an invalid pipe path to fail"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn concurrent_launches_elect_one_primary() {
+        const LAUNCHES: usize = 8;
+        const DONE: &[u8] = b"done";
+        let path = pipe_path("concurrent");
+        let launches = (0..LAUNCHES)
+            .map(|launch| {
+                let path = path.clone();
+                thread::spawn(move || {
+                    let command = launch.to_string();
+                    match acquire_single_instance(&path, command.as_bytes(), 100, SHORT_DELAY) {
+                        // Receive on another thread so forwarding launches can finish.
+                        SingleInstance::Primary(mut listener) => Some(thread::spawn(move || {
+                            let received = iter::repeat_with(|| receive(&mut listener))
+                                .take_while(|message| message != DONE)
+                                .map(|message| String::from_utf8(message).unwrap())
+                                .collect::<HashSet<_>>();
+                            (command, received)
+                        })),
+                        SingleInstance::Forwarded => None,
+                        SingleInstance::Unavailable(error) => panic!("{}", error),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = launches
+            .into_iter()
+            .map(|launch| launch.join())
+            .collect::<Vec<_>>();
+        let primaries = results
+            .into_iter()
+            .filter_map(|result| result.ok().flatten())
+            .collect::<Vec<_>>();
+        assert_eq!(primaries.len(), 1);
+        PipeClient::connect(&path).unwrap().write_all(DONE).unwrap();
+        let (primary, received) = primaries.into_iter().next().unwrap().join().unwrap();
+        let forwarded = (0..LAUNCHES)
+            .map(|launch| launch.to_string())
+            .filter(|command| command != &primary)
+            .collect::<HashSet<_>>();
+        assert_eq!(received, forwarded);
     }
 }

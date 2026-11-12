@@ -1,6 +1,6 @@
 use crate::stremio_app::stremio_player::communication::{
-    BoolProp, CmdVal, InMsg, InMsgArgs, InMsgFn, MpvCmd, PlayerEnded, PlayerProprChange, PropKey,
-    PropVal,
+    BoolProp, CmdVal, InMsg, InMsgArgs, InMsgFn, MpvCmd, PlayerEnded, PlayerProprChange,
+    PlayerResponse, PropKey, PropVal,
 };
 use libmpv2::{events::PropertyData, mpv_end_file_reason};
 
@@ -183,43 +183,107 @@ fn set_gpu_video_processing_tokens() {
 
 #[test]
 fn command_stop_tokens() {
-    assert_tokens(
-        &InMsg(
+    assert_eq!(
+        serde_json::to_value(&InMsg(
             InMsgFn::MpvCommand,
             InMsgArgs::Cmd(CmdVal::Single((MpvCmd::Stop,))),
-        ),
-        &[
-            Token::TupleStruct {
-                name: "InMsg",
-                len: 2,
-            },
-            Token::Str("mpv-command"),
-            Token::Tuple { len: 1 },
-            Token::Str("stop"),
-            Token::TupleEnd,
-            Token::TupleStructEnd,
-        ],
+        ))
+        .unwrap(),
+        serde_json::json!(["mpv-command", ["stop"]])
     );
 }
 
 #[test]
 fn command_loadfile_tokens() {
-    assert_tokens(
-        &InMsg(
+    assert_eq!(
+        serde_json::to_value(&InMsg(
             InMsgFn::MpvCommand,
             InMsgArgs::Cmd(CmdVal::Double(MpvCmd::Loadfile, "some_file".to_string())),
-        ),
-        &[
-            Token::TupleStruct {
-                name: "InMsg",
-                len: 2,
-            },
-            Token::Str("mpv-command"),
-            Token::Tuple { len: 2 },
-            Token::Str("loadfile"),
-            Token::Str("some_file"),
-            Token::TupleEnd,
-            Token::TupleStructEnd,
-        ],
+        ))
+        .unwrap(),
+        serde_json::json!(["mpv-command", ["loadfile", "some_file"]])
+    );
+}
+
+#[test]
+fn loadfile_accepts_fractional_start_and_rejects_other_options() {
+    for parts in [
+        serde_json::json!(["loadfile", "video", "replace", "start=+12.5"]),
+        serde_json::json!(["loadfile", "video", "replace", "-1", "start=+12.5"]),
+    ] {
+        let command = serde_json::from_value::<CmdVal>(parts.clone()).unwrap();
+        assert_eq!(serde_json::to_value(command).unwrap(), parts);
+    }
+    for parts in [
+        serde_json::json!(["loadfile"]),
+        serde_json::json!(["loadfile", "video", "append"]),
+        serde_json::json!(["loadfile", "video", "replace", "0", "start=+1"]),
+        serde_json::json!(["loadfile", "video", "replace", "stream-dump=output"]),
+        serde_json::json!([
+            "loadfile",
+            "video",
+            "replace",
+            "start=+1,stream-dump=output"
+        ]),
+        serde_json::json!(["loadfile", "video", "replace", "start=+NaN"]),
+        serde_json::json!(["loadfile", "video", "replace", "start=+inf"]),
+        serde_json::json!(["loadfile", "video", "replace", "start=+-1"]),
+    ] {
+        assert!(
+            serde_json::from_value::<InMsg>(serde_json::json!(["mpv-command", parts])).is_err()
+        );
+    }
+}
+
+#[test]
+fn subtitle_commands_use_deferred_selection_and_explicit_track_ids() {
+    for parts in [
+        serde_json::json!([
+            "sub-add",
+            "https://example.com/a.ass",
+            "auto",
+            "English",
+            "eng"
+        ]),
+        serde_json::json!(["sub-remove", "7"]),
+    ] {
+        let command = serde_json::from_value::<CmdVal>(parts.clone()).unwrap();
+        assert_eq!(serde_json::to_value(command).unwrap(), parts);
+    }
+    for parts in [
+        serde_json::json!(["sub-add", "https://example.com/a.ass"]),
+        serde_json::json!([
+            "sub-add",
+            "https://example.com/a.ass",
+            "select",
+            "English",
+            "eng"
+        ]),
+        serde_json::json!(["sub-remove"]),
+        serde_json::json!(["sub-remove", "0"]),
+        serde_json::json!(["sub-remove", "-1"]),
+    ] {
+        assert!(serde_json::from_value::<CmdVal>(parts).is_err());
+    }
+}
+
+#[test]
+fn internal_player_commands_keep_their_existing_wire_shapes() {
+    for parts in [
+        serde_json::json!(["add", "chapter", "1"]),
+        serde_json::json!(["cycle", "pause"]),
+        serde_json::json!(["seek", "12.5", "absolute"]),
+        serde_json::json!(["keypress", "Ctrl+LEFT"]),
+    ] {
+        let command = serde_json::from_value::<CmdVal>(parts.clone()).unwrap();
+        assert_eq!(serde_json::to_value(command).unwrap(), parts);
+    }
+}
+
+#[test]
+fn video_ready_reports_the_load_id_in_the_frontend_protocol() {
+    assert_eq!(
+        PlayerResponse::video_ready(42, true).to_value(),
+        Some(serde_json::json!(["mpv-event-video-ready", {"loadId":42,"ready":true}]))
     );
 }
