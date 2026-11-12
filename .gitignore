@@ -1,4 +1,5 @@
 /target
+/runtime-source/
 /stremio*.exe
 /libmpv-2.dll
 /bin/libmpv-2.dll

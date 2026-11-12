@@ -10,6 +10,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$runtimeDir = switch ($Target) {
+    "x86_64-pc-windows-msvc" { "bin" }
+    "aarch64-pc-windows-msvc" { "bin-arm64" }
+    default { throw "Unsupported portable target: $Target" }
+}
+
 $releaseDir = Join-Path -Path "target" -ChildPath "$Target\release"
 $stageDir = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "stremio-portable-$([System.Guid]::NewGuid())"
 
@@ -39,6 +45,7 @@ try {
 
     Add-PortableFile -Path (Join-Path -Path $releaseDir -ChildPath "stremio-shell-ng.exe") -Name "stremio-shell-ng.exe"
     Add-PortableFile -Path (Join-Path -Path $releaseDir -ChildPath "libmpv-2.dll") -Name "libmpv-2.dll"
+    Add-PortableFile -Path (Join-Path -Path $runtimeDir -ChildPath "stremio-runtime.exe") -Name "stremio-runtime.exe"
     Add-PortableFile -Path "RPCconfig.ini" -Name "RPCconfig.ini"
     Add-PortableFile -Path "mpv.conf" -Name "mpv.conf" -Optional
 
