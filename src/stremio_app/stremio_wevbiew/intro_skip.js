@@ -148,11 +148,14 @@
         document.head.appendChild(style);
         settingsButton = document.createElement('button');
         settingsButton.type = 'button';
+        // Match PiP/fullscreen controls: playback arrows must not navigate here.
+        settingsButton.tabIndex = -1;
         settingsButton.id = 'stremio-shell-intro-skip-settings-btn';
         settingsButton.className = 'shell-intro-control';
         settingsButton.innerHTML = icon;
         settingsButton.setAttribute('aria-controls', 'stremio-shell-intro-skip-panel');
         settingsButton.setAttribute('aria-expanded', 'false');
+        settingsButton.addEventListener('mousedown', function (event) { event.preventDefault(); });
         settingsButton.addEventListener('click', function (event) {
             event.stopPropagation();
             if (panelOpen) closePanel(false);
@@ -181,8 +184,10 @@
         skipButton = document.createElement('button');
         skipButton.id = 'stremio-shell-manual-skip-btn';
         skipButton.type = 'button';
+        skipButton.tabIndex = -1;
         skipButton.className = 'shell-intro-control';
         skipButton.innerHTML = icon + '<span></span>';
+        skipButton.addEventListener('mousedown', function (event) { event.preventDefault(); });
         skipButton.addEventListener('click', function (event) {
             event.stopPropagation();
             if (!isPlayer() || !state.visible || state.hidden || !state.offerId) return;
@@ -243,13 +248,15 @@
     document.addEventListener('mousedown', function (event) {
         if (panel && !panel.contains(event.target) && !settingsButton.contains(event.target)) closePanel(false);
     }, true);
-    // Let native buttons/radios handle activation before the shell's MPV shortcuts.
+    // Keep native activation/radio navigation, but let focused toolbar controls
+    // pass playback shortcuts through after the settings panel closes.
     document.addEventListener('keydown', function (event) {
         if (panelOpen && event.key === 'Escape') {
             event.preventDefault();
             event.stopImmediatePropagation();
             closePanel(true);
-        } else if (event.target.closest('.shell-intro-control, #stremio-shell-intro-skip-panel')) {
+        } else if (event.target.closest('#stremio-shell-intro-skip-panel') ||
+            (event.target.closest('.shell-intro-control') && ['Enter', ' ', 'Spacebar', 'Tab'].indexOf(event.key) !== -1)) {
             event.stopImmediatePropagation();
         }
     }, true);
