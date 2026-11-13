@@ -1181,7 +1181,7 @@ fn create_event_thread(
                     continue;
                 }
                 PlayerMpvEvent::PlaybackRestart => {
-                    if let Some(load_id) = controller.video_ready.playback_restarted() {
+                    if let Some(load_id) = controller.on_playback_restarted() {
                         send_video_ready(&rpc_response_sender, load_id, true);
                     }
                     continue;
@@ -1686,19 +1686,34 @@ impl PlayerController {
         }
     }
 
+    fn ready_file_epoch(&self, current_file_epoch: u64) -> Option<u64> {
+        (self.state == LoadState::Loaded
+            && self.pending_media_command.is_none()
+            && self.pending_loadfile.is_none()
+            && self.loaded_file_epoch == Some(self.file_epoch)
+            && self.file_epoch != 0
+            && self.file_epoch == current_file_epoch)
+            .then_some(self.file_epoch)
+    }
+
+    fn on_playback_restarted(&mut self) -> Option<u64> {
+        let load_id = self.video_ready.playback_restarted()?;
+        // FileLoaded permits synchronization, while PlaybackRestart confirms
+        // the current video can render/play, including while it is paused.
+        // Retain this native signal even before a Steam party is initialized.
+        if let Some(file_epoch) = self.ready_file_epoch(FILE_LOAD_EPOCH.load(Ordering::Acquire)) {
+            crate::stremio_app::steam_sync::notify_player_ready(file_epoch);
+        }
+        Some(load_id)
+    }
+
     fn can_apply_local_sync(
         &self,
         command: &LocalSyncCommand,
         current_revision: u64,
         current_file_epoch: u64,
     ) -> bool {
-        self.state == LoadState::Loaded
-            && self.pending_media_command.is_none()
-            && self.pending_loadfile.is_none()
-            && self.loaded_file_epoch == Some(self.file_epoch)
-            && self.file_epoch != 0
-            && command.file_epoch == self.file_epoch
-            && command.file_epoch == current_file_epoch
+        self.ready_file_epoch(current_file_epoch) == Some(command.file_epoch)
             && command.revision == current_revision
             && command
                 .seek_to
@@ -3136,27 +3151,35 @@ mod tests {
             seek_to: Some(120.0),
         };
         assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
         controller.state = LoadState::Loading;
         assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
         controller.state = LoadState::Loaded;
         assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
         controller.loaded_file_epoch = Some(41);
         assert!(controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), Some(41));
+        assert_eq!(controller.ready_file_epoch(42), None);
 
         controller.pending_media_command = Some(CmdVal::Double(
             MpvCmd::Loadfile,
             "https://guest.example/new-source".to_string(),
         ));
         assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
         controller.pending_media_command = None;
         controller.pending_loadfile = Some(CmdVal::Double(
             MpvCmd::Loadfile,
             "https://guest.example/new-source".to_string(),
         ));
         assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
         controller.pending_loadfile = None;
         controller.state = LoadState::Stopping;
         assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
     }
 
     #[test]
@@ -3666,6 +3689,7 @@ mod tests {
         ready.queue_current_load(12);
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut reports = Vec::new();
+        let mut ready_epochs = Vec::new();
         let mut starts = 0;
         while Instant::now() < deadline {
             match wait_player_event(&mpv, 0.01) {
@@ -3686,6 +3710,10 @@ mod tests {
                         current,
                         starts == 2,
                         "old FileLoaded must not change the current controller state"
+                    );
+                    assert!(
+                        ready_epochs.is_empty(),
+                        "FileLoaded cannot announce playable readiness before PlaybackRestart"
                     );
                     let current_command = LocalSyncCommand {
                         revision: 73,
@@ -3716,8 +3744,13 @@ mod tests {
                 }
                 Some(Ok(PlayerMpvEvent::EndFile(_))) => controller.on_end_file(),
                 Some(Ok(PlayerMpvEvent::PlaybackRestart)) => {
-                    if let Some(id) = controller.video_ready.playback_restarted() {
+                    if let Some(id) = controller.on_playback_restarted() {
                         reports.push(id);
+                        if let Some(epoch) = controller.ready_file_epoch(
+                            super::FILE_LOAD_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+                        ) {
+                            ready_epochs.push(epoch);
+                        }
                     }
                     if starts == 2 {
                         break;
@@ -3729,6 +3762,11 @@ mod tests {
         }
         assert_eq!(starts, 2, "both queued files must have started");
         assert_eq!(reports, vec![replacement]);
+        assert_eq!(ready_epochs, vec![controller.file_epoch]);
+        assert!(
+            controller.on_playback_restarted().is_none(),
+            "repeated playback restarts must not announce readiness again"
+        );
     }
 
     #[test]

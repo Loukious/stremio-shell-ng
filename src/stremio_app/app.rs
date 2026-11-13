@@ -2575,6 +2575,24 @@ impl MainWindow {
                 nwg::TrayNotificationFlags::INFO_ICON,
                 false,
             ),
+            SyncUiEvent::ReadinessUpdated {
+                announcement,
+                media,
+                generation,
+                sequence,
+            } => {
+                // Keep routine readiness changes in the shared party panel;
+                // member heartbeats should not create tray balloons or flash.
+                self.update_watch_party_menu();
+                if let (Some(message), Some(identity)) = (announcement, media) {
+                    self.update_watch_party_overlay_for_readiness(
+                        Some("Watch Party"),
+                        Some(&message),
+                        Some((&identity, generation, sequence)),
+                    );
+                }
+                return;
+            }
             SyncUiEvent::Error { message } => (
                 "Watch Party Error",
                 message,
@@ -2739,10 +2757,33 @@ impl MainWindow {
         self.update_watch_party_menu();
     }
     fn update_watch_party_overlay(&self, event_title: Option<&str>, event_text: Option<&str>) {
+        self.update_watch_party_overlay_for_readiness(event_title, event_text, None);
+    }
+    fn update_watch_party_overlay_for_readiness(
+        &self,
+        event_title: Option<&str>,
+        event_text: Option<&str>,
+        announcement_context: Option<(&MediaIdentity, u64, u64)>,
+    ) {
         let party_id = LOBBY_PARTY_ID.lock().map(|p| p.clone()).unwrap_or_default();
         let member_count = LOBBY_MEMBER_COUNT.lock().map(|c| *c).unwrap_or(0);
         let max_size = LOBBY_MAX_SIZE.lock().map(|m| *m).unwrap_or(8);
         let members = LOBBY_MEMBERS.lock().map(|m| m.clone()).unwrap_or_default();
+        let readiness = crate::stremio_app::steam_sync::readiness_snapshot();
+        let (event_title, event_text) =
+            if announcement_context.is_some_and(|(media, generation, sequence)| {
+                !readiness.as_ref().is_some_and(|state| {
+                    state.media == *media
+                        && state.generation == generation
+                        && state.sequence == sequence
+                })
+            }) {
+                // The UI queue can lag behind an episode or source change. Match the event
+                // against the same current snapshot used to render this panel.
+                (None, None)
+            } else {
+                (event_title, event_text)
+            };
         let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
         let active = !party_id.is_empty() && member_count > 0;
         let role_label = match role {
@@ -2766,141 +2807,32 @@ impl MainWindow {
             "badge": badge,
             "canLeave": can_leave,
             "canKick": active && role == LobbyRole::Host,
+            "readinessKey": readiness.as_ref().map(|state| {
+                serde_json::json!([state.media, state.generation])
+            }),
+            "readinessActive": active && readiness.is_some(),
+            "readinessSequence": readiness.as_ref().map(|state| state.sequence.to_string()),
+            "eventReadinessKey": announcement_context.map(|(media, generation, _)| {
+                serde_json::json!([media, generation])
+            }),
+            "eventReadinessSequence": announcement_context.map(|(_, _, sequence)| sequence.to_string()),
             "members": members.iter().map(|member| {
+                let status = readiness.as_ref().and_then(|state| {
+                    state.members.iter().find(|entry| entry.steam_id == member.steam_id)
+                        .and_then(|entry| entry.status)
+                });
                 serde_json::json!({
                     "steamId": member.steam_id.to_string(),
                     "name": member.name,
                     "isHost": member.is_host,
+                    "readiness": status,
                 })
             }).collect::<Vec<_>>(),
             "eventTitle": event_title,
             "eventText": event_text,
         });
-        let script = r##"(function() {
-                const state = __STREMIO_WATCH_PARTY_STATE__;
-                const id = "stremio-shell-watch-party";
-                let el = document.getElementById(id);
-                if (!state.visible) {
-                    if (el) el.remove();
-                    return;
-                }
-                if (!el) {
-                    el = document.createElement("div");
-                    el.id = id;
-                    document.documentElement.appendChild(el);
-                }
-                if (!el.querySelector('[data-role="panel"]')) {
-                    el.style.cssText = [
-                        "position:fixed",
-                        "left:50%",
-                        "top:0",
-                        "transform:translateX(-50%)",
-                        "z-index:2147483647",
-                        "width:min(420px,calc(100vw - 40px))",
-                        "height:142px",
-                        "pointer-events:none"
-                    ].join(";");
-                    el.innerHTML = `
-                        <div data-role="hotspot" style="position:absolute;left:50%;top:0;transform:translateX(-50%);width:270px;height:30px;pointer-events:auto"></div>
-                        <div data-role="panel" style="
-                            position:absolute;
-                            left:50%;
-                            top:12px;
-                            transform:translate(-50%,-10px);
-                            width:100%;
-                            box-sizing:border-box;
-                            opacity:0;
-                            transition:opacity .16s ease,transform .16s ease;
-                            pointer-events:none;
-                            font:13px/1.35 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
-                            color:#f5f7fb;
-                            background:linear-gradient(135deg,rgba(19,22,34,.82),rgba(30,22,52,.74));
-                            border:1px solid rgba(142,105,255,.28);
-                            box-shadow:0 18px 60px rgba(0,0,0,.34),0 0 28px rgba(126,87,255,.12) inset;
-                            backdrop-filter:blur(18px);
-                            border-radius:8px;
-                            padding:11px 12px;
-                            overflow:hidden">
-                            <div style="display:flex;gap:10px;align-items:flex-start">
-                                <div style="width:9px;height:9px;border-radius:50%;background:#8b5cf6;box-shadow:0 0 12px rgba(139,92,246,.9);margin-top:5px;flex:0 0 auto"></div>
-                                <div style="min-width:0;flex:1">
-                                    <div data-role="badge" style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
-                                    <div data-role="event" style="margin-top:3px;color:rgba(226,232,240,.78);overflow-wrap:anywhere"></div>
-                                </div>
-                                <button data-role="leave" style="display:none;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(255,255,255,.08);color:#f8fafc;padding:6px 9px;font:inherit;cursor:pointer;flex:0 0 auto">Leave</button>
-                            </div>
-                            <div data-role="members" style="display:grid;grid-template-columns:1fr;gap:5px;margin-top:10px;max-height:86px;overflow:auto"></div>
-                        </div>
-                    `;
-                    const panel = el.querySelector('[data-role="panel"]');
-                    const show = () => {
-                        panel.style.opacity = "1";
-                        panel.style.transform = "translate(-50%,0)";
-                        panel.style.pointerEvents = "auto";
-                    };
-                    const hide = () => {
-                        if (el.matches(":hover")) return;
-                        panel.style.opacity = "0";
-                        panel.style.transform = "translate(-50%,-10px)";
-                        panel.style.pointerEvents = "none";
-                    };
-                    el.querySelector('[data-role="hotspot"]').addEventListener("mouseenter", show);
-                    panel.addEventListener("mouseenter", show);
-                    el.addEventListener("mouseleave", () => setTimeout(hide, 120));
-                    el.__stremioWatchPartyShow = show;
-                    el.__stremioWatchPartyHide = hide;
-                    el.querySelector('[data-role="leave"]').addEventListener("click", () => {
-                        try {
-                            window.chrome.webview.postMessage(JSON.stringify({
-                                id: 1,
-                                args: ["shell-watch-party-leave"]
-                            }));
-                        } catch (_) {}
-                    });
-                }
-                el.querySelector('[data-role="badge"]').textContent = state.badge || "Watch Party";
-                const event = el.querySelector('[data-role="event"]');
-                const message = [state.eventTitle, state.eventText].filter(Boolean).join(": ");
-                event.textContent = message || (state.active ? "Playback sync is active." : "");
-                const leave = el.querySelector('[data-role="leave"]');
-                leave.style.display = state.canLeave ? "block" : "none";
-                const members = el.querySelector('[data-role="members"]');
-                members.innerHTML = "";
-                (state.members || []).forEach((member) => {
-                    const row = document.createElement("div");
-                    row.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;color:rgba(241,245,249,.9)";
-                    const dot = document.createElement("div");
-                    dot.style.cssText = `width:6px;height:6px;border-radius:50%;flex:0 0 auto;background:${member.isHost ? "#8b5cf6" : "#38bdf8"}`;
-                    const name = document.createElement("div");
-                    name.textContent = `${member.name || "Unknown"}${member.isHost ? " - Host" : ""}`;
-                    name.style.cssText = "min-width:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
-                    row.appendChild(dot);
-                    row.appendChild(name);
-                    if (state.canKick && !member.isHost) {
-                        const kick = document.createElement("button");
-                        kick.textContent = "Remove";
-                        kick.style.cssText = "border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(239,68,68,.16);color:#fecaca;padding:4px 7px;font:inherit;cursor:pointer;flex:0 0 auto";
-                        kick.addEventListener("click", () => {
-                            try {
-                                window.chrome.webview.postMessage(JSON.stringify({
-                                    id: 1,
-                                    args: ["shell-watch-party-kick", { steamId: String(member.steamId) }]
-                                }));
-                            } catch (_) {}
-                        });
-                        row.appendChild(kick);
-                    }
-                    members.appendChild(row);
-                });
-                if (message && el.__stremioWatchPartyShow) {
-                    el.__stremioWatchPartyShow();
-                    clearTimeout(el.__stremioWatchPartyTimer);
-                    el.__stremioWatchPartyTimer = setTimeout(() => {
-                        if (el.__stremioWatchPartyHide) el.__stremioWatchPartyHide();
-                    }, 4200);
-                }
-            })();"##
-        .replace("__STREMIO_WATCH_PARTY_STATE__", &payload.to_string());
+        let script = include_str!("stremio_wevbiew/watch_party_overlay.js")
+            .replace("__STREMIO_WATCH_PARTY_STATE__", &payload.to_string());
 
         send_webview_script(&script);
     }

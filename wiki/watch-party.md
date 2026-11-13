@@ -41,6 +41,17 @@ The choice can be changed when the party has ended. With the option unchecked (`
 
 Older watch-party clients and protocol-1 invitation links must be updated. They are rejected rather than silently using shared-source playback.
 
+## See Who Is Ready
+
+In local-source parties, move the pointer to the top center of the window to open the watch-party panel. Everyone can see each viewer's current status:
+
+- **Selecting source**: the viewer is choosing a stream for this movie or episode.
+- **Loading video**: their chosen source is opening.
+- **Ready**: their video has loaded and can follow the host.
+- **Unknown**: that viewer's client does not report readiness; update it to this version.
+
+Status changes briefly open the panel with announcements such as “Alice is ready.” The status belongs to the current episode and resets when the episode changes. When the host reloads the same episode, its status changes to **Loading video**, while guests keep the status of their own source. Playback continues to follow the host; these announcements do not add a wait-for-everyone step.
+
 ## Join A Watch Party
 
 1. Open Steam and make sure you are signed in.

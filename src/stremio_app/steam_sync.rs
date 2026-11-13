@@ -6,14 +6,16 @@ use crate::stremio_app::stremio_player::player::{
     CURRENT_STREAM_URL, CURRENT_TIME, FILE_LOAD_EPOCH, IS_PAUSED, PLAYER_CMD_TX, TOTAL_DURATION,
 };
 use crate::stremio_app::sync_protocol::{
-    decode_steam_join_secret, encode_steam_join_secret, GuestMsg, HostMsg, LobbyMember,
-    LocalPlaybackState, MediaIdentity, SourceMode, SteamJoinSecret, SteamSyncWireMsg,
-    STEAM_SYNC_APP_ID, STEAM_SYNC_CHANNEL, STEAM_SYNC_PROTOCOL_VERSION,
+    decode_steam_join_secret, encode_steam_join_secret, GuestMsg, GuestReadiness, HostMsg,
+    LobbyMember, LocalPlaybackState, MediaIdentity, PartyReadiness, ReadinessStatus, SourceMode,
+    SteamJoinSecret, SteamSyncWireMsg, STEAM_SYNC_APP_ID, STEAM_SYNC_CHANNEL,
+    STEAM_SYNC_PROTOCOL_VERSION,
 };
 use crate::stremio_app::watch_party_local::{
     current_local_sync_revision, invalidate_local_sync, GuestLocalPlayback, GuestStateChange,
     LocalSyncCommand,
 };
+use crate::stremio_app::watch_party_readiness::{GuestReadinessRoster, HostReadinessRoster};
 
 use flume::{Receiver, Sender};
 use once_cell::sync::Lazy;
@@ -27,12 +29,31 @@ use std::time::{Duration, Instant};
 pub enum SyncUiEvent {
     HostStarted,
     JoinedHost,
-    LobbyUpdated { member_count: i32, max_size: i32 },
-    GuestJoined { name: String, member_count: i32 },
-    GuestLeft { name: String, member_count: i32 },
-    HostLeft { reason: String },
+    LobbyUpdated {
+        member_count: i32,
+        max_size: i32,
+    },
+    GuestJoined {
+        name: String,
+        member_count: i32,
+    },
+    GuestLeft {
+        name: String,
+        member_count: i32,
+    },
+    HostLeft {
+        reason: String,
+    },
     LeftLobby,
-    Error { message: String },
+    ReadinessUpdated {
+        announcement: Option<String>,
+        media: Option<MediaIdentity>,
+        generation: u64,
+        sequence: u64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +102,9 @@ enum RuntimeCommand {
     PlayerLoaded {
         file_epoch: u64,
     },
+    PlayerReady {
+        file_epoch: u64,
+    },
     PlayerUnloaded {
         file_epoch: u64,
     },
@@ -112,6 +136,8 @@ enum Mode {
         token: String,
         source_mode: SourceMode,
         local_host: LocalHostPlayback,
+        readiness: HostReadinessRoster,
+        readiness_peers: HashSet<u64>,
         max_size: i32,
         authorized_peers: HashMap<u64, LobbyMember>,
         kicked_peers: HashSet<u64>,
@@ -127,6 +153,7 @@ enum Mode {
         current_web_url: String,
         source_mode: SourceMode,
         local: GuestLocalPlayback,
+        readiness: GuestReadinessUpdates,
         last_context: Option<WebMediaContext>,
         shared_wait_epoch: u64,
     },
@@ -173,6 +200,55 @@ struct NativeMediaSnapshot {
     context: WebMediaContext,
     file_epoch: u64,
     loaded: bool,
+    loading: bool,
+    playback_ready: bool,
+}
+
+#[derive(Debug, Default)]
+struct GuestReadinessUpdates {
+    supported: bool,
+    sequence: u64,
+    last_report: Option<GuestReadiness>,
+    roster: GuestReadinessRoster,
+}
+
+impl GuestReadinessUpdates {
+    fn report(
+        &mut self,
+        local: &GuestLocalPlayback,
+        native: &NativeMediaSnapshot,
+        current_epoch: u64,
+    ) -> Option<GuestReadiness> {
+        if !self.supported {
+            return None;
+        }
+        let selection = local.selection()?;
+        let bound =
+            local.file_epoch() == Some(native.file_epoch) && native.file_epoch == current_epoch;
+        let status = if bound && native.loaded && native.playback_ready && local.is_ready() {
+            ReadinessStatus::Ready
+        } else if bound && (native.loading || native.loaded) {
+            ReadinessStatus::Loading
+        } else {
+            ReadinessStatus::Selecting
+        };
+        if self.last_report.as_ref().is_some_and(|previous| {
+            previous.media == selection.media
+                && previous.generation == selection.generation
+                && previous.status == status
+        }) {
+            return None;
+        }
+        self.sequence = self.sequence.checked_add(1)?;
+        let state = GuestReadiness {
+            media: selection.media.clone(),
+            generation: selection.generation,
+            sequence: self.sequence,
+            status,
+        };
+        self.last_report = Some(state.clone());
+        Some(state)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -223,6 +299,14 @@ static WEB_MEDIA: Lazy<Mutex<WebMediaContext>> =
     Lazy::new(|| Mutex::new(WebMediaContext::default()));
 static NATIVE_MEDIA: Lazy<Mutex<NativeMediaSnapshot>> =
     Lazy::new(|| Mutex::new(NativeMediaSnapshot::default()));
+static READINESS_SNAPSHOT: Lazy<Mutex<Option<PartyReadiness>>> = Lazy::new(|| Mutex::new(None));
+
+pub fn readiness_snapshot() -> Option<PartyReadiness> {
+    READINESS_SNAPSHOT
+        .lock()
+        .ok()
+        .and_then(|state| state.clone())
+}
 
 fn runtime_notification(command: RuntimeCommand) {
     if let Ok(runtime) = RUNTIME_TX.lock() {
@@ -259,6 +343,8 @@ pub fn update_web_media(
     if load_intent {
         if let Ok(mut native) = NATIVE_MEDIA.lock() {
             native.loaded = false;
+            native.playback_ready = false;
+            native.loading = context.media.is_some();
         }
     } else if let Ok(mut native) = NATIVE_MEDIA.lock() {
         // A current-core snapshot binds metadata for an already playing host.
@@ -293,6 +379,8 @@ pub fn notify_player_load_started(file_epoch: u64) {
             context: context.clone(),
             file_epoch,
             loaded: false,
+            loading: true,
+            playback_ready: false,
         };
     }
     invalidate_local_sync();
@@ -312,12 +400,31 @@ pub fn notify_player_loaded(file_epoch: u64) {
     runtime_notification(RuntimeCommand::PlayerLoaded { file_epoch });
 }
 
+pub fn notify_player_ready(file_epoch: u64) {
+    if let Ok(mut native) = NATIVE_MEDIA.lock() {
+        if !native.loaded
+            || native.file_epoch != file_epoch
+            || file_epoch != FILE_LOAD_EPOCH.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if native.playback_ready {
+            return;
+        }
+        native.playback_ready = true;
+        native.loading = false;
+    }
+    runtime_notification(RuntimeCommand::PlayerReady { file_epoch });
+}
+
 pub fn notify_player_unloaded(file_epoch: u64) {
     if let Ok(mut native) = NATIVE_MEDIA.lock() {
         if native.file_epoch != file_epoch {
             return;
         }
         native.loaded = false;
+        native.loading = false;
+        native.playback_ready = false;
     }
     invalidate_local_sync();
     runtime_notification(RuntimeCommand::PlayerUnloaded { file_epoch });
@@ -486,6 +593,7 @@ fn run_runtime(rx: Receiver<RuntimeCommand>, init_tx: Sender<Result<(), String>>
     loop {
         for command in rx.drain() {
             handle_command(&client, &event_tx, command, &mut mode);
+            tick_party_readiness(&client, &mut mode);
         }
 
         update_session_policy(&session_policy, &mode);
@@ -506,6 +614,7 @@ fn run_runtime(rx: Receiver<RuntimeCommand>, init_tx: Sender<Result<(), String>>
 
         drain_incoming_messages(&client, &mut mode);
         tick_host_broadcast(&client, &mut mode);
+        tick_party_readiness(&client, &mut mode);
         update_session_policy(&session_policy, &mode);
 
         thread::sleep(Duration::from_millis(30));
@@ -635,6 +744,20 @@ fn handle_command(
                 }
             }
         }
+        RuntimeCommand::PlayerReady { file_epoch } => {
+            if file_epoch == FILE_LOAD_EPOCH.load(Ordering::Acquire) {
+                if let Some(Mode::Guest {
+                    source_mode: SourceMode::Local,
+                    local,
+                    ..
+                }) = mode
+                {
+                    if !local.is_waiting() {
+                        apply_local_sync(local);
+                    }
+                }
+            }
+        }
         RuntimeCommand::PlayerUnloaded { file_epoch } => {
             if file_epoch == FILE_LOAD_EPOCH.load(Ordering::Acquire) {
                 if let Some(Mode::Guest {
@@ -688,6 +811,8 @@ fn handle_event(client: &steamworks::Client, event: RuntimeEvent, mode: &mut Opt
                     token: token.clone(),
                     source_mode,
                     local_host: LocalHostPlayback::default(),
+                    readiness: HostReadinessRoster::default(),
+                    readiness_peers: HashSet::new(),
                     max_size,
                     authorized_peers: HashMap::new(),
                     kicked_peers: HashSet::new(),
@@ -735,6 +860,7 @@ fn handle_event(client: &steamworks::Client, event: RuntimeEvent, mode: &mut Opt
                     current_web_url: String::new(),
                     source_mode: secret.source_mode,
                     local: GuestLocalPlayback::default(),
+                    readiness: GuestReadinessUpdates::default(),
                     last_context: None,
                     shared_wait_epoch: FILE_LOAD_EPOCH.load(Ordering::Acquire),
                 });
@@ -744,6 +870,7 @@ fn handle_event(client: &steamworks::Client, event: RuntimeEvent, mode: &mut Opt
                     token: secret.token,
                     name: whoami::username(),
                     local_sources: true,
+                    readiness: true,
                 };
                 send_guest_msg(client, secret.host_steam_id, hello, true);
                 send_guest_msg(client, secret.host_steam_id, GuestMsg::RequestState, true);
@@ -844,6 +971,7 @@ fn handle_host_incoming(
             token: guest_token,
             name,
             local_sources,
+            readiness: supports_readiness,
         }) => {
             if kicked_peers.contains(&peer_id) {
                 send_error(client, peer_id, "you were removed from this watch party");
@@ -899,6 +1027,29 @@ fn handle_host_incoming(
                 );
             }
             send_current_host_state(client, mode, peer_id);
+            let roster_changed = if let Some(Mode::Host {
+                source_mode: SourceMode::Local,
+                readiness,
+                readiness_peers,
+                ..
+            }) = mode
+            {
+                if supports_readiness {
+                    readiness_peers.insert(peer_id);
+                } else {
+                    readiness_peers.remove(&peer_id);
+                }
+                let _ = readiness.add_member(peer_id, supports_readiness);
+                true
+            } else {
+                false
+            };
+            tick_party_readiness(client, mode);
+            if roster_changed {
+                broadcast_readiness(client, mode);
+            } else {
+                send_current_readiness(client, mode, peer_id);
+            }
         }
         SteamSyncWireMsg::Guest(GuestMsg::RequestState) => {
             if authorized_peers.contains_key(&peer_id) {
@@ -914,6 +1065,27 @@ fn handle_host_incoming(
                     true,
                 );
                 send_current_host_state(client, mode, peer_id);
+                send_current_readiness(client, mode, peer_id);
+            }
+        }
+        SteamSyncWireMsg::Guest(GuestMsg::Readiness { state }) => {
+            if let Some(Mode::Host {
+                source_mode: SourceMode::Local,
+                authorized_peers,
+                readiness_peers,
+                readiness,
+                ..
+            }) = mode
+            {
+                if authorized_peers.contains_key(&peer_id) && readiness_peers.contains(&peer_id) {
+                    match readiness.report(peer_id, &state) {
+                        Ok(true) => broadcast_readiness(client, mode),
+                        Ok(false) => {}
+                        Err(error) => {
+                            eprintln!("Steam readiness: invalid report from {peer_id}: {error}")
+                        }
+                    }
+                }
             }
         }
         SteamSyncWireMsg::Guest(GuestMsg::Leave) => {
@@ -1011,6 +1183,7 @@ fn handle_peer_left(
             true,
         );
     }
+    remove_readiness_member(client, mode, peer_id);
 }
 
 fn kick_authorized_peer(client: &steamworks::Client, mode: &mut Option<Mode>, peer_id: u64) {
@@ -1062,6 +1235,7 @@ fn kick_authorized_peer(client: &steamworks::Client, mode: &mut Option<Mode>, pe
             true,
         );
     }
+    remove_readiness_member(client, mode, peer_id);
 }
 
 fn host_lobby_members(
@@ -1252,6 +1426,216 @@ fn send_current_host_state(client: &steamworks::Client, mode: &mut Option<Mode>,
     }
 }
 
+fn publish_readiness(state: Option<PartyReadiness>) {
+    let previous = if let Ok(mut current) = READINESS_SNAPSHOT.lock() {
+        if *current == state {
+            return;
+        }
+        std::mem::replace(&mut *current, state.clone())
+    } else {
+        return;
+    };
+    let announcement = readiness_announcement(
+        previous.as_ref(),
+        state.as_ref(),
+        &LOBBY_MEMBERS
+            .lock()
+            .map(|members| members.clone())
+            .unwrap_or_default(),
+    );
+    let media = state.as_ref().map(|state| state.media.clone());
+    let generation = state.as_ref().map_or(0, |state| state.generation);
+    let sequence = state.as_ref().map_or(0, |state| state.sequence);
+    emit_ui_event(SyncUiEvent::ReadinessUpdated {
+        announcement,
+        media,
+        generation,
+        sequence,
+    });
+}
+
+fn readiness_announcement(
+    previous: Option<&PartyReadiness>,
+    current: Option<&PartyReadiness>,
+    members: &[LobbyMember],
+) -> Option<String> {
+    let current = current?;
+    let previous = previous.filter(|previous| {
+        previous.media == current.media && previous.generation == current.generation
+    });
+    let changes = current
+        .members
+        .iter()
+        .filter_map(|row| {
+            let old = previous.and_then(|previous| {
+                previous
+                    .members
+                    .iter()
+                    .find(|old| old.steam_id == row.steam_id)
+            });
+            if old.is_some_and(|old| old.status == row.status) {
+                return None;
+            }
+            // The host may already have a decoded frame when a new episode's
+            // first roster is published. Announce that Ready state too.
+            if old.is_none() && row.status != Some(ReadinessStatus::Ready) {
+                return None;
+            }
+            let name = &members
+                .iter()
+                .find(|member| member.steam_id == row.steam_id)?
+                .name;
+            Some(match row.status? {
+                ReadinessStatus::Selecting => format!("{name} is choosing a source"),
+                ReadinessStatus::Loading => format!("{name} is loading the video"),
+                ReadinessStatus::Ready => format!("{name} is ready"),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!changes.is_empty()).then(|| changes.join(". "))
+}
+
+fn send_current_readiness(client: &steamworks::Client, mode: &Option<Mode>, peer_id: u64) {
+    if let Some(Mode::Host {
+        source_mode: SourceMode::Local,
+        readiness,
+        readiness_peers,
+        ..
+    }) = mode
+    {
+        if readiness_peers.contains(&peer_id) {
+            if let Some(state) = readiness.snapshot() {
+                send_host_msg(client, peer_id, HostMsg::Readiness { state }, true);
+            }
+        }
+    }
+}
+
+fn broadcast_readiness(client: &steamworks::Client, mode: &Option<Mode>) {
+    if let Some(Mode::Host {
+        source_mode: SourceMode::Local,
+        readiness,
+        readiness_peers,
+        ..
+    }) = mode
+    {
+        let state = readiness.snapshot();
+        publish_readiness(state.clone());
+        if let Some(state) = state {
+            for peer_id in readiness_peers {
+                send_host_msg(
+                    client,
+                    *peer_id,
+                    HostMsg::Readiness {
+                        state: state.clone(),
+                    },
+                    true,
+                );
+            }
+        }
+    }
+}
+
+fn remove_readiness_member(client: &steamworks::Client, mode: &mut Option<Mode>, peer_id: u64) {
+    if let Some(Mode::Host {
+        readiness,
+        readiness_peers,
+        ..
+    }) = mode
+    {
+        readiness_peers.remove(&peer_id);
+        if readiness.remove_member(peer_id).unwrap_or(false) {
+            broadcast_readiness(client, mode);
+        }
+    }
+}
+
+fn host_readiness_status(
+    native: &NativeMediaSnapshot,
+    media: Option<&MediaIdentity>,
+    current_epoch: u64,
+) -> ReadinessStatus {
+    let current_file = native.file_epoch == current_epoch
+        && media.is_some_and(|media| native.context.media.as_ref() == Some(media));
+    if current_file && native.loaded && native.playback_ready {
+        ReadinessStatus::Ready
+    } else if current_file && (native.loading || native.loaded) {
+        ReadinessStatus::Loading
+    } else {
+        ReadinessStatus::Selecting
+    }
+}
+
+fn tick_party_readiness(client: &steamworks::Client, mode: &mut Option<Mode>) {
+    if matches!(
+        mode,
+        Some(Mode::Host {
+            source_mode: SourceMode::Local,
+            ..
+        })
+    ) {
+        // Use the exact media generation assigned by playback synchronization.
+        // If this discovers a new episode, send its state before its roster.
+        let message = current_host_message(mode);
+        let native = NATIVE_MEDIA
+            .lock()
+            .map(|native| native.clone())
+            .unwrap_or_default();
+        let host_id = client.user().steam_id().raw();
+        let Some(Mode::Host {
+            readiness,
+            local_host,
+            authorized_peers,
+            ..
+        }) = mode
+        else {
+            return;
+        };
+        let mut changed = readiness.add_member(host_id, true).unwrap_or(false);
+        let new_media = if let Some(media) = local_host.media.as_ref() {
+            readiness
+                .set_media(media.clone(), local_host.generation)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        changed |= new_media;
+        let status = host_readiness_status(
+            &native,
+            local_host.media.as_ref(),
+            FILE_LOAD_EPOCH.load(Ordering::Acquire),
+        );
+        changed |= readiness.set_status(host_id, status).unwrap_or(false);
+        if new_media {
+            if let Some(message) = message {
+                for peer_id in authorized_peers.keys() {
+                    send_host_msg(client, *peer_id, message.clone(), true);
+                }
+            }
+        }
+        if changed {
+            broadcast_readiness(client, mode);
+        }
+    } else if let Some(Mode::Guest {
+        source_mode: SourceMode::Local,
+        local,
+        readiness,
+        host_steam_id,
+        ..
+    }) = mode
+    {
+        let native = NATIVE_MEDIA
+            .lock()
+            .map(|native| native.clone())
+            .unwrap_or_default();
+        if let Some(state) =
+            readiness.report(local, &native, FILE_LOAD_EPOCH.load(Ordering::Acquire))
+        {
+            send_guest_msg(client, *host_steam_id, GuestMsg::Readiness { state }, true);
+        }
+    }
+}
+
 fn send_web_event(name: &str, value: serde_json::Value) {
     if let Ok(web) = crate::stremio_app::stremio_wevbiew::wevbiew::WEB_CMD_TX.lock() {
         if let Some(tx) = web.as_ref() {
@@ -1369,6 +1753,7 @@ fn handle_host_message(msg: HostMsg, guest: &mut Mode) -> Result<(), String> {
         current_web_url,
         source_mode,
         local,
+        readiness,
         shared_wait_epoch,
         ..
     } = guest
@@ -1380,6 +1765,7 @@ fn handle_host_message(msg: HostMsg, guest: &mut Mode) -> Result<(), String> {
             &msg,
             HostMsg::LocalState { .. }
                 | HostMsg::LocalWaiting { .. }
+                | HostMsg::Readiness { .. }
                 | HostMsg::LobbyInfo { .. }
                 | HostMsg::LobbyClosed { .. }
         )
@@ -1387,6 +1773,28 @@ fn handle_host_message(msg: HostMsg, guest: &mut Mode) -> Result<(), String> {
         return Err("The host sent an incompatible playback message. Update both clients; local-source parties cannot use shared media links.".to_string());
     }
     match msg {
+        HostMsg::Readiness { state } => {
+            if *source_mode != SourceMode::Local {
+                return Err(
+                    "The watch-party source mode does not match its readiness roster.".to_string(),
+                );
+            }
+            let Some(selection) = local.selection() else {
+                return Ok(());
+            };
+            if readiness
+                .roster
+                .ingest(state, &selection.media, selection.generation)?
+            {
+                readiness.supported = true;
+                publish_readiness(
+                    readiness
+                        .roster
+                        .current(&selection.media, selection.generation)
+                        .cloned(),
+                );
+            }
+        }
         HostMsg::LocalWaiting {
             generation,
             sequence,
@@ -1408,6 +1816,8 @@ fn handle_host_message(msg: HostMsg, guest: &mut Mode) -> Result<(), String> {
             }
             match local.ingest(state, Instant::now())? {
                 GuestStateChange::Select(selection) => {
+                    readiness.roster.clear();
+                    publish_readiness(None);
                     send_web_event(
                         "shell-watch-party-select-source",
                         serde_json::json!({
@@ -1617,6 +2027,7 @@ fn set_lobby_role(role: LobbyRole) {
 
 fn clear_lobby_globals() {
     invalidate_local_sync();
+    publish_readiness(None);
     send_web_event("shell-watch-party-local-clear", serde_json::json!({}));
     if let Ok(mut id) = LOBBY_PARTY_ID.lock() {
         id.clear();
@@ -1662,6 +2073,8 @@ mod tests {
             },
             file_epoch,
             loaded: true,
+            loading: false,
+            playback_ready: true,
         }
     }
 
@@ -1682,6 +2095,7 @@ mod tests {
             current_web_url: String::new(),
             source_mode: SourceMode::Local,
             local: GuestLocalPlayback::default(),
+            readiness: GuestReadinessUpdates::default(),
             last_context: None,
             shared_wait_epoch: 0,
         }
@@ -1949,6 +2363,221 @@ mod tests {
         };
         assert!(policy.should_accept(42));
         assert!(!policy.should_accept(43));
+    }
+
+    #[test]
+    fn readiness_reports_wait_for_host_support_and_current_file_first_frame() {
+        let now = Instant::now();
+        let mut host = LocalHostPlayback::default();
+        let initial = local_state(
+            host.snapshot(&native("tt1234567:1:1", "host", 10), &playback(), 10)
+                .unwrap(),
+        );
+        let mut local = GuestLocalPlayback::default();
+        local.ingest(initial.clone(), now).unwrap();
+        let ticket = local.selection().unwrap().request_id.clone();
+        let mut updates = GuestReadinessUpdates::default();
+        let mut file = native("tt1234567:1:1", "guest", 100);
+        assert!(updates.report(&local, &file, 100).is_none());
+        updates.supported = true;
+        let selecting = updates.report(&local, &file, 100).unwrap();
+        assert_eq!(selecting.status, ReadinessStatus::Selecting);
+        assert!(local.select(&initial.media, &ticket));
+        assert!(local.loading(100));
+        file.loaded = false;
+        file.playback_ready = false;
+        file.loading = true;
+        let loading = updates.report(&local, &file, 100).unwrap();
+        assert_eq!(loading.status, ReadinessStatus::Loading);
+        assert!(loading.sequence > selecting.sequence);
+        assert!(local.loaded(100));
+        file.loaded = true;
+        assert!(updates.report(&local, &file, 100).is_none());
+        file.playback_ready = true;
+        file.loading = false;
+        let ready = updates.report(&local, &file, 100).unwrap();
+        assert_eq!(ready.status, ReadinessStatus::Ready);
+        assert!(ready.sequence > loading.sequence);
+        assert!(updates.report(&local, &file, 100).is_none());
+        assert!(local.waiting(1, 2).unwrap());
+        assert!(updates.report(&local, &file, 100).is_none());
+
+        assert!(local.select(&initial.media, &ticket));
+        assert!(local.loading(101));
+        file.file_epoch = 101;
+        file.loaded = false;
+        file.playback_ready = false;
+        file.loading = true;
+        let reload = updates.report(&local, &file, 101).unwrap();
+        assert_eq!(reload.status, ReadinessStatus::Loading);
+        assert!(reload.sequence > ready.sequence);
+        let stale_file = native("tt1234567:1:1", "obsolete", 100);
+        assert_eq!(
+            updates.report(&local, &stale_file, 101).unwrap().status,
+            ReadinessStatus::Selecting
+        );
+        let mut next = initial;
+        next.media.video_id = "tt1234567:1:2".to_string();
+        next.generation = 2;
+        next.sequence = 3;
+        local.ingest(next.clone(), now).unwrap();
+        let episode = updates.report(&local, &stale_file, 101).unwrap();
+        assert_eq!(episode.status, ReadinessStatus::Selecting);
+        assert_eq!(episode.media, next.media);
+        assert_eq!(episode.generation, 2);
+    }
+
+    #[test]
+    fn host_readiness_requires_the_announced_episode_and_current_native_frame() {
+        let mut file = native("tt1234567:1:1", "host", 10);
+        let media = file.context.media.clone().unwrap();
+        assert_eq!(
+            host_readiness_status(&file, Some(&media), 10),
+            ReadinessStatus::Ready
+        );
+        assert_eq!(
+            host_readiness_status(&file, Some(&media), 11),
+            ReadinessStatus::Selecting
+        );
+        file.playback_ready = false;
+        assert_eq!(
+            host_readiness_status(&file, Some(&media), 10),
+            ReadinessStatus::Loading
+        );
+        file.playback_ready = true;
+        file.context.media = None;
+        assert_eq!(
+            host_readiness_status(&file, Some(&media), 10),
+            ReadinessStatus::Selecting
+        );
+        file.context.media = native("tt1234567:1:2", "another-file", 10).context.media;
+        assert_eq!(
+            host_readiness_status(&file, Some(&media), 10),
+            ReadinessStatus::Selecting
+        );
+        assert_eq!(
+            host_readiness_status(&file, None, 10),
+            ReadinessStatus::Selecting
+        );
+    }
+
+    #[test]
+    fn guest_readiness_handshake_and_visible_roster_follow_current_episode_only() {
+        let previous_snapshot = readiness_snapshot();
+        let mut guest = guest();
+        let mut host = LocalHostPlayback::default();
+        let initial = local_state(
+            host.snapshot(&native("tt1234567:1:1", "host", 10), &playback(), 10)
+                .unwrap(),
+        );
+        handle_host_message(
+            HostMsg::LocalState {
+                state: initial.clone(),
+            },
+            &mut guest,
+        )
+        .unwrap();
+        let mut roster = HostReadinessRoster::default();
+        roster.add_member(2, true).unwrap();
+        roster.add_member(3, true).unwrap();
+        roster
+            .set_media(initial.media.clone(), initial.generation)
+            .unwrap();
+        roster.set_status(2, ReadinessStatus::Ready).unwrap();
+        let current = roster.snapshot().unwrap();
+        handle_host_message(
+            HostMsg::Readiness {
+                state: current.clone(),
+            },
+            &mut guest,
+        )
+        .unwrap();
+        let snapshot = readiness_snapshot();
+        let mut stale = current.clone();
+        stale.generation += 1;
+        stale.sequence += 100;
+        handle_host_message(HostMsg::Readiness { state: stale }, &mut guest).unwrap();
+        let after_stale = readiness_snapshot();
+        let Mode::Guest { readiness, .. } = &guest else {
+            unreachable!()
+        };
+        let supported = readiness.supported;
+        let mut next = initial;
+        next.media.video_id = "tt1234567:1:2".to_string();
+        next.generation += 1;
+        next.sequence += 1;
+        handle_host_message(HostMsg::LocalState { state: next }, &mut guest).unwrap();
+        let cleared = readiness_snapshot();
+        handle_host_message(
+            HostMsg::Readiness {
+                state: current.clone(),
+            },
+            &mut guest,
+        )
+        .unwrap();
+        let after_old_episode = readiness_snapshot();
+        *READINESS_SNAPSHOT.lock().unwrap() = previous_snapshot;
+        assert!(supported);
+        assert_eq!(snapshot, Some(current));
+        assert_eq!(after_stale, snapshot);
+        assert!(cleared.is_none());
+        assert!(after_old_episode.is_none());
+    }
+
+    #[test]
+    fn readiness_announcements_are_named_transitions_without_heartbeat_or_episode_noise() {
+        let mut roster = HostReadinessRoster::default();
+        roster.add_member(1, true).unwrap();
+        roster.add_member(2, true).unwrap();
+        roster
+            .set_media(
+                native("tt1234567:1:1", "host", 10).context.media.unwrap(),
+                1,
+            )
+            .unwrap();
+        let members = vec![
+            LobbyMember {
+                steam_id: 1,
+                name: "Host".to_string(),
+                is_host: true,
+            },
+            LobbyMember {
+                steam_id: 2,
+                name: "Alice".to_string(),
+                is_host: false,
+            },
+        ];
+        let selecting = roster.snapshot().unwrap();
+        assert!(readiness_announcement(None, Some(&selecting), &members).is_none());
+        roster.set_status(2, ReadinessStatus::Loading).unwrap();
+        let loading = roster.snapshot().unwrap();
+        assert_eq!(
+            readiness_announcement(Some(&selecting), Some(&loading), &members),
+            Some("Alice is loading the video".to_string())
+        );
+        roster.set_status(2, ReadinessStatus::Ready).unwrap();
+        let ready = roster.snapshot().unwrap();
+        assert_eq!(
+            readiness_announcement(Some(&loading), Some(&ready), &members),
+            Some("Alice is ready".to_string())
+        );
+        assert!(readiness_announcement(Some(&ready), Some(&ready), &members).is_none());
+        roster
+            .set_media(native("tt1234567:1:2", "new", 11).context.media.unwrap(), 2)
+            .unwrap();
+        assert!(
+            readiness_announcement(Some(&ready), roster.snapshot().as_ref(), &members).is_none()
+        );
+        roster.set_status(1, ReadinessStatus::Ready).unwrap();
+        let next_ready = roster.snapshot().unwrap();
+        assert_eq!(
+            readiness_announcement(Some(&ready), Some(&next_ready), &members),
+            Some("Host is ready".to_string())
+        );
+        assert_eq!(
+            readiness_announcement(None, Some(&next_ready), &members),
+            Some("Host is ready".to_string())
+        );
     }
 
     #[test]

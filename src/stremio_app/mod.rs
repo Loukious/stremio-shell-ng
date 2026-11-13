@@ -27,3 +27,4 @@ pub mod steam_sync;
 pub mod steam_sync;
 pub mod sync_protocol;
 pub mod watch_party_local;
+pub mod watch_party_readiness;

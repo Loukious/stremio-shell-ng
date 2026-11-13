@@ -1,4 +1,4 @@
-use crate::stremio_app::sync_protocol::{MediaIdentity, SourceMode};
+use crate::stremio_app::sync_protocol::{MediaIdentity, PartyReadiness, SourceMode};
 use flume::Sender;
 
 #[derive(Debug, Clone)]
@@ -6,15 +6,37 @@ use flume::Sender;
 pub enum SyncUiEvent {
     HostStarted,
     JoinedHost,
-    LobbyUpdated { member_count: i32, max_size: i32 },
-    GuestJoined { name: String, member_count: i32 },
-    GuestLeft { name: String, member_count: i32 },
-    HostLeft { reason: String },
+    LobbyUpdated {
+        member_count: i32,
+        max_size: i32,
+    },
+    GuestJoined {
+        name: String,
+        member_count: i32,
+    },
+    GuestLeft {
+        name: String,
+        member_count: i32,
+    },
+    HostLeft {
+        reason: String,
+    },
     LeftLobby,
-    Error { message: String },
+    ReadinessUpdated {
+        announcement: Option<String>,
+        media: Option<MediaIdentity>,
+        generation: u64,
+        sequence: u64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub fn set_ui_event_sender(_sender: Sender<SyncUiEvent>) {}
+pub fn readiness_snapshot() -> Option<PartyReadiness> {
+    None
+}
 
 pub fn leave_lobby() -> Result<(), String> {
     Ok(())
@@ -42,6 +64,7 @@ pub fn update_web_media(
 }
 pub fn notify_player_load_started(_file_epoch: u64) {}
 pub fn notify_player_loaded(_file_epoch: u64) {}
+pub fn notify_player_ready(_file_epoch: u64) {}
 pub fn notify_player_unloaded(_file_epoch: u64) {}
 
 pub fn connect_to_host(_join_secret: &str) -> Result<(), String> {

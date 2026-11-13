@@ -82,6 +82,71 @@ impl LocalPlaybackState {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessStatus {
+    Selecting,
+    Loading,
+    Ready,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GuestReadiness {
+    pub media: MediaIdentity,
+    pub generation: u64,
+    pub sequence: u64,
+    pub status: ReadinessStatus,
+}
+
+impl GuestReadiness {
+    pub fn validate(&self) -> Result<(), String> {
+        self.media.validate()?;
+        if self.generation == 0 || self.sequence == 0 {
+            return Err("Watch-party readiness generation or sequence is invalid.".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemberReadiness {
+    pub steam_id: u64,
+    // Older protocol-2 clients do not advertise readiness support.
+    pub status: Option<ReadinessStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PartyReadiness {
+    pub media: MediaIdentity,
+    pub generation: u64,
+    pub sequence: u64,
+    pub members: Vec<MemberReadiness>,
+}
+
+impl PartyReadiness {
+    pub fn validate(&self) -> Result<(), String> {
+        self.media.validate()?;
+        if self.generation == 0 || self.sequence == 0 {
+            return Err("Watch-party readiness generation or sequence is invalid.".to_string());
+        }
+        if self.members.is_empty() || self.members.len() > 16 {
+            return Err("Watch-party readiness member count is invalid.".to_string());
+        }
+        let mut seen = std::collections::HashSet::new();
+        if self
+            .members
+            .iter()
+            .any(|member| member.steam_id == 0 || !seen.insert(member.steam_id))
+        {
+            return Err("Watch-party readiness members are invalid.".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct LobbyMember {
     pub steam_id: u64,
@@ -92,6 +157,8 @@ pub struct LobbyMember {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
 pub enum HostMsg {
+    #[serde(rename = "readiness")]
+    Readiness { state: PartyReadiness },
     #[serde(rename = "local_state")]
     LocalState { state: LocalPlaybackState },
     #[serde(rename = "local_waiting")]
@@ -133,7 +200,11 @@ pub enum GuestMsg {
         name: String,
         #[serde(default)]
         local_sources: bool,
+        #[serde(default)]
+        readiness: bool,
     },
+    #[serde(rename = "readiness")]
+    Readiness { state: GuestReadiness },
     #[serde(rename = "request_state")]
     RequestState,
     #[serde(rename = "leave")]
@@ -379,9 +450,124 @@ mod tests {
             hello,
             GuestMsg::Hello {
                 local_sources: false,
+                readiness: false,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn readiness_wire_payloads_are_semantic_and_reject_extra_source_fields() {
+        let report = GuestReadiness {
+            media: local_state().media,
+            generation: 3,
+            sequence: 2,
+            status: ReadinessStatus::Ready,
+        };
+        let roster = PartyReadiness {
+            media: report.media.clone(),
+            generation: 3,
+            sequence: 8,
+            members: vec![
+                MemberReadiness {
+                    steam_id: 1,
+                    status: Some(ReadinessStatus::Ready),
+                },
+                MemberReadiness {
+                    steam_id: 2,
+                    status: None,
+                },
+            ],
+        };
+        for message in [
+            SteamSyncWireMsg::Guest(GuestMsg::Readiness {
+                state: report.clone(),
+            }),
+            SteamSyncWireMsg::Host(HostMsg::Readiness {
+                state: roster.clone(),
+            }),
+        ] {
+            let wire = serde_json::to_value(&message).unwrap();
+            assert_eq!(wire["payload"]["type"], "readiness");
+            assert_eq!(
+                wire["payload"]["state"]["media"].as_object().unwrap().len(),
+                3
+            );
+            let encoded = serde_json::to_string(&message).unwrap();
+            for excluded in [
+                "stream_url",
+                "web_url",
+                "addon",
+                "headers",
+                "deepLinks",
+                "http",
+            ] {
+                assert!(
+                    !encoded.contains(excluded),
+                    "unexpected readiness field: {}",
+                    excluded
+                );
+            }
+            assert_eq!(
+                serde_json::from_str::<SteamSyncWireMsg>(&encoded).unwrap(),
+                message
+            );
+        }
+        assert!(report.validate().is_ok());
+        assert!(roster.validate().is_ok());
+        let mut report_extra = serde_json::to_value(report).unwrap();
+        report_extra["stream_url"] = serde_json::json!("https://private.invalid/source");
+        assert!(serde_json::from_value::<GuestReadiness>(report_extra).is_err());
+        let mut roster_extra = serde_json::to_value(roster).unwrap();
+        roster_extra["members"][0]["addon"] = serde_json::json!("private-addon-secret");
+        assert!(serde_json::from_value::<PartyReadiness>(roster_extra).is_err());
+    }
+
+    #[test]
+    fn readiness_validation_rejects_invalid_identity_order_and_membership() {
+        let mut report = GuestReadiness {
+            media: local_state().media,
+            generation: 1,
+            sequence: 1,
+            status: ReadinessStatus::Loading,
+        };
+        report.sequence = 0;
+        assert!(report.validate().is_err());
+        report.sequence = 1;
+        report.generation = 0;
+        assert!(report.validate().is_err());
+        report.generation = 1;
+        report.media.video_id = "https:private-source".to_string();
+        assert!(report.validate().is_err());
+        let mut roster = PartyReadiness {
+            media: local_state().media,
+            generation: 1,
+            sequence: 1,
+            members: Vec::new(),
+        };
+        assert!(roster.validate().is_err());
+        roster.members = vec![MemberReadiness {
+            steam_id: 0,
+            status: None,
+        }];
+        assert!(roster.validate().is_err());
+        roster.members = vec![
+            MemberReadiness {
+                steam_id: 1,
+                status: None
+            };
+            2
+        ];
+        assert!(roster.validate().is_err());
+        roster.members = (1..=17)
+            .map(|steam_id| MemberReadiness {
+                steam_id,
+                status: None,
+            })
+            .collect();
+        assert!(roster.validate().is_err());
+        roster.members.truncate(16);
+        assert!(roster.validate().is_ok());
     }
 
     #[test]
@@ -422,6 +608,7 @@ mod tests {
             token: "abc".to_string(),
             name: "viewer".to_string(),
             local_sources: true,
+            readiness: true,
         });
         let json = serde_json::to_string(&guest).unwrap();
         assert_eq!(
