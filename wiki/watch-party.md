@@ -24,7 +24,7 @@ Watch Party lets one person host playback and share a Discord Rich Presence join
 
 ## Let Each Viewer Choose Their Own Stream
 
-Before starting the party, select **Use each viewer's own stream** in the tray menu. This choice is saved beside the executable in `RPCconfig.ini`:
+**Use each viewer's own stream** is enabled by default for new configurations and when the setting is missing. You can change it in the tray menu before starting a party. This choice is saved beside the executable in `RPCconfig.ini`, and an explicitly saved shared-source choice is preserved:
 
 ```ini
 [WatchParty]
@@ -37,7 +37,7 @@ If the host reloads or changes source for the same episode, guests pause while i
 
 Choose the same release or edition as the host whenever possible. Different cuts can have different timings even when the episode ID matches. Each guest needs their own usable source; this mode cannot resolve an arbitrary host HTTP URL into an episode. Start the host's movie or episode through its Stremio details page so metadata is available.
 
-The choice can be changed when the party has ended. With the option unchecked (`source_mode = shared`, the default), guests use the host's shared source. Local mode does not fall back to that URL if selection or loading fails.
+The choice can be changed when the party has ended. With the option unchecked (`source_mode = shared`), guests use the host's shared source. Local mode does not fall back to that URL if selection or loading fails.
 
 Older watch-party clients and protocol-1 invitation links must be updated. They are rejected rather than silently using shared-source playback.
 

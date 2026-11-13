@@ -10,8 +10,8 @@ pub const STEAM_JOIN_PREFIX: &str = "stremio://sync/steam/v2/";
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceMode {
-    #[default]
     Shared,
+    #[default]
     Local,
 }
 
@@ -223,7 +223,7 @@ pub enum SteamSyncWireMsg {
 pub struct SteamJoinSecret {
     #[serde(default = "legacy_protocol_version")]
     pub protocol_version: u16,
-    #[serde(default)]
+    #[serde(default = "legacy_source_mode")]
     pub source_mode: SourceMode,
     pub app_id: u32,
     pub lobby_id: u64,
@@ -234,6 +234,11 @@ pub struct SteamJoinSecret {
 
 fn legacy_protocol_version() -> u16 {
     1
+}
+
+// Invitations created before local sources were supported shared the host's URL.
+fn legacy_source_mode() -> SourceMode {
+    SourceMode::Shared
 }
 
 pub fn encode_steam_join_secret(secret: &SteamJoinSecret) -> Result<String, String> {
@@ -310,11 +315,17 @@ mod tests {
 
     #[test]
     fn steam_secret_round_trips() {
+        assert_eq!(SourceMode::default(), SourceMode::Local);
         let secret = sample_secret();
         let encoded = encode_steam_join_secret(&secret).unwrap();
 
         assert!(encoded.starts_with(STEAM_JOIN_PREFIX));
         assert_eq!(decode_steam_join_secret(&encoded).unwrap(), secret);
+
+        let mut legacy = serde_json::to_value(&secret).unwrap();
+        legacy.as_object_mut().unwrap().remove("source_mode");
+        let legacy: SteamJoinSecret = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.source_mode, SourceMode::Shared);
     }
 
     #[test]

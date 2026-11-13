@@ -5,7 +5,7 @@
       ![General view](https://i.imgur.com/jBWs2PC.png)
 * Watch Party support through Steam networking
     * See the [Watch Party Guide](wiki/watch-party.md) for hosting, joining, and troubleshooting
-    * Optional local stream selection lets each viewer use their own addons/account; the tray choice is saved in `RPCconfig.ini`.
+    * Local stream selection is enabled by default so each viewer uses their own addons/account; the tray choice is saved in `RPCconfig.ini`.
 * Media Keys and Windows Media Overlay support:
     * Play/Pause
     * Seek forward/backward

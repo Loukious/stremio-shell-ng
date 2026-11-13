@@ -396,7 +396,7 @@ fn load_or_create_config() -> Config {
 
         default_config
             .with_section(Some("WatchParty"))
-            .set("source_mode", "shared");
+            .set("source_mode", "local");
 
         default_config
             .with_section(Some("AutoSkip"))
@@ -598,8 +598,8 @@ fn persist_manual_intro_outro(enabled: bool) -> Result<(), String> {
 
 fn watch_party_source_mode_from(config: &Ini) -> SourceMode {
     match config.get_from(Some("WatchParty"), "source_mode") {
-        Some("local") => SourceMode::Local,
-        _ => SourceMode::Shared,
+        Some("shared") => SourceMode::Shared,
+        _ => SourceMode::Local,
     }
 }
 
@@ -693,8 +693,12 @@ mod watch_party_config_tests {
             "[AutoSkip]\nmanual_intro_outro=true\n[IntroDB]\napi_key=example\n",
         )
         .unwrap();
-        let config = Ini::load_from_file(&path).unwrap();
-        assert_eq!(watch_party_source_mode_from(&config), SourceMode::Shared);
+        let mut config = Ini::load_from_file(&path).unwrap();
+        assert_eq!(watch_party_source_mode_from(&config), SourceMode::Local);
+        config
+            .with_section(Some("WatchParty"))
+            .set("source_mode", "invalid");
+        assert_eq!(watch_party_source_mode_from(&config), SourceMode::Local);
         persist_watch_party_source_mode_to(&path, SourceMode::Local).unwrap();
         let config = Ini::load_from_file(&path).unwrap();
         assert_eq!(watch_party_source_mode_from(&config), SourceMode::Local);
