@@ -2618,10 +2618,12 @@ impl MainWindow {
         let config = load_or_create_config();
         self.tray
             .tray_watch_party_local_sources
-            .set_checked(config.watch_party_source_mode == SourceMode::Local);
+            .set_enabled(party_id.is_empty());
+        // NWG set_enabled replaces the native menu state, including its check
+        // bit. Restore the saved choice after enabling/disabling the item.
         self.tray
             .tray_watch_party_local_sources
-            .set_enabled(party_id.is_empty());
+            .set_checked(config.watch_party_source_mode == SourceMode::Local);
 
         if party_id.is_empty() || member_count <= 0 {
             self.window.set_text(APP_NAME);
