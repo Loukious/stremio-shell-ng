@@ -50,10 +50,17 @@ async function player(language = 'eng', { bodyReady = true } = {}) {
             this.parentElement = null;
         }
         addEventListener(name, listener) { (this.listeners[name] ||= []).push(listener); }
-        click() { for (const listener of this.listeners.click || []) listener({ target: this, detail: 1, stopPropagation() {} }); }
+        click(detail = 1) { for (const listener of this.listeners.click || []) listener({ target: this, detail, stopPropagation() {} }); }
         focus() { document.activeElement = this; }
         contains(element) { return element === this || this.children.some(child => child.contains(element)); }
-        closest(selector) { return selector === 'label' ? this.parentElement : null; }
+        closest(selector) {
+            for (let element = this; element; element = element.parentElement) {
+                if (selector.startsWith('#') && element.id === selector.slice(1)) return element;
+                if (selector.startsWith('.') && element.className.split(/\s+/).includes(selector.slice(1))) return element;
+                if (element.tagName.toLowerCase() === selector) return element;
+            }
+            return null;
+        }
         set innerHTML(html) {
             if (this.tagName === 'FIELDSET') {
                 for (const value of ['auto', 'manual']) {
@@ -116,6 +123,21 @@ async function player(language = 'eng', { bodyReady = true } = {}) {
         toast: () => document.getElementById('stremio-shell-auto-skip-toast'),
         skipButton: () => document.getElementById('stremio-shell-manual-skip-btn'),
         settingsButton: () => document.getElementById('stremio-shell-intro-skip-settings-btn'),
+        activeElement: () => document.activeElement,
+        pointerDown: element => {
+            let prevented = false;
+            for (const listener of element.listeners.mousedown || []) listener({ preventDefault() { prevented = true; } });
+            if (!prevented) element.focus();
+        },
+        keydown: key => {
+            const event = {
+                key, target: document.activeElement || document.body, stopped: false, defaultPrevented: false,
+                preventDefault() { this.defaultPrevented = true; },
+                stopImmediatePropagation() { this.stopped = true; }
+            };
+            documentEvents.keydown(event);
+            return event;
+        },
         hasStyles: () => document.head?.children.some(element => element.textContent?.includes('#stremio-shell-manual-skip-btn')),
         ready: () => { mountBody(); documentEvents.DOMContentLoaded(); },
         posts,
@@ -197,6 +219,54 @@ test('mounts a styled manual offer without an anchor, including before the body 
     p.skipButton().click();
     assert.deepEqual(p.posts.at(-1).args, ['shell-manual-skip', { offer_id: 'offer-before-body' }]);
     assert.equal(p.skipButton().hidden, true);
+});
+
+test('skip controls leave playback focus alone on mouse activation', async () => {
+    const p = await player();
+    p.fullscreen('Enter fullscreen mode', FULLSCREEN_PATHS[0]);
+    p.refresh();
+    p.pointerDown(p.settingsButton());
+    p.settingsButton().click();
+    assert.equal(p.activeElement(), undefined);
+    p.offer('clickable-offer');
+    p.pointerDown(p.skipButton());
+    p.skipButton().click();
+    assert.equal(p.activeElement(), undefined);
+    assert.deepEqual(p.posts.at(-1).args, ['shell-manual-skip', { offer_id: 'clickable-offer' }]);
+    assert.equal(p.keydown('ArrowLeft').stopped, false);
+});
+
+test('closing skip settings restores focus without swallowing repeated seek shortcuts', async () => {
+    const p = await player();
+    p.fullscreen('Enter fullscreen mode', FULLSCREEN_PATHS[0]);
+    p.refresh();
+    p.settingsButton().click(0);
+    assert.equal(p.activeElement().name, 'shell-intro-mode');
+    const radioArrow = p.keydown('ArrowRight');
+    assert.equal(radioArrow.stopped, true);
+    assert.equal(radioArrow.defaultPrevented, false);
+    const escape = p.keydown('Escape');
+    assert.equal(escape.defaultPrevented, true);
+    assert.equal(p.activeElement(), p.settingsButton());
+    for (const key of ['ArrowLeft', 'ArrowLeft', 'ArrowRight', 'ArrowRight', 'f']) {
+        assert.equal(p.keydown(key).stopped, false, `${key} must reach playback`);
+    }
+    for (const key of ['Enter', ' ', 'Tab']) {
+        const activation = p.keydown(key);
+        assert.equal(activation.stopped, true);
+        assert.equal(activation.defaultPrevented, false);
+    }
+});
+
+test('a focused manual skip keeps native activation and allows playback shortcuts', async () => {
+    const p = await player();
+    p.offer('keyboard-offer');
+    p.skipButton().focus();
+    assert.equal(p.keydown('ArrowLeft').stopped, false);
+    assert.equal(p.keydown('ArrowRight').stopped, false);
+    const activation = p.keydown(' ');
+    assert.equal(activation.stopped, true);
+    assert.equal(activation.defaultPrevented, false);
 });
 
 test('only submits the current offer and clears it on timeout, hide and navigation', async () => {
