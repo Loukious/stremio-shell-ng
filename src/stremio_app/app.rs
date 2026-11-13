@@ -69,8 +69,9 @@ pub static LOBBY_MEMBERS: Lazy<Mutex<Vec<crate::stremio_app::sync_protocol::Lobb
 /// Whether this app owns the lobby or joined someone else's lobby.
 pub static LOBBY_ROLE: Lazy<Mutex<LobbyRole>> = Lazy::new(|| Mutex::new(LobbyRole::None));
 use crate::stremio_app::{
+    cache_directory::{self, CacheDirectoryRequest},
     constants::{
-        web_endpoint_with_streaming_server, APP_NAME, UPDATE_ENDPOINT, UPDATE_INTERVAL,
+        safe_url, web_endpoint_with_streaming_server, APP_NAME, UPDATE_ENDPOINT, UPDATE_INTERVAL,
         WEB_ENDPOINT, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH,
     },
     ipc::{RPCRequest, RPCResponse},
@@ -89,7 +90,7 @@ use crate::stremio_app::{
     PipeServer,
 };
 
-use super::stremio_server::StremioServer;
+use super::stremio_server::{ServerEvent, StremioServer};
 
 fn weserv_contain(url: &str) -> String {
     format!(
@@ -242,10 +243,43 @@ fn handle_media_metadata(params: Option<&Value>) {
     }
 }
 
+const WEBUI_RETRY_DELAYS_SECS: [u64; 2] = [2, 5];
+const WEBUI_READY_TIMEOUT_SECS: u64 = 30;
+const WEBUI_RETRY_READY_TIMEOUT_SECS: u64 = 15;
+const WEBUI_UNREACHABLE: &str = "Stremio couldn't load its interface. \
+    Check your internet connection, VPN or firewall, then click Retry.";
+
+pub enum WebUiEvent {
+    Ready,
+    LoadFailed(String),
+    Timeout(u64),
+    Retry(u64),
+}
+
+type WebUiEvents = Arc<Mutex<VecDeque<WebUiEvent>>>;
+
+fn send_webui_event(events: &WebUiEvents, notice: &nwg::NoticeSender, event: WebUiEvent) {
+    events.lock().unwrap().push_back(event);
+    notice.notice();
+}
+
+pub enum OpenRequest {
+    Input(String),
+    Ready,
+    Reset,
+}
+
 #[derive(Default, NwgUi)]
 pub struct MainWindow {
     pub command: String,
-    pub commands_path: Option<String>,
+    pub commands_server: RefCell<Option<PipeServer>>,
+    pub open_media_sender: RefCell<Option<Sender<OpenRequest>>>,
+    pub local_server_url: Arc<Mutex<Option<String>>>,
+    pub webui_events: WebUiEvents,
+    pub webui_ready: Cell<bool>,
+    pub webui_retries: Cell<usize>,
+    pub webui_generation: Cell<u64>,
+    pub webui_retry_pending: Cell<bool>,
     pub webui_url: String,
     pub no_splash: bool,
     pub dev_tools: bool,
@@ -255,6 +289,8 @@ pub struct MainWindow {
     pub release_candidate: bool,
     pub autoupdater_setup_file: Arc<Mutex<Option<PathBuf>>>,
     pub requested_fullscreen: Arc<Mutex<Option<bool>>>,
+    pub requested_cache_directory: Arc<Mutex<Option<CacheDirectoryRequest>>>,
+    pub requested_interface_scale: Arc<Mutex<Option<u64>>>,
     pub requested_pip: Arc<Mutex<Option<bool>>>,
     pub pip_window: RefCell<PipWindow>,
     pub pip_active: Cell<bool>,
@@ -264,6 +300,8 @@ pub struct MainWindow {
     pub embed: nwg::EmbedResource,
     #[nwg_resource(source_embed: Some(&data.embed), source_embed_str: Some("MAINICON"))]
     pub window_icon: nwg::Icon,
+    #[nwg_resource(title: "Choose cache folder", action: nwg::FileDialogAction::OpenDirectory)]
+    pub cache_directory_picker: nwg::FileDialog,
     #[nwg_control(icon: Some(&data.window_icon), title: APP_NAME, flags: "MAIN_WINDOW")]
     #[nwg_events(
         OnWindowClose: [Self::on_quit(SELF, EVT_DATA)],
@@ -291,6 +329,7 @@ pub struct MainWindow {
     #[nwg_partial(parent: window)]
     pub splash_screen: SplashImage,
     #[nwg_partial(parent: window)]
+    #[nwg_events((notice, OnNotice): [Self::on_server_notice])]
     pub server: StremioServer,
     #[nwg_partial(parent: window)]
     pub player: Player,
@@ -315,6 +354,15 @@ pub struct MainWindow {
     #[nwg_events(OnNotice: [Self::on_sync_notice] )]
     pub sync_notice: nwg::Notice,
     pub sync_events: Arc<Mutex<VecDeque<crate::stremio_app::steam_sync::SyncUiEvent>>>,
+    #[nwg_control]
+    #[nwg_events(OnNotice: [Self::on_webui_notice])]
+    pub webui_notice: nwg::Notice,
+    #[nwg_control]
+    #[nwg_events(OnNotice: [Self::on_set_interface_scale_notice])]
+    pub set_interface_scale_notice: nwg::Notice,
+    #[nwg_control]
+    #[nwg_events(OnNotice: [Self::on_cache_directory_notice])]
+    pub cache_directory_notice: nwg::Notice,
 }
 
 fn load_or_create_config() -> Config {
@@ -1287,18 +1335,33 @@ impl MainWindow {
         }
     }
     fn on_init(&self) {
-        let webui_url =
-            if self.webui_url.trim_end_matches('/') == WEB_ENDPOINT.trim_end_matches('/') {
-                self.server
-                    .server_url()
-                    .map(|server_url| web_endpoint_with_streaming_server(&server_url))
-                    .unwrap_or_else(|| self.webui_url.clone())
-            } else {
-                self.webui_url.clone()
-            };
-        self.webview.endpoint.set(webui_url).ok();
         self.webview.dev_tools.set(self.dev_tools).ok();
         if let Some(hwnd) = self.window.handle.hwnd() {
+            nwg::bind_raw_event_handler(&self.window.handle, 0x10001, |hwnd, msg, _w, l| {
+                use winapi::um::winuser::{
+                    GetWindowLongA, SetWindowPos, GWL_STYLE, SWP_NOACTIVATE, SWP_NOZORDER,
+                    WM_DPICHANGED, WS_CAPTION,
+                };
+                if msg != WM_DPICHANGED
+                    || unsafe { GetWindowLongA(hwnd, GWL_STYLE) } as u32 & WS_CAPTION == 0
+                {
+                    return None;
+                }
+                let rect = unsafe { &*(l as *const RECT) };
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                Some(0)
+            })
+            .ok();
             // When MPV is detached into PiP, the transparent WebView can reveal
             // the main window background during resize. Black matches video
             // letterboxing and avoids white flashes.
@@ -1532,14 +1595,42 @@ impl MainWindow {
             self.splash_screen.hide();
         }
 
-        let command_clone = self.command.clone();
-
-        // Single application IPC
-        let socket_path = Path::new(
-            self.commands_path
-                .as_ref()
-                .expect("Cannot initialie the single application IPC"),
-        );
+        let (open_sender, open_receiver) = flume::unbounded();
+        let open_sender_web = open_sender.clone();
+        *self.open_media_sender.borrow_mut() = Some(open_sender.clone());
+        let command = self.command.clone();
+        let web_tx_open = web_tx_arg.clone();
+        thread::spawn(move || {
+            let mut ready = false;
+            let mut pending = VecDeque::new();
+            if !command.is_empty() {
+                pending.push_back(command);
+            }
+            for request in open_receiver {
+                match request {
+                    OpenRequest::Input(input) => pending.push_back(input),
+                    OpenRequest::Ready => ready = true,
+                    OpenRequest::Reset => ready = false,
+                }
+                if ready {
+                    while let Some(input) = pending.pop_front() {
+                        if input.starts_with("stremio://sync/") {
+                            if let Err(error) =
+                                crate::stremio_app::steam_sync::connect_to_host(&input)
+                            {
+                                eprintln!("Could not join watch party: {error}");
+                            }
+                        } else {
+                            web_tx_open
+                                .send(RPCResponse::response_message(Some(
+                                    super::open_media::message(&input),
+                                )))
+                                .ok();
+                        }
+                    }
+                }
+            }
+        });
 
         let autoupdater_endpoint = self.autoupdater_endpoint.clone();
         let force_update = self.force_update;
@@ -1585,26 +1676,17 @@ impl MainWindow {
             }
         }); // thread
 
-        if let Ok(mut listener) = PipeServer::bind(socket_path) {
+        if let Some(mut listener) = self.commands_server.borrow_mut().take() {
             let focus_sender = self.focus_notice.sender();
             thread::spawn(move || loop {
                 if let Ok(mut stream) = listener.accept() {
                     let mut buf = vec![];
                     stream.read_to_end(&mut buf).ok();
-                    if let Ok(s) = str::from_utf8(&buf) {
+                    if let Ok(input) = str::from_utf8(&buf) {
                         focus_sender.notice();
-                        let s_str = s.to_string();
-                        if s_str.starts_with("stremio://sync/") {
-                            use crate::stremio_app::steam_sync;
-                            match steam_sync::connect_to_host(&s_str) {
-                                Ok(_) => println!("✅ Sync client connected!"),
-                                Err(e) => eprintln!("⚠️ Failed to connect: {e}"),
-                            }
-                        } else {
-                            // ['open-media', url]
-                            web_tx_arg.send(RPCResponse::open_media(s_str)).ok();
+                        if !input.is_empty() {
+                            open_sender.send(OpenRequest::Input(input.to_owned())).ok();
                         }
-                        println!("{s}");
                     }
                 }
             });
@@ -1636,6 +1718,13 @@ impl MainWindow {
         let autoupdater_setup_mutex = self.autoupdater_setup_file.clone();
         let requested_fullscreen = self.requested_fullscreen.clone();
         let requested_pip = self.requested_pip.clone();
+        let local_server_url = self.local_server_url.clone();
+        let requested_cache_directory = self.requested_cache_directory.clone();
+        let cache_directory_sender = self.cache_directory_notice.sender();
+        let requested_interface_scale = self.requested_interface_scale.clone();
+        let set_interface_scale_sender = self.set_interface_scale_notice.sender();
+        let webui_events = self.webui_events.clone();
+        let webui_sender = self.webui_notice.sender();
         thread::spawn(move || loop {
             if let Some(msg) = web_rx
                 .recv()
@@ -1654,7 +1743,50 @@ impl MainWindow {
                 match msg.get_method() {
                     // The handshake. Here we send some useful data to the WEB UI
                     None if msg.is_handshake() => {
-                        web_tx_web.send(RPCResponse::get_handshake()).ok();
+                        web_tx_web
+                            .send(RPCResponse::get_handshake(
+                                local_server_url.lock().unwrap().as_deref(),
+                            ))
+                            .ok();
+                    }
+                    Some("pick-cache-directory") => {
+                        if let Some(request) = msg.get_params().and_then(|params| {
+                            serde_json::from_value::<CacheDirectoryRequest>(params.clone()).ok()
+                        }) {
+                            let mut pending = requested_cache_directory.lock().unwrap();
+                            let error = if !cache_directory::matches_local_server(
+                                &request.server_url,
+                                local_server_url.lock().unwrap().as_deref(),
+                            ) {
+                                Some("The folder picker is only available for the shell's current local server")
+                            } else if pending.is_some() {
+                                Some("A folder picker is already open")
+                            } else {
+                                None
+                            };
+                            if let Some(error) = error {
+                                web_tx_web
+                                    .send(cache_directory::selected(
+                                        request.request_id,
+                                        Err(error.to_owned()),
+                                    ))
+                                    .ok();
+                            } else {
+                                *pending = Some(request);
+                                cache_directory_sender.notice();
+                            }
+                        }
+                    }
+                    Some("win-set-interface-scale") => {
+                        if let Some(scale) = msg
+                            .get_params()
+                            .and_then(|params| params.get("scale"))
+                            .and_then(Value::as_u64)
+                            .filter(|scale| shell_state::valid_interface_scale(*scale))
+                        {
+                            *requested_interface_scale.lock().unwrap() = Some(scale);
+                            set_interface_scale_sender.notice();
+                        }
                     }
                     Some("win-set-visibility") => {
                         if let Some(fullscreen) = msg
@@ -1746,6 +1878,7 @@ impl MainWindow {
                         }
                     }
                     Some("app-ready") => {
+                        send_webui_event(&webui_events, &webui_sender, WebUiEvent::Ready);
                         hide_splash_sender.notice();
                         web_tx_web
                             .send(RPCResponse::visibility_change(true, 1, false))
@@ -1754,18 +1887,19 @@ impl MainWindow {
                             .send("check_for_update".to_owned())
                             .expect("Failed to send value to updater channel");
 
-                        let command_ref = command_clone.clone();
-                        if !command_ref.is_empty() {
-                            if command_ref.starts_with("stremio://sync/") {
-                                use crate::stremio_app::steam_sync;
-                                match steam_sync::connect_to_host(&command_ref) {
-                                    Ok(_) => println!("✅ Sync client connected!"),
-                                    Err(e) => eprintln!("⚠️ Failed to connect: {e}"),
-                                }
-                            } else {
-                                web_tx_web.send(RPCResponse::open_media(command_ref)).ok();
-                            }
-                        }
+                        open_sender_web.send(OpenRequest::Ready).ok();
+                    }
+                    Some("app-load-error") => {
+                        let details = msg
+                            .get_params()
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        send_webui_event(
+                            &webui_events,
+                            &webui_sender,
+                            WebUiEvent::LoadFailed(details),
+                        );
                     }
                     Some("app-error") => {
                         hide_splash_sender.notice();
@@ -1775,65 +1909,16 @@ impl MainWindow {
                         }
                     }
                     Some("open-external") => {
-                        if let Some(arg) = msg.get_params() {
-                            // FIXME: THIS IS NOT SAFE BY ANY MEANS
-                            // open::that("calc").ok(); does exactly that
-                            let arg = arg.as_str().unwrap_or("");
-                            let arg_lc = arg.to_lowercase();
-                            if arg_lc.starts_with("http://")
-                                || arg_lc.starts_with("https://")
-                                || arg_lc.starts_with("rtp://")
-                                || arg_lc.starts_with("rtps://")
-                                || arg_lc.starts_with("ftp://")
-                                || arg_lc.starts_with("ipfs://")
-                            {
-                                open::that(arg).ok();
+                        if let Some(uri) = msg.get_params().and_then(Value::as_str) {
+                            if let Some(url) = safe_url(uri) {
+                                open::that(url).ok();
                             }
                         }
                     }
                     Some("play-external") => {
-                        if let Some(arg) = msg.get_params() {
-                            let arg = arg.as_str().unwrap_or("");
-                            let arg_lc = arg.to_lowercase();
-                            const ALLOWED_SCHEMES: &[&str] = &["mpv://", "vlc://", "potplayer://"];
-                            let allowed = ALLOWED_SCHEMES.iter().any(|s| arg_lc.starts_with(s));
-                            if !arg.is_empty() && allowed {
-                                if let Some(stream_url) =
-                                    arg_lc.starts_with("mpv://").then(|| &arg[6..])
-                                {
-                                    // `--` ends mpv's option parsing; the stream URL can't smuggle flags.
-                                    let mpv_paths: Vec<String> = vec![
-                                        std::env::var("ProgramFiles")
-                                            .ok()
-                                            .map(|v| format!("{v}\\mpv\\mpv.exe")),
-                                        std::env::var("ProgramFiles(x86)")
-                                            .ok()
-                                            .map(|v| format!("{v}\\mpv\\mpv.exe")),
-                                        std::env::var("LOCALAPPDATA")
-                                            .ok()
-                                            .map(|v| format!("{v}\\Programs\\mpv\\mpv.exe")),
-                                        std::env::var("LOCALAPPDATA")
-                                            .ok()
-                                            .map(|v| format!("{v}\\mpv\\mpv.exe")),
-                                        Some("mpv.exe".to_string()),
-                                    ]
-                                    .into_iter()
-                                    .flatten()
-                                    .collect();
-                                    for path in &mpv_paths {
-                                        if Command::new(path)
-                                            .arg("--")
-                                            .arg(stream_url)
-                                            .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
-                                            .spawn()
-                                            .is_ok()
-                                        {
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    open::that(arg).ok();
-                                }
+                        if let Some(uri) = msg.get_params().and_then(Value::as_str) {
+                            if let Err(error) = super::external_player::play(uri) {
+                                eprintln!("Could not open external player: {error}");
                             }
                         }
                     }
@@ -1915,6 +2000,241 @@ impl MainWindow {
                 }
             } // recv
         }); // thread
+        if self.server.development() {
+            self.load_webui(None);
+        } else {
+            self.server.start();
+        }
+    }
+    fn load_webui(&self, server_url: Option<&str>) {
+        *self.local_server_url.lock().unwrap() = server_url
+            .filter(|server_url| {
+                Url::parse(server_url).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+                })
+            })
+            .map(str::to_owned);
+        if let Some(sender) = self.open_media_sender.borrow().as_ref() {
+            sender.send(OpenRequest::Reset).ok();
+        }
+        let endpoint = if self.webui_url.trim_end_matches('/') == WEB_ENDPOINT.trim_end_matches('/')
+        {
+            server_url
+                .map(web_endpoint_with_streaming_server)
+                .unwrap_or_else(|| self.webui_url.clone())
+        } else {
+            self.webui_url.clone()
+        };
+        self.webui_ready.set(false);
+        self.webui_retry_pending.set(false);
+        self.webui_retries.set(0);
+        if let Err(error) = self.webview.navigate(endpoint) {
+            self.splash_screen.hide();
+            nwg::modal_error_message(
+                &self.window,
+                "Cannot load Stremio Web UI",
+                &error.to_string(),
+            );
+        } else {
+            self.start_webui_deadline();
+        }
+    }
+    fn start_webui_deadline(&self) {
+        let generation = self.webui_generation.get() + 1;
+        self.webui_generation.set(generation);
+        let timeout = if self.webui_retries.get() > 0 {
+            WEBUI_RETRY_READY_TIMEOUT_SECS
+        } else {
+            WEBUI_READY_TIMEOUT_SECS
+        };
+        let events = self.webui_events.clone();
+        let sender = self.webui_notice.sender();
+        thread::spawn(move || {
+            thread::sleep(time::Duration::from_secs(timeout));
+            send_webui_event(&events, &sender, WebUiEvent::Timeout(generation));
+        });
+    }
+    fn retry_webui_silently(&self) -> bool {
+        if self.webui_retry_pending.replace(true) {
+            return true;
+        }
+        let Some(&delay) = WEBUI_RETRY_DELAYS_SECS.get(self.webui_retries.get()) else {
+            self.webui_retry_pending.set(false);
+            return false;
+        };
+        self.webui_retries.set(self.webui_retries.get() + 1);
+        let generation = self.webui_generation.get() + 1;
+        self.webui_generation.set(generation);
+        let events = self.webui_events.clone();
+        let sender = self.webui_notice.sender();
+        thread::spawn(move || {
+            thread::sleep(time::Duration::from_secs(delay));
+            send_webui_event(&events, &sender, WebUiEvent::Retry(generation));
+        });
+        true
+    }
+    fn retry_webui(&self) {
+        self.webui_retry_pending.set(false);
+        match self.webview.retry() {
+            Ok(()) => self.start_webui_deadline(),
+            Err(error) => self.show_webui_error(&error.to_string()),
+        }
+    }
+    fn show_webui_error(&self, details: &str) {
+        self.splash_screen.hide();
+        self.on_show();
+        let choice = nwg::modal_message(
+            &self.window,
+            &nwg::MessageParams {
+                title: "Stremio",
+                content: details,
+                buttons: nwg::MessageButtons::RetryCancel,
+                icons: nwg::MessageIcons::Error,
+            },
+        );
+        // The web UI can become ready while the dialog is open.
+        if self.webui_ready.get() {
+            return;
+        }
+        if choice == nwg::MessageChoice::Retry {
+            if !self.no_splash {
+                self.splash_screen.show();
+            }
+            self.retry_webui();
+        } else {
+            self.on_exit();
+        }
+    }
+    fn on_webui_notice(&self) {
+        let events: Vec<_> = self.webui_events.lock().unwrap().drain(..).collect();
+        for event in events {
+            let current = self.webui_generation.get();
+            match event {
+                WebUiEvent::Ready => {
+                    self.webui_ready.set(true);
+                    self.webui_retry_pending.set(false);
+                    self.webui_generation.set(current + 1);
+                    self.webui_retries.set(0);
+                }
+                _ if self.webui_ready.get() => {}
+                WebUiEvent::LoadFailed(detail) => {
+                    eprintln!("Web UI load error: {detail}");
+                    if !self.retry_webui_silently() {
+                        self.show_webui_error(&format!("{WEBUI_UNREACHABLE}\n\n{detail}"));
+                    }
+                }
+                WebUiEvent::Timeout(generation) if generation == current => {
+                    eprintln!("Web UI startup timed out");
+                    if self.webui_retries.get() > 0 || !self.retry_webui_silently() {
+                        self.show_webui_error(WEBUI_UNREACHABLE);
+                    }
+                }
+                WebUiEvent::Retry(generation) if generation == current => {
+                    eprintln!("Retrying the web UI (attempt {})", self.webui_retries.get());
+                    self.retry_webui();
+                }
+                WebUiEvent::Timeout(_) | WebUiEvent::Retry(_) => {}
+            }
+        }
+    }
+    fn on_server_notice(&self) {
+        for event in self.server.events() {
+            match event {
+                ServerEvent::Ready(endpoint) => self.load_webui(Some(&endpoint)),
+                ServerEvent::Failed(details) => {
+                    self.webui_generation.set(self.webui_generation.get() + 1);
+                    self.webui_ready.set(false);
+                    self.webui_retry_pending.set(false);
+                    *self.local_server_url.lock().unwrap() = None;
+                    if let Some(sender) = self.open_media_sender.borrow().as_ref() {
+                        sender.send(OpenRequest::Reset).ok();
+                    }
+                    self.splash_screen.hide();
+                    self.on_show();
+                    let content = format!(
+                        "Stremio's local streaming server is unavailable.\n\n{details}\n\nChoose Retry to start the server again, or Cancel to exit Stremio."
+                    );
+                    let choice = nwg::modal_message(
+                        &self.window,
+                        &nwg::MessageParams {
+                            title: "Stremio server",
+                            content: &content,
+                            buttons: nwg::MessageButtons::RetryCancel,
+                            icons: nwg::MessageIcons::Error,
+                        },
+                    );
+                    if choice == nwg::MessageChoice::Retry {
+                        if !self.no_splash {
+                            self.splash_screen.show();
+                        }
+                        self.server.start();
+                    } else {
+                        self.on_exit();
+                    }
+                }
+            }
+        }
+    }
+    fn on_cache_directory_notice(&self) {
+        let request = self.requested_cache_directory.lock().unwrap().clone();
+        let Some(request) = request else { return };
+        if !cache_directory::matches_local_server(
+            &request.server_url,
+            self.local_server_url.lock().unwrap().as_deref(),
+        ) {
+            self.requested_cache_directory.lock().unwrap().take();
+            if let Some((web_tx, _)) = self.webview.channel.borrow().as_ref() {
+                web_tx
+                    .send(cache_directory::selected(
+                        request.request_id,
+                        Err("The local server has changed".to_owned()),
+                    ))
+                    .ok();
+            }
+            return;
+        }
+        if let Some(directory) = &request.directory {
+            // An unplugged drive must not prevent choosing a different folder.
+            self.cache_directory_picker
+                .set_default_folder(directory)
+                .ok();
+        }
+        // Show runs a nested message loop; keep the pending request, but no locks or borrows.
+        let result = if self.cache_directory_picker.run(Some(&self.window)) {
+            self.cache_directory_picker
+                .get_selected_item()
+                .map_err(|error| error.to_string())
+                .and_then(|path| {
+                    path.into_string()
+                        .map(Some)
+                        .map_err(|_| "The selected folder path is not valid Unicode".to_owned())
+                })
+        } else {
+            Ok(None)
+        };
+        let result = if cache_directory::matches_local_server(
+            &request.server_url,
+            self.local_server_url.lock().unwrap().as_deref(),
+        ) {
+            result
+        } else {
+            Err("The local server has changed".to_owned())
+        };
+        self.requested_cache_directory.lock().unwrap().take();
+        if let Some((web_tx, _)) = self.webview.channel.borrow().as_ref() {
+            web_tx
+                .send(cache_directory::selected(request.request_id, result))
+                .ok();
+        }
+    }
+    fn on_set_interface_scale_notice(&self) {
+        if let Some(scale) = self.requested_interface_scale.lock().unwrap().take() {
+            match shell_state::save_interface_scale(scale) {
+                Ok(()) => self.webview.set_interface_scale(scale),
+                Err(error) => eprintln!("Could not save interface scale: {error}"),
+            }
+        }
     }
     fn on_min_max(&self, data: &nwg::EventData) {
         let data = data.on_min_max();

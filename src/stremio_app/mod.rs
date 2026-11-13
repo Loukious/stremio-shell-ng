@@ -1,4 +1,7 @@
 pub mod app;
+pub mod cache_directory;
+pub mod external_player;
+pub mod open_media;
 pub use app::MainWindow;
 pub mod gpu_video_processing;
 pub mod ipc;
@@ -12,7 +15,7 @@ pub mod splash;
 pub mod systray;
 pub mod updater;
 pub mod window_helper;
-pub use named_pipe::{PipeClient, PipeServer};
+pub use named_pipe::{acquire_single_instance, PipeServer, SingleInstance};
 pub mod constants;
 pub mod intro_skip;
 pub mod mpv_hwnd;

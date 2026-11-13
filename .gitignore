@@ -1,8 +1,12 @@
 /target
+/runtime-source/
 /stremio*.exe
 /libmpv-2.dll
 /bin/libmpv-2.dll
 /bin-arm64/libmpv-2.dll
+/bin*/ffmpeg.exe
+/bin*/ffprobe.exe
+/bin*/vcruntime*.dll
 /mpv-*/libmpv-2.dll
 /bin/backup
 StremioSetup*.exe

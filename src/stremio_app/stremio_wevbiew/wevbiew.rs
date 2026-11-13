@@ -1,4 +1,4 @@
-use crate::stremio_app::constants::SERVER_IPC_KEY;
+use crate::stremio_app::constants::{safe_url, SERVER_IPC_KEY};
 use crate::stremio_app::ipc;
 use crate::stremio_app::stremio_player::player::PLAYER_CMD_TX;
 use native_windows_gui::{self as nwg, PartialUi};
@@ -12,9 +12,8 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use url::Url;
 use urlencoding::decode;
-use webview2::Controller;
+use webview2::{Controller, WebErrorStatus};
 use webview2_sys::KeyEventKind;
 use winapi::shared::windef::HWND;
 use winapi::um::winuser::{GetClientRect, GetKeyState, VK_F7, WM_APPCOMMAND, WM_SETFOCUS};
@@ -408,13 +407,11 @@ fn build_mpv_keydown_script() -> String {
     )
 }
 
-use super::constants::{WARNING_URL, WHITELISTED_HOSTS};
-
 pub static CURRENT_URL: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".to_string()));
 
 #[derive(Default)]
 pub struct WebView {
-    pub endpoint: Rc<OnceCell<String>>,
+    endpoint: Rc<RefCell<Option<String>>>,
     pub dev_tools: Rc<OnceCell<bool>>,
     pub controller: Rc<OnceCell<Controller>>,
     pub channel: ipc::Channel,
@@ -424,6 +421,54 @@ pub struct WebView {
 }
 
 impl WebView {
+    pub fn navigate(&self, endpoint: String) -> webview2::Result<()> {
+        *self.endpoint.borrow_mut() = Some(endpoint.clone());
+        if let Some(controller) = self.controller.get() {
+            Self::navigate_webview(&controller.get_webview()?, &endpoint)?;
+        }
+        Ok(())
+    }
+
+    pub fn retry(&self) -> webview2::Result<()> {
+        if let (Some(controller), Some(endpoint)) =
+            (self.controller.get(), self.endpoint.borrow().as_deref())
+        {
+            let webview = controller.get_webview()?;
+            if webview.get_source()? == endpoint {
+                webview.reload()?;
+            } else {
+                webview.navigate(endpoint)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn navigate_webview(webview: &webview2::WebView, endpoint: &str) -> webview2::Result<()> {
+        let source = webview.get_source()?;
+        if source.split('#').next() == endpoint.split('#').next() {
+            // A fragment-only navigation would leave Core connected to the failed server.
+            // Set the new endpoint before reloading, including when the port is unchanged.
+            let fragment = endpoint.split_once('#').map(|(_, hash)| hash).unwrap_or("");
+            webview.execute_script(
+                &format!(
+                    "window.location.hash = {}; window.location.reload();",
+                    json!(fragment)
+                ),
+                |_| Ok(()),
+            )
+        } else {
+            webview.navigate(endpoint)
+        }
+    }
+
+    pub fn set_interface_scale(&self, scale: u64) {
+        if let Some(controller) = self.controller.get() {
+            if let Err(error) = controller.put_zoom_factor(scale as f64 / 100.0) {
+                eprintln!("Cannot set interface scale: {error}");
+            }
+        }
+    }
+
     pub fn fit_to_window(&self, hwnd: Option<HWND>) {
         if let Some(hwnd) = hwnd {
             unsafe {
@@ -506,40 +551,47 @@ impl PartialUi for WebView {
                     settings.put_are_host_objects_allowed(false).ok();
                     settings.put_are_default_script_dialogs_enabled(false).ok();
 
-                    // Handle window.open and href
                     webview.add_new_window_requested(move |_webview, event| {
                         if let Ok(uri) = event.get_uri() {
-                            if let Ok(url) = Url::parse(&uri) {
-                                let is_whitelisted = url.host().is_some_and(|host| {
-                                    WHITELISTED_HOSTS.iter().any(|whitelisted_host| host.to_string().ends_with(whitelisted_host))
-                                });
-
-                                let final_url = if is_whitelisted {
-                                    url.to_string()
-                                } else {
-                                    format!("{}{}", WARNING_URL, urlencoding::encode(url.as_ref()))
-                                };
-
-                                if let Err(e) = open::that(final_url) {
-                                    eprintln!("Failed to open URL: {e}");
-                                }
+                            if let Some(final_url) = safe_url(&uri) {
+                                open::that(final_url).ok();
                             }
                         }
-
                         Ok(())
                     })?;
-
-                    if let Some(endpoint) = endpoint.get() {
-                        if webview
-                            .navigate(endpoint.as_str()).is_err() {
-                                tx_web.clone().send(ipc::RPCResponse::response_message(Some(json!(["app-error", format!("Cannot load WEB UI at '{}'", &endpoint)])))).ok();
-                        };
-                    }
-                        webview.add_web_message_received(move |_w, msg| {
-                            let msg = msg.try_get_web_message_as_string()?;
-                            tx_web.send(msg).ok();
-                            Ok(())
-                        }).expect("Cannot add web message received");
+                    let navigation_endpoint = endpoint.clone();
+                    webview.add_navigation_starting(move |_webview, event| {
+                        let uri = event.get_uri()?;
+                        if !same_origin(&trusted_origin(&navigation_endpoint), &uri) {
+                            event.put_cancel(true)?;
+                            if let Some(final_url) = safe_url(&uri) {
+                                open::that(final_url).ok();
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    let load_error_tx = tx_web.clone();
+                    webview.add_navigation_completed(move |_webview, event| {
+                        if !event.get_is_success()? {
+                            let status = event.get_web_error_status()?;
+                            if status != WebErrorStatus::OperationCanceled {
+                                load_error_tx.send(ipc::RPCResponse::response_message(Some(json!([
+                                    "app-load-error", format!("{status:?}")
+                                ])))).ok();
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    let navigation_tx = tx_web.clone();
+                    let message_endpoint = endpoint.clone();
+                    webview.add_web_message_received(move |_w, msg| {
+                        if !same_origin(&trusted_origin(&message_endpoint), &msg.get_source()?) {
+                            return Ok(());
+                        }
+                        let message = msg.try_get_web_message_as_string()?;
+                        tx_web.send(message).ok();
+                        Ok(())
+                    }).expect("Cannot add web message received");
                         webview.add_new_window_requested(move |_w, msg| {
                             if let Some(file) = msg.get_uri().ok().and_then(|str| {decode(str.as_str()).ok().map(Cow::into_owned)}) {
                                 tx_drag_drop.send(ipc::RPCResponse::response_message(Some(json!(["dragdrop" ,[file]])))).ok();
@@ -561,10 +613,14 @@ impl PartialUi for WebView {
                             Ok(())
                         }).expect("Cannot add source_changed event");
 
+                        let content_endpoint = endpoint.clone();
                         webview.add_content_loading(move |wv, _| {
+                            if !same_origin(&trusted_origin(&content_endpoint), &wv.get_source()?) {
+                                return Ok(());
+                            }
                             wv.execute_script(format!(
-                                    "window.stremio_server_ipc_key='{}'",
-                                    std::env::var(SERVER_IPC_KEY).unwrap_or_default()
+                                    "window.stremio_server_ipc_key={}",
+                                    json!(std::env::var(SERVER_IPC_KEY).unwrap_or_default())
                             ).as_str(), |_| Ok(())
                             ).expect("Cannot add SERVER_IPC_KEY to webview");
 
@@ -690,9 +746,18 @@ impl PartialUi for WebView {
                         })
                         .unwrap();
 
+                        let navigation = endpoint.borrow().clone();
+                        controller.put_zoom_factor(crate::stremio_app::shell_state::load_interface_scale() as f64 / 100.0).ok();
                         controller_clone
                             .set(controller)
                             .expect("Cannot update the controller");
+                        if let Some(endpoint) = navigation {
+                            if let Err(error) = WebView::navigate_webview(&webview, &endpoint) {
+                                navigation_tx.send(ipc::RPCResponse::response_message(Some(json!([
+                                    "app-load-error", error.to_string()
+                                ])))).ok();
+                            }
+                        }
                         Ok(())
                     })
             });
@@ -796,5 +861,41 @@ mod tests {
             browser_reserved_mpv_key_with_modifiers(VK_F7 as u32, true, true, false, false,),
             Some("Shift+Ctrl+F7".to_string())
         );
+    }
+}
+
+fn trusted_origin(endpoint: &RefCell<Option<String>>) -> Option<url::Origin> {
+    endpoint
+        .borrow()
+        .as_deref()
+        .and_then(|endpoint| url::Url::parse(endpoint).ok())
+        .map(|endpoint| endpoint.origin())
+}
+
+fn same_origin(trusted: &Option<url::Origin>, uri: &str) -> bool {
+    match trusted {
+        Some(trusted) => url::Url::parse(uri).is_ok_and(|url| url.origin() == *trusted),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    #[test]
+    fn messages_and_navigation_require_exact_configured_origin() {
+        let endpoint = RefCell::new(Some("https://web.stremio.com/#/".to_owned()));
+        let origin = trusted_origin(&endpoint);
+        assert!(same_origin(&origin, "https://web.stremio.com/player"));
+        for uri in [
+            "https://web.stremio.com.evil.test/",
+            "http://web.stremio.com/",
+            "https://web.stremio.com:444/",
+            "file:///C:/test.html",
+            "not a URL",
+        ] {
+            assert!(!same_origin(&origin, uri));
+        }
+        assert!(!same_origin(&None, "https://web.stremio.com/"));
     }
 }

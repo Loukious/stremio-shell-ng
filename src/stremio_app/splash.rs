@@ -23,4 +23,7 @@ impl SplashImage {
     pub fn hide(&self) {
         self.splash.set_visible(false);
     }
+    pub fn show(&self) {
+        self.splash.set_visible(true);
+    }
 }

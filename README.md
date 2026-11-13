@@ -23,6 +23,15 @@
 * Auto-chapter skipping based on chapter titles (configurable keywords in `RPCconfig.ini`)
 * Choose automatic opening/ending skipping or a manual skip button from the player controls. The manual button hides after 8 seconds; the choice is saved in `RPCconfig.ini` (`[AutoSkip] manual_intro_outro`, defaults to `false`). Automatic opening/ending skips show a brief notification. Recaps remain automatic.
 * Picture in Picture support
+* Native ASS subtitles, including cancellation when changing videos
+* Interface zoom from 75% to 175%, saved between launches
+* Native cache-folder selection for the bundled streaming server
+* Open local torrent files and magnet links, and launch VLC, MPV, PotPlayer or M3U playlists
+* Bounded startup retries and audio recovery when an output device reconnects
+
+The [upstream port notes](wiki/upstream-ports-2026-11.md) describe the imported changes and validation.
+
+Windows installers and portable ZIPs include the native runtime built from pinned source for x64 and ARM64. Desktop playback uses MPV; these packages omit FFmpeg, FFprobe and VC runtime DLLs. Installer updates preserve an existing `RPCconfig.ini`, including your saved intro-skip mode. For browser playback that needs probing or conversion, use the separate [standalone runtime bundle](https://github.com/Loukious/stremio-runtime), which includes the media tools.
 
 
 

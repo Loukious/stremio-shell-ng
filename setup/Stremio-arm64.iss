@@ -11,12 +11,10 @@
 #define MyAppCopyright "Copyright © " + GetDateTimeString('yyyy', '', '') + " " + MyAppPublisher
 #define MyAppURL "https://www.stremio.com/"
 #define MyAppGoodbyeURL "https://www.strem.io/goodbye"
-#define AssocTorrentExt ".torrent"
-#define AssocTorrentKey StringChange(MyAppName, " ", "") + AssocTorrentExt
-#define AssocTorrentDesc "Bittorrent seed file"
 
 #define public Dependency_NoExampleSetup
 #include "CodeDependencies.iss"
+#include "FileAssociations.iss"
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
@@ -59,6 +57,7 @@ SignedUninstaller=yes
 [Code]
 function InitializeSetup: Boolean;
 begin
+  TorrentWasRegistered := RegValueExists(HKCU, '{#AssocCapabilities}\URLAssociations', 'magnet');
   Dependency_AddWebView2;
   Result := True;
 end;
@@ -86,8 +85,13 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
 begin
-  if (CurStep = ssDone) and WizardIsTaskSelected('runapp') then
-    ExecAsOriginalUser(ExpandConstant('{app}\{#MyAppExeName}'), '', '', SW_SHOW, ewNoWait, ResultCode);
+  if CurStep = ssPostInstall then
+    UpdateFileAssociations;
+  if CurStep = ssDone then begin
+    if WizardIsTaskSelected('runapp') then
+      ExecAsOriginalUser(ExpandConstant('{app}\{#MyAppExeName}'), '', '', SW_SHOW, ewNoWait, ResultCode);
+    OpenDefaultApps;
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -95,8 +99,17 @@ var
   ErrorCode: Integer;
 begin
   case (CurUninstallStep) of
-    usPostUninstall: if MsgBox(ExpandConstant('{cm:RemoveDataFolder}'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-      DelTree(ExpandConstant('{app}'), True, True, True);
+    usUninstall: begin
+      RemoveOwnedClass('stremio');
+      RemoveOwnedClass('magnet');
+      RemoveOwnedClass('Stremio.torrent');
+    end;
+    usPostUninstall: begin
+      RestoreProtocol(StremioProtocolBackup);
+      RestoreProtocol(MagnetProtocolBackup);
+      if MsgBox(ExpandConstant('{cm:RemoveDataFolder}'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+        DelTree(ExpandConstant('{app}'), True, True, True);
+    end;
     usDone: ShellExec('', ExpandConstant('{#MyAppGoodbyeURL}'), '', '', SW_SHOW, ewNoWait, ErrorCode);
   end;
 end;
@@ -160,35 +173,16 @@ ukrainian.RemoveDataFolder=Видалити всі дані та конфігу�
 Name: "runapp"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"
 ;Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "assoctorrent"; Description: "Associate {#MyAppName} with .torrent files"
+Name: "assoctorrent"; Description: "Open torrent files and magnet links with Stremio"
 
 [Files]
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 Source: "{#MyAppExeLocation}"; DestDir: "{app}"; Flags: ignoreversion signonce
 Source: "{#SourcePath}..\target\aarch64-pc-windows-msvc\release\libmpv-2.dll"; DestDir: "{app}"; Flags: ignoreversion signonce
 Source: "{#SourcePath}..\bin-arm64\stremio-runtime.exe"; DestDir: "{app}"; Flags: ignoreversion signonce
-Source: "{#SourcePath}..\RPCconfig.ini"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}..\RPCconfig.ini"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
 
 [Registry]
-; Associate .torrent files if assoctorrent task is selected
-Root: HKA; Subkey: "Software\Classes\{#AssocTorrentExt}}\OpenWithProgids"; ValueType: string; ValueName: "{#AssocTorrentKey}"; ValueData: ""; Flags: uninsdeletevalue; Tasks: assoctorrent
-Root: HKA; Subkey: "Software\Classes\{#AssocTorrentKey}"; ValueType: string; ValueName: ""; ValueData: "{#AssocTorrentDesc}"; Flags: uninsdeletekey; Tasks: assoctorrent
-Root: HKA; Subkey: "Software\Classes\{#AssocTorrentKey}\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName},0"; Flags: uninsdeletekey; Tasks: assoctorrent
-Root: HKA; Subkey: "Software\Classes\{#AssocTorrentKey}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey; Tasks: assoctorrent
-
-; stremio: protocol
-Root: HKA; Subkey: "Software\Classes\stremio"; ValueType: string; ValueName: ""; ValueData: "URL:Stremio Protocol"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\stremio"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\stremio\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName},0"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\stremio\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey
-
-; magnet: protocol
-Root: HKA; Subkey: "Software\Classes\magnet"; ValueType: string; ValueName: ""; ValueData: "URL:BitTorrent magnet"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\magnet"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\magnet\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName},0"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\magnet\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey
-
-Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".torrent"; ValueData: ""; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".avi"; ValueData: ""; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".asf"; ValueData: ""; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".mkv"; ValueData: ""; Flags: uninsdeletekey

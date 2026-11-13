@@ -5,11 +5,11 @@ use crate::stremio_app::stremio_wevbiew::wevbiew::set_bound_mpv_keys;
 use crate::stremio_app::RPCResponse;
 use flume::{Receiver, Sender};
 use libmpv2::events::PropertyData;
-use libmpv2::{events::Event, Format, Mpv};
+use libmpv2::{Format, Mpv};
 use native_windows_gui::{self as nwg, PartialUi};
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,6 +89,7 @@ const LOCAL_LOADFILE_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const LOCAL_STREAM_STARTUP_RETRY_LIMIT: u32 = 60;
 const LOCAL_STREAM_STARTUP_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MPV_COMMAND_QUEUE_RECOVERY_LIMIT: u32 = 3;
+const DIRECT_HTTP_PREMATURE_END_RETRY_LIMIT: u32 = 3;
 const DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2: u32 = 15;
 const DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR: u32 = 2;
 
@@ -140,6 +141,29 @@ enum LoadState {
     Stopping,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrematureEndRecovery {
+    Local,
+    DirectHttp,
+}
+
+impl PrematureEndRecovery {
+    fn retry_limit(self) -> u32 {
+        match self {
+            Self::Local => 1,
+            Self::DirectHttp => DIRECT_HTTP_PREMATURE_END_RETRY_LIMIT,
+        }
+    }
+
+    fn reload_url(self, url: &str) -> String {
+        match self {
+            Self::Local => cache_busted_url(url),
+            // Debrid/CDN query strings may be signed. Reload them byte-for-byte.
+            Self::DirectHttp => url.to_string(),
+        }
+    }
+}
+
 struct PlayerController {
     observed_properties: HashSet<String>,
     state: LoadState,
@@ -163,6 +187,11 @@ struct PlayerController {
     managed_gpu_filter_applied: bool,
     last_display_output: Option<(DisplayOutputState, bool)>,
     next_display_refresh: Instant,
+    video_ready: VideoReadyState,
+    rpc_response_sender: Option<Sender<String>>,
+    subtitle_request_sender: Option<Sender<SubtitleWorkerRequest>>,
+    pending_media_command: Option<CmdVal>,
+    pending_subtitle_ack: Option<Receiver<()>>,
 }
 
 struct ActiveLoadfile {
@@ -195,6 +224,429 @@ struct CommandSubmission {
     abortable: bool,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct SubtitleCommand {
+    name: &'static str,
+    args: Vec<String>,
+}
+
+impl SubtitleCommand {
+    fn from_command(command: CmdVal) -> Result<Self, CmdVal> {
+        let name = match &command {
+            CmdVal::Quintuple(MpvCmd::SubAdd, ..) => "sub-add",
+            CmdVal::Double(MpvCmd::SubRemove, ..) => "sub-remove",
+            _ => return Err(command),
+        };
+        Ok(Self {
+            name,
+            args: command.into(),
+        })
+    }
+}
+
+enum SubtitleWorkerRequest {
+    Command(SubtitleCommand),
+    BeginMediaChange(Sender<()>),
+    EndMediaChange,
+}
+
+struct InFlightSubtitle {
+    reply_id: u64,
+    name: &'static str,
+}
+
+enum SubtitleWorkerEvent {
+    Request(Result<SubtitleWorkerRequest, flume::RecvError>),
+    Wake(Result<(), flume::RecvError>),
+}
+
+fn start_next_subtitle(
+    mpv: &Mpv,
+    queue: &mut VecDeque<SubtitleCommand>,
+    in_flight: &mut Option<InFlightSubtitle>,
+    next_reply_id: &mut u64,
+    media_change: bool,
+) {
+    while !media_change && in_flight.is_none() {
+        let Some(command) = queue.pop_front() else {
+            return;
+        };
+        let args = match command
+            .args
+            .iter()
+            .map(|argument| CString::new(argument.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(args) => args,
+            Err(_) => {
+                eprintln!("mpv: invalid {} argument", command.name);
+                continue;
+            }
+        };
+        let mut arg_ptrs = args
+            .iter()
+            .map(|arg| arg.as_ptr())
+            .chain(std::iter::once(std::ptr::null::<c_char>()))
+            .collect::<Vec<_>>();
+        let reply_id = *next_reply_id;
+        *next_reply_id = (*next_reply_id).wrapping_add(1).max(1);
+        let result = unsafe {
+            libmpv2_sys::mpv_command_async(mpv.ctx.as_ptr(), reply_id, arg_ptrs.as_mut_ptr())
+        };
+        if result < 0 {
+            eprintln!(
+                "mpv: failed to queue {}: {}",
+                command.name,
+                mpv_error_string(result)
+            );
+            continue;
+        }
+        *in_flight = Some(InFlightSubtitle {
+            reply_id,
+            name: command.name,
+        });
+    }
+}
+
+fn create_subtitle_thread(
+    mut mpv: Mpv,
+    request_receiver: Receiver<SubtitleWorkerRequest>,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("subtitle-loader".to_string())
+        .spawn(move || {
+            let (wake_sender, wake_receiver) = flume::bounded(1);
+            mpv.set_wakeup_callback(move || {
+                let _ = wake_sender.try_send(());
+            });
+
+            let mut queue = VecDeque::new();
+            let mut in_flight: Option<InFlightSubtitle> = None;
+            let mut next_reply_id = 1;
+            let mut media_change = false;
+            let mut media_change_ack: Option<Sender<()>> = None;
+
+            loop {
+                let event = flume::Selector::new()
+                    .recv(&request_receiver, SubtitleWorkerEvent::Request)
+                    .recv(&wake_receiver, SubtitleWorkerEvent::Wake)
+                    .wait();
+
+                match event {
+                    SubtitleWorkerEvent::Request(Ok(SubtitleWorkerRequest::Command(command))) => {
+                        queue.push_back(command);
+                    }
+                    SubtitleWorkerEvent::Request(Ok(SubtitleWorkerRequest::BeginMediaChange(
+                        acknowledge,
+                    ))) => {
+                        media_change = true;
+                        queue.clear();
+                        if let Some(command) = &in_flight {
+                            media_change_ack = Some(acknowledge);
+                            unsafe {
+                                libmpv2_sys::mpv_abort_async_command(
+                                    mpv.ctx.as_ptr(),
+                                    command.reply_id,
+                                );
+                            }
+                        } else {
+                            let _ = acknowledge.send(());
+                        }
+                    }
+                    SubtitleWorkerEvent::Request(Ok(SubtitleWorkerRequest::EndMediaChange)) => {
+                        media_change = false;
+                    }
+                    SubtitleWorkerEvent::Request(Err(_)) | SubtitleWorkerEvent::Wake(Err(_)) => {
+                        break;
+                    }
+                    SubtitleWorkerEvent::Wake(Ok(())) => loop {
+                        let event = unsafe { &*libmpv2_sys::mpv_wait_event(mpv.ctx.as_ptr(), 0.0) };
+                        match event.event_id {
+                            libmpv2_sys::mpv_event_id_MPV_EVENT_NONE => break,
+                            libmpv2_sys::mpv_event_id_MPV_EVENT_SHUTDOWN => return,
+                            libmpv2_sys::mpv_event_id_MPV_EVENT_COMMAND_REPLY => {
+                                let Some(command) = &in_flight else {
+                                    continue;
+                                };
+                                if command.reply_id != event.reply_userdata {
+                                    continue;
+                                }
+                                let command = in_flight.take().expect("missing subtitle command");
+                                if event.error < 0 {
+                                    eprintln!(
+                                        "mpv: {} failed: {}",
+                                        command.name,
+                                        mpv_error_string(event.error)
+                                    );
+                                }
+                                if let Some(acknowledge) = media_change_ack.take() {
+                                    let _ = acknowledge.send(());
+                                }
+                            }
+                            _ => {}
+                        }
+                    },
+                }
+
+                start_next_subtitle(
+                    &mpv,
+                    &mut queue,
+                    &mut in_flight,
+                    &mut next_reply_id,
+                    media_change,
+                );
+            }
+        })
+        .expect("failed to start subtitle worker")
+}
+
+// The high-level event wrapper discards playlist entry IDs and command results.
+// Copy the handled event data here so load readiness can use MPV's actual IDs.
+#[derive(Debug)]
+enum PlayerMpvEvent {
+    GetPropertyReply(String, OwnedPropertyData),
+    SetPropertyReply,
+    PropertyChange(String, OwnedPropertyData),
+    CommandReply {
+        request_id: u64,
+        error: i32,
+        playlist_entry_id: Option<i64>,
+    },
+    StartFile(i64),
+    FileLoaded,
+    PlaybackRestart,
+    EndFile(libmpv2::EndFileReason),
+    Shutdown,
+    Other,
+}
+
+#[derive(Debug)]
+enum OwnedPropertyData {
+    Str(String),
+    OsdStr(String),
+    Flag(bool),
+    Int64(i64),
+    Double(f64),
+}
+
+impl OwnedPropertyData {
+    fn as_property_data(&self) -> PropertyData<'_> {
+        match self {
+            Self::Str(value) => PropertyData::Str(value),
+            Self::OsdStr(value) => PropertyData::OsdStr(value),
+            Self::Flag(value) => PropertyData::Flag(*value),
+            Self::Int64(value) => PropertyData::Int64(*value),
+            Self::Double(value) => PropertyData::Double(*value),
+        }
+    }
+}
+
+fn wait_player_event(mpv: &Mpv, timeout: f64) -> Option<Result<PlayerMpvEvent, String>> {
+    let event = unsafe { &*libmpv2_sys::mpv_wait_event(mpv.ctx.as_ptr(), timeout) };
+    use libmpv2_sys::{
+        mpv_event_command, mpv_event_end_file, mpv_event_property, mpv_event_start_file,
+    };
+    if event.event_id == libmpv2_sys::mpv_event_id_MPV_EVENT_NONE {
+        return None;
+    }
+    if event.event_id == libmpv2_sys::mpv_event_id_MPV_EVENT_COMMAND_REPLY {
+        let playlist_entry_id = if event.error >= 0 && !event.data.is_null() {
+            let command = unsafe { &*(event.data as *const mpv_event_command) };
+            playlist_entry_id_from_node(&command.result)
+        } else {
+            None
+        };
+        return Some(Ok(PlayerMpvEvent::CommandReply {
+            request_id: event.reply_userdata,
+            error: event.error,
+            playlist_entry_id,
+        }));
+    }
+    if event.error < 0 {
+        return Some(Err(self::mpv_error_string(event.error)));
+    }
+    let result = match event.event_id {
+        libmpv2_sys::mpv_event_id_MPV_EVENT_START_FILE if !event.data.is_null() => {
+            let start = unsafe { &*(event.data as *const mpv_event_start_file) };
+            Ok(PlayerMpvEvent::StartFile(start.playlist_entry_id))
+        }
+        libmpv2_sys::mpv_event_id_MPV_EVENT_FILE_LOADED => Ok(PlayerMpvEvent::FileLoaded),
+        libmpv2_sys::mpv_event_id_MPV_EVENT_PLAYBACK_RESTART => Ok(PlayerMpvEvent::PlaybackRestart),
+        libmpv2_sys::mpv_event_id_MPV_EVENT_SHUTDOWN => Ok(PlayerMpvEvent::Shutdown),
+        libmpv2_sys::mpv_event_id_MPV_EVENT_END_FILE if !event.data.is_null() => {
+            let end = unsafe { &*(event.data as *const mpv_event_end_file) };
+            if end.error < 0 {
+                eprintln!("[MPV] EndFile error: {}", self::mpv_error_string(end.error));
+            }
+            // The reason still needs the normal EndFile handling, including recovery
+            // and notifying the frontend when playback cannot continue.
+            Ok(PlayerMpvEvent::EndFile(end.reason))
+        }
+        libmpv2_sys::mpv_event_id_MPV_EVENT_GET_PROPERTY_REPLY
+        | libmpv2_sys::mpv_event_id_MPV_EVENT_PROPERTY_CHANGE
+            if !event.data.is_null() =>
+        {
+            let property = unsafe { &*(event.data as *const mpv_event_property) };
+            if property.format == libmpv2_sys::mpv_format_MPV_FORMAT_NONE {
+                // Unload notifications can precede EndFile. Keep the last valid
+                // playback position, duration, and seekability for recovery.
+                return None;
+            }
+            if property.name.is_null() || property.data.is_null() {
+                return Some(Err("MPV returned an empty property event".to_owned()));
+            }
+            let name = unsafe { CStr::from_ptr(property.name) }
+                .to_string_lossy()
+                .into_owned();
+            let value = unsafe {
+                match property.format {
+                    libmpv2_sys::mpv_format_MPV_FORMAT_FLAG => {
+                        OwnedPropertyData::Flag(*(property.data as *const i32) != 0)
+                    }
+                    libmpv2_sys::mpv_format_MPV_FORMAT_INT64 => {
+                        OwnedPropertyData::Int64(*(property.data as *const i64))
+                    }
+                    libmpv2_sys::mpv_format_MPV_FORMAT_DOUBLE => {
+                        OwnedPropertyData::Double(*(property.data as *const f64))
+                    }
+                    libmpv2_sys::mpv_format_MPV_FORMAT_STRING
+                    | libmpv2_sys::mpv_format_MPV_FORMAT_OSD_STRING => {
+                        let text = *(property.data as *const *const c_char);
+                        if text.is_null() {
+                            return Some(Err("MPV returned an empty property string".to_owned()));
+                        }
+                        let text = CStr::from_ptr(text).to_string_lossy().into_owned();
+                        if property.format == libmpv2_sys::mpv_format_MPV_FORMAT_STRING {
+                            OwnedPropertyData::Str(text)
+                        } else {
+                            OwnedPropertyData::OsdStr(text)
+                        }
+                    }
+                    _ => {
+                        return Some(Err("MPV returned an unsupported property format".to_owned()))
+                    }
+                }
+            };
+            if event.event_id == libmpv2_sys::mpv_event_id_MPV_EVENT_GET_PROPERTY_REPLY {
+                Ok(PlayerMpvEvent::GetPropertyReply(name, value))
+            } else {
+                Ok(PlayerMpvEvent::PropertyChange(name, value))
+            }
+        }
+        libmpv2_sys::mpv_event_id_MPV_EVENT_SET_PROPERTY_REPLY => {
+            Ok(PlayerMpvEvent::SetPropertyReply)
+        }
+        _ => Ok(PlayerMpvEvent::Other),
+    };
+    Some(result)
+}
+
+fn playlist_entry_id_from_node(node: &libmpv2_sys::mpv_node) -> Option<i64> {
+    if node.format != libmpv2_sys::mpv_format_MPV_FORMAT_NODE_MAP {
+        return None;
+    }
+    let list = unsafe { node.u.list.as_ref()? };
+    if list.keys.is_null() || list.values.is_null() {
+        return None;
+    }
+    for index in 0..list.num.max(0) as usize {
+        let key = unsafe { *list.keys.add(index) };
+        let value = unsafe { &*list.values.add(index) };
+        if !key.is_null()
+            && unsafe { CStr::from_ptr(key) }.to_bytes() == b"playlist_entry_id"
+            && value.format == libmpv2_sys::mpv_format_MPV_FORMAT_INT64
+        {
+            return Some(unsafe { value.u.int64 });
+        }
+    }
+    None
+}
+
+#[derive(Debug, Default)]
+struct VideoReadyState {
+    next_load_id: u64,
+    current_load_id: Option<u64>,
+    request_load_ids: HashMap<u64, u64>,
+    playlist_load_ids: HashMap<i64, u64>,
+    active_playlist_entry_id: Option<i64>,
+    active_load_id: Option<u64>,
+    file_loaded_id: Option<u64>,
+    file_loaded: bool,
+    ready_sent_id: Option<u64>,
+}
+
+impl VideoReadyState {
+    fn begin_transition(&mut self) -> u64 {
+        self.next_load_id += 1;
+        self.current_load_id = Some(self.next_load_id);
+        self.file_loaded_id = None;
+        self.file_loaded = false;
+        self.ready_sent_id = None;
+        self.next_load_id
+    }
+
+    fn queue_current_load(&mut self, request_id: u64) {
+        if let Some(load_id) = self.current_load_id {
+            self.request_load_ids.insert(request_id, load_id);
+        }
+    }
+
+    fn command_replied(&mut self, request_id: u64, playlist_entry_id: Option<i64>) {
+        let Some(load_id) = self.request_load_ids.remove(&request_id) else {
+            return;
+        };
+        if let Some(entry_id) = playlist_entry_id {
+            if self.active_playlist_entry_id == Some(entry_id) {
+                self.active_load_id = Some(load_id);
+                if self.file_loaded && Some(load_id) == self.current_load_id {
+                    self.file_loaded_id = Some(load_id);
+                }
+            } else {
+                self.playlist_load_ids.insert(entry_id, load_id);
+            }
+        }
+    }
+
+    fn end_file(&mut self) {
+        self.file_loaded_id = None;
+        self.file_loaded = false;
+        self.ready_sent_id = None;
+    }
+
+    fn start_file(&mut self, playlist_entry_id: i64) {
+        self.active_playlist_entry_id = Some(playlist_entry_id);
+        self.active_load_id = self.playlist_load_ids.remove(&playlist_entry_id);
+        self.file_loaded_id = None;
+        self.file_loaded = false;
+    }
+
+    fn file_loaded(&mut self) {
+        self.file_loaded = true;
+        if self.active_load_id == self.current_load_id {
+            self.file_loaded_id = self.active_load_id;
+        }
+    }
+
+    fn playback_restarted(&mut self) -> Option<u64> {
+        let load_id = self.current_load_id?;
+        if self.file_loaded_id != Some(load_id) || self.ready_sent_id == Some(load_id) {
+            return None;
+        }
+        self.ready_sent_id = Some(load_id);
+        Some(load_id)
+    }
+}
+
+fn video_ready_response(load_id: u64, ready: bool) -> String {
+    RPCResponse::response_message(PlayerResponse::video_ready(load_id, ready).to_value())
+}
+
+fn send_video_ready(rpc_response_sender: &Sender<String>, load_id: u64, ready: bool) {
+    if let Err(error) = rpc_response_sender.send(video_ready_response(load_id, ready)) {
+        eprintln!("failed to send video readiness: {error}");
+    }
+}
+
 impl PlayerController {
     fn new(window_handle: isize) -> Self {
         Self {
@@ -220,6 +672,11 @@ impl PlayerController {
             managed_gpu_filter_applied: false,
             last_display_output: None,
             next_display_refresh: Instant::now(),
+            video_ready: VideoReadyState::default(),
+            rpc_response_sender: None,
+            subtitle_request_sender: None,
+            pending_media_command: None,
+            pending_subtitle_ack: None,
         }
     }
 
@@ -344,6 +801,7 @@ fn create_shareable_mpv(window_handle: HWND) -> Mpv {
         set_property!("wid", window_handle as i64);
         set_property!("title", "Stremio");
         set_property!("audio-client-name", "Stremio");
+        set_property!("audio-fallback-to-null", "yes");
         set_property!("config", "yes");
         set_property!("load-scripts", "yes");
         // Keep the embedded VO alive between files. Recreating it at every EOF can
@@ -363,7 +821,7 @@ fn create_shareable_mpv(window_handle: HWND) -> Mpv {
         // `%23%` escapes the 23-byte HTTP status list as one mpv option value.
         set_property!(
             "stream-lavf-o",
-            "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=%23%408,429,500,502,503,504,reconnect_delay_max=15"
+            "reconnect=1,reconnect_on_network_error=1,reconnect_on_http_error=%23%408,429,500,502,503,504,reconnect_delay_max=15"
         );
         // gpu-next: libplacebo VO with modern HDR tone-mapping; gpu, is the fallback.
         set_property!("vo", "gpu-next,gpu,");
@@ -500,7 +958,7 @@ fn apply_display_output_mode(
         DisplayOutputMode::Sdr => [
             ("d3d11-output-csp", "srgb"),
             ("target-colorspace-hint", "yes"),
-            ("target-trc", "srgb"),
+            ("target-trc", "auto"),
             ("target-prim", "bt.709"),
         ],
     };
@@ -628,15 +1086,24 @@ fn create_event_thread(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut controller = PlayerController::new(window_handle);
+        controller.rpc_response_sender = Some(rpc_response_sender.clone());
+        let subtitle_mpv = mpv
+            .create_client(None)
+            .expect("cannot create MPV subtitle client");
+        let (subtitle_sender, subtitle_receiver) = flume::unbounded();
+        controller.subtitle_request_sender = Some(subtitle_sender);
+        let _subtitle_thread = create_subtitle_thread(subtitle_mpv, subtitle_receiver);
         mpv.disable_deprecated_events()
             .expect("failed to disable deprecated MPV events");
         for (name, format) in [
             ("time-pos", Format::Double),
             ("duration", Format::Double),
+            ("seekable", Format::Flag),
             ("pause", Format::Flag),
             ("chapter", Format::Int64),
             ("chapters", Format::Int64),
             ("chapter-metadata/by-key/title", Format::String),
+            ("audio-device-list", Format::String),
         ] {
             observe_property(&mpv, name, format);
             controller.observed_properties.insert(name.to_string());
@@ -646,13 +1113,14 @@ fn create_event_thread(
             while let Ok(msg) = in_msg_receiver.try_recv() {
                 controller.handle_in_msg(&mpv, msg, &rpc_response_sender);
             }
+            controller.flush_pending_media_command(&mpv);
             controller.flush_stale_stop(&mpv);
             controller.flush_stale_loadfile(&mpv);
             controller.flush_pending_startup_retry(&mpv);
             controller.refresh_display_output(&mpv);
             controller.keep_video_surface_behind_webview();
 
-            let event = match mpv.wait_event(0.01) {
+            let event = match wait_player_event(&mpv, 0.01) {
                 Some(Ok(event)) => event,
                 Some(Err(error)) => {
                     eprintln!("Event errored: {error:?}");
@@ -667,20 +1135,32 @@ fn create_event_thread(
             };
 
             let player_response = match event {
-                Event::GetPropertyReply { name, result, .. } => {
-                    emit_async_property_reply(&rpc_response_sender, name, &result);
+                PlayerMpvEvent::GetPropertyReply(name, result) => {
+                    let result = result.as_property_data();
+                    if name == "current-ao" {
+                        if matches!(
+                            result,
+                            PropertyData::Str("null") | PropertyData::OsdStr("null")
+                        ) {
+                            let _ = send_command_parts(&mpv, "ao-reload".to_string(), Vec::new());
+                        }
+                        continue;
+                    }
+                    emit_async_property_reply(&rpc_response_sender, &name, &result);
                     continue;
                 }
-                Event::SetPropertyReply(_) => continue,
-                Event::StartFile => {
+                PlayerMpvEvent::SetPropertyReply => continue,
+                PlayerMpvEvent::StartFile(playlist_entry_id) => {
                     println!("[MPV] StartFile");
-                    controller.on_start_file();
+                    controller.on_start_file(playlist_entry_id);
                     continue;
                 }
-                Event::FileLoaded => {
+                PlayerMpvEvent::FileLoaded => {
                     let url = controller.current_url.clone();
                     println!("[MPV] FileLoaded url={url}");
-                    controller.on_file_loaded(&mpv, &rpc_response_sender);
+                    if !controller.on_file_loaded(&mpv, &rpc_response_sender) {
+                        continue;
+                    }
                     request_loaded_property_snapshot(&mpv);
 
                     if let Some(pos) = controller.take_pending_reload_seek_for(&url) {
@@ -692,8 +1172,19 @@ fn create_event_thread(
                     }
                     continue;
                 }
-                Event::PropertyChange { name, change, .. } => {
-                    update_cached_property(name, &change);
+                PlayerMpvEvent::PlaybackRestart => {
+                    if let Some(load_id) = controller.video_ready.playback_restarted() {
+                        send_video_ready(&rpc_response_sender, load_id, true);
+                    }
+                    continue;
+                }
+                PlayerMpvEvent::PropertyChange(name, change) => {
+                    let change = change.as_property_data();
+                    if name == "audio-device-list" {
+                        request_property_async(&mpv, "current-ao", Format::String);
+                        continue;
+                    }
+                    update_cached_property(&name, &change);
                     PlayerResponse(
                         "mpv-prop-change",
                         PlayerEvent::PropChange(PlayerProprChange::from_name_value(
@@ -702,10 +1193,22 @@ fn create_event_thread(
                         )),
                     )
                 }
-                Event::EndFile(reason) => {
+                PlayerMpvEvent::EndFile(reason) => {
                     let url = controller.current_url.clone();
                     let time = *CURRENT_TIME.lock().unwrap();
                     let duration = *TOTAL_DURATION.lock().unwrap();
+                    let replacement_queued = controller.pending_media_command.is_some()
+                        || controller.pending_loadfile.is_some();
+                    let recovery = premature_end_recovery(
+                        controller.state,
+                        reason,
+                        &url,
+                        time,
+                        duration,
+                        cached_property_value("seekable").and_then(|value| value.as_bool())
+                            == Some(true),
+                    )
+                    .filter(|_| !replacement_queued);
                     println!(
                         "[MPV] EndFile reason={:?}, time={}, duration={}, url={}",
                         reason, time, duration, url
@@ -726,30 +1229,11 @@ fn create_event_thread(
                         continue;
                     }
 
-                    // Implement reload-on-stuck behavior for local torrent URLs
-                    if reason == libmpv2::mpv_end_file_reason::Eof {
-                        let premature = url.contains("127.0.0.1:11470")
-                            && duration > 30.0
-                            && time > 0.0
-                            && time < duration - 10.0;
-
-                        if premature && controller.premature_eof_reloads < 1 {
-                            controller.premature_eof_reloads += 1;
-                            println!("[MPV] Premature EOF detected on local stream. Reloading...");
-
-                            let url2 = cache_busted_url(&url);
-
-                            controller.set_current_url(url2.clone());
-                            controller.pending_reload_url = Some(url2.clone());
-                            controller.pending_reload_seek = Some(time);
-                            let cmd =
-                                CmdVal::Tripple(MpvCmd::Loadfile, url2, "replace".to_string());
-                            controller.send_loadfile_now(&mpv, cmd);
-
-                            // Do not propagate this premature EndFile to the frontend,
-                            // otherwise the autoplay logic might trigger next episode.
-                            continue;
-                        }
+                    if recovery.is_some_and(|recovery| {
+                        controller.recover_premature_end(&mpv, recovery, &url, time)
+                    }) {
+                        // Suppress completion only after a replacement was actually queued.
+                        continue;
                     }
 
                     if error_retry_scheduled {
@@ -768,13 +1252,37 @@ fn create_event_thread(
 
                     PlayerResponse(
                         "mpv-event-ended",
-                        PlayerEvent::End(PlayerEnded::from_end_reason(reason)),
+                        PlayerEvent::End(PlayerEnded::from_end_reason(unrecovered_end_reason(
+                            reason, recovery,
+                        ))),
                     )
                 }
-                Event::Shutdown => {
+                PlayerMpvEvent::Shutdown => {
                     break;
                 }
-                Event::CommandReply(request_id) => {
+                PlayerMpvEvent::CommandReply {
+                    request_id,
+                    error,
+                    playlist_entry_id,
+                } => {
+                    controller
+                        .video_ready
+                        .command_replied(request_id, playlist_entry_id);
+                    if error < 0 {
+                        eprintln!(
+                            "MPV command {request_id} failed: {}",
+                            mpv_error_string(error)
+                        );
+                        let resume_position = controller
+                            .active_loadfile
+                            .as_ref()
+                            .and_then(|active| active.requested_start);
+                        controller.retry_local_stream_startup_failure(
+                            "command reply error",
+                            resume_position,
+                        );
+                        continue;
+                    }
                     println!("[MPV CMD REPLY] request_id={request_id}");
                     controller.on_command_reply(request_id, &mpv);
                     continue;
@@ -1155,6 +1663,72 @@ impl PlayerController {
     }
 
     fn handle_command(&mut self, mpv: &Mpv, cmd: CmdVal) {
+        let cmd = match SubtitleCommand::from_command(cmd) {
+            Ok(command) => {
+                if self.state == LoadState::Loaded && self.pending_media_command.is_none() {
+                    if let Some(sender) = &self.subtitle_request_sender {
+                        let _ = sender.send(SubtitleWorkerRequest::Command(command));
+                    }
+                }
+                return;
+            }
+            Err(cmd) => cmd,
+        };
+        if is_loadfile_command(&cmd) || is_stop_command(&cmd) {
+            let load_id = self.video_ready.begin_transition();
+            if let Some(sender) = &self.rpc_response_sender {
+                send_video_ready(sender, load_id, false);
+            }
+            if is_stop_command(&cmd) {
+                self.pending_loadfile = None;
+                self.pending_startup_retry = None;
+                self.pending_reload_url = None;
+                self.pending_reload_seek = None;
+            }
+            if let Some(sender) = &self.subtitle_request_sender {
+                self.pending_media_command = Some(cmd);
+                if self.pending_subtitle_ack.is_none() {
+                    let (acknowledge, acknowledged) = flume::bounded(1);
+                    if sender
+                        .send(SubtitleWorkerRequest::BeginMediaChange(acknowledge))
+                        .is_ok()
+                    {
+                        self.pending_subtitle_ack = Some(acknowledged);
+                    } else {
+                        eprintln!("mpv: subtitle worker stopped before media change");
+                        self.pending_media_command = None;
+                    }
+                }
+                return;
+            }
+        }
+        self.execute_command(mpv, cmd);
+    }
+
+    fn flush_pending_media_command(&mut self, mpv: &Mpv) {
+        let Some(acknowledged) = &self.pending_subtitle_ack else {
+            return;
+        };
+        match acknowledged.try_recv() {
+            Err(flume::TryRecvError::Empty) => return,
+            Err(flume::TryRecvError::Disconnected) => {
+                eprintln!("mpv: subtitle worker stopped before media change");
+                self.pending_subtitle_ack = None;
+                self.pending_media_command = None;
+                return;
+            }
+            Ok(()) => {}
+        }
+        self.pending_subtitle_ack = None;
+        if let Some(command) = self.pending_media_command.take() {
+            self.execute_command(mpv, command);
+        }
+        if let Some(sender) = &self.subtitle_request_sender {
+            let _ = sender.send(SubtitleWorkerRequest::EndMediaChange);
+        }
+    }
+
+    fn execute_command(&mut self, mpv: &Mpv, cmd: CmdVal) {
         println!("[PLAYER] parsed mpv command: {cmd:?}");
         let cmd = sanitize_loadfile_start(cmd);
         println!("[PLAYER] sanitized mpv command: {cmd:?}");
@@ -1277,7 +1851,8 @@ impl PlayerController {
             return;
         };
 
-        let is_reload = url.contains("_reload=");
+        let is_reload = self.pending_reload_url.as_deref() == Some(url)
+            || (is_local_stream_url(url) && url.contains("_reload="));
         if !is_reload {
             if self.current_url == url {
                 println!("[PLAYER] restarting current non-reload stream: {url}");
@@ -1302,7 +1877,13 @@ impl PlayerController {
         println!("Stream URL captured: {}", url);
     }
 
-    fn on_start_file(&mut self) {
+    fn on_start_file(&mut self, playlist_entry_id: i64) {
+        self.video_ready.start_file(playlist_entry_id);
+        if self.video_ready.active_load_id.is_some()
+            && self.video_ready.active_load_id != self.video_ready.current_load_id
+        {
+            return;
+        }
         self.state = LoadState::Loading;
         self.stop_started_at = None;
         if let Some(active) = self.active_loadfile.as_mut() {
@@ -1318,7 +1899,13 @@ impl PlayerController {
         *CURRENT_CHAPTER_TITLE.lock().unwrap() = String::new();
     }
 
-    fn on_file_loaded(&mut self, mpv: &Mpv, rpc_response_sender: &Sender<String>) {
+    fn on_file_loaded(&mut self, mpv: &Mpv, rpc_response_sender: &Sender<String>) -> bool {
+        self.video_ready.file_loaded();
+        if self.video_ready.active_load_id.is_some()
+            && self.video_ready.active_load_id != self.video_ready.current_load_id
+        {
+            return false;
+        }
         self.state = LoadState::Loaded;
         self.stop_started_at = None;
         self.stop_command_request_id = None;
@@ -1333,9 +1920,11 @@ impl PlayerController {
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
         self.apply_pending_file_properties(mpv, rpc_response_sender);
         self.invalidate_display_output();
+        true
     }
 
     fn on_end_file(&mut self) {
+        self.video_ready.end_file();
         let replacement_is_loading = self
             .active_loadfile
             .as_ref()
@@ -1366,7 +1955,8 @@ impl PlayerController {
     }
 
     fn should_defer_startup_property(&self, name: &PropKey) -> bool {
-        should_defer_property(self.state, &name.to_string())
+        (self.pending_media_command.is_some() && is_file_scoped_property(&name.to_string()))
+            || should_defer_property(self.state, &name.to_string())
     }
 
     fn queue_startup_property(&mut self, name: PropKey, value: PropVal) {
@@ -1414,13 +2004,53 @@ impl PlayerController {
                 self.pending_reload_url = None;
                 self.pending_reload_seek.take()
             }
-            Some(_) => {
-                self.pending_reload_url = None;
-                self.pending_reload_seek = None;
-                None
-            }
-            None => None,
+            // A stale FileLoaded event must not consume another file's resume position.
+            Some(_) | None => None,
         }
+    }
+
+    fn recover_premature_end(
+        &mut self,
+        mpv: &Mpv,
+        recovery: PrematureEndRecovery,
+        url: &str,
+        position: f64,
+    ) -> bool {
+        if self.premature_eof_reloads >= recovery.retry_limit() {
+            return false;
+        }
+
+        let reload_url = recovery.reload_url(url);
+        self.pending_reload_url = Some(reload_url.clone());
+        self.pending_reload_seek = Some(position);
+        self.handle_command(
+            mpv,
+            CmdVal::Tripple(MpvCmd::Loadfile, reload_url.clone(), "replace".to_string()),
+        );
+
+        if self.has_queued_loadfile_for(&reload_url) {
+            self.premature_eof_reloads += 1;
+            let origin = url::Url::parse(url)
+                .map(|url| url.origin().ascii_serialization())
+                .unwrap_or_else(|_| "unknown".to_string());
+            println!(
+                "[MPV] Recovering premature end ({recovery:?}), origin={origin}, attempt={}, position={position}",
+                self.premature_eof_reloads
+            );
+            true
+        } else {
+            self.pending_reload_url = None;
+            self.pending_reload_seek = None;
+            false
+        }
+    }
+
+    fn has_queued_loadfile_for(&self, url: &str) -> bool {
+        self.active_loadfile
+            .as_ref()
+            .is_some_and(|active| active.url == url)
+            || self.pending_loadfile.as_ref().and_then(loadfile_url) == Some(url)
+            || self.pending_media_command.as_ref().and_then(loadfile_url) == Some(url)
     }
 
     fn set_current_url(&mut self, url: String) {
@@ -1439,6 +2069,7 @@ impl PlayerController {
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
         if let Some(submission) = send_command(mpv, cmd) {
+            self.video_ready.queue_current_load(submission.request_id);
             self.active_loadfile = Some(ActiveLoadfile {
                 cmd: active_cmd,
                 url,
@@ -1460,6 +2091,8 @@ impl PlayerController {
         let Some(active) = self.active_loadfile.take() else {
             return false;
         };
+        // Keep its readiness association until MPV replies. The load command may
+        // already have executed even when its StartFile event is still queued.
 
         if active.abortable {
             println!(
@@ -1659,7 +2292,7 @@ impl PlayerController {
             self.pending_reload_url = Some(retry.retry_url.clone());
             self.pending_reload_seek = Some(position);
         }
-        self.send_loadfile_now(
+        self.handle_command(
             mpv,
             CmdVal::Tripple(MpvCmd::Loadfile, retry.retry_url, "replace".to_string()),
         );
@@ -1823,7 +2456,61 @@ fn should_retry_startup_failure_event(
 }
 
 fn is_local_stream_url(url: &str) -> bool {
-    url.contains(":11470/")
+    url::Url::parse(url).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host().is_some_and(|host| match host {
+                url::Host::Ipv4(address) => address.is_loopback(),
+                url::Host::Ipv6(address) => address.is_loopback(),
+                url::Host::Domain(name) => name == "localhost",
+            })
+    })
+}
+
+fn premature_end_recovery(
+    state: LoadState,
+    reason: libmpv2::EndFileReason,
+    url: &str,
+    time: f64,
+    duration: f64,
+    seekable: bool,
+) -> Option<PrematureEndRecovery> {
+    if !time.is_finite()
+        || !duration.is_finite()
+        || duration <= 30.0
+        || time <= 0.0
+        || time >= duration - 10.0
+    {
+        return None;
+    }
+
+    if is_local_stream_url(url) {
+        return (reason == libmpv2::mpv_end_file_reason::Eof)
+            .then_some(PrematureEndRecovery::Local);
+    }
+
+    (state == LoadState::Loaded
+        && seekable
+        && matches!(
+            reason,
+            libmpv2::mpv_end_file_reason::Eof | libmpv2::mpv_end_file_reason::Error
+        )
+        && url::Url::parse(url)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host()))
+    .then_some(PrematureEndRecovery::DirectHttp)
+}
+
+fn unrecovered_end_reason(
+    reason: libmpv2::EndFileReason,
+    recovery: Option<PrematureEndRecovery>,
+) -> libmpv2::EndFileReason {
+    if reason == libmpv2::mpv_end_file_reason::Eof
+        && recovery == Some(PrematureEndRecovery::DirectHttp)
+    {
+        // Exhausted or failed recovery must not report a truncated VOD as completed.
+        libmpv2::mpv_end_file_reason::Error
+    } else {
+        reason
+    }
 }
 
 fn cache_busted_url(url: &str) -> String {
@@ -1979,6 +2666,7 @@ fn is_cached_immediate_property(name: &str) -> bool {
             | "sid"
             | "aid"
             | "vid"
+            | "seekable"
             | "sub-scale"
             | "sub-pos"
             | "sub-delay"
@@ -2033,6 +2721,7 @@ fn clear_file_scoped_cached_props() {
     for name in [
         "time-pos",
         "duration",
+        "seekable",
         "paused-for-cache",
         "cache-buffering-state",
         "demuxer-cache-time",
@@ -2052,6 +2741,7 @@ fn clear_file_scoped_cached_props() {
 fn request_loaded_property_snapshot(mpv: &Mpv) {
     for (name, format) in [
         ("duration", Format::Double),
+        ("seekable", Format::Flag),
         ("time-pos", Format::Double),
         ("pause", Format::Flag),
         ("volume", Format::Double),
@@ -2080,6 +2770,7 @@ fn emit_async_property_reply(
 
 fn property_data_to_json(name: &str, value: &PropertyData) -> Option<Value> {
     match value {
+        PropertyData::None => None,
         PropertyData::Flag(value) => Some(Value::Bool(*value)),
         PropertyData::Int64(value) => Some(json!(*value)),
         PropertyData::Double(value) if value.is_finite() => Some(json!(*value)),
@@ -2150,6 +2841,7 @@ fn mpv_string_property_to_json(name: &str, value: String) -> Value {
 
 fn update_cached_property(name: &str, change: &PropertyData) {
     let cached_value = match change {
+        PropertyData::None => None,
         PropertyData::Flag(value) => Some(Value::Bool(*value)),
         PropertyData::Int64(value) => Some(json!(*value)),
         PropertyData::Double(value) => Some(json!(*value)),
@@ -2315,11 +3007,597 @@ mod tests {
     use super::{
         binding_sequence_parts, cache_busted_url_at, is_active_user_binding,
         is_unchanged_persistent_render_property, property_data_to_json, should_defer_property,
-        should_retry_startup_failure_event, LoadState, PropVal,
+        should_retry_startup_failure_event, LoadState, PropVal, VideoReadyState,
     };
     use libmpv2::events::PropertyData;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn local_stream_recovery_accepts_random_runtime_ports() {
+        for url in [
+            "http://127.0.0.1:45821/stream",
+            "http://localhost:45822/stream",
+            "http://[::1]:45823/stream",
+        ] {
+            assert!(super::is_local_stream_url(url));
+        }
+        for url in [
+            "http://example.com:11470/stream",
+            "http://127.0.0.1.evil.test:11470/stream",
+            "file:///C:/video.mp4",
+        ] {
+            assert!(!super::is_local_stream_url(url));
+        }
+    }
+
+    #[test]
+    fn premature_http_end_requires_seekable_loaded_vod() {
+        use libmpv2::mpv_end_file_reason::{Eof, Error, Quit, Redirect, Stop};
+
+        for reason in [Eof, Error] {
+            for url in [
+                "http://cdn.example/video",
+                "https://cdn.example/video?token=a%2Fb",
+            ] {
+                assert_eq!(
+                    super::premature_end_recovery(
+                        LoadState::Loaded,
+                        reason,
+                        url,
+                        120.0,
+                        7200.0,
+                        true,
+                    ),
+                    Some(super::PrematureEndRecovery::DirectHttp),
+                );
+            }
+        }
+        for state in [LoadState::Idle, LoadState::Loading, LoadState::Stopping] {
+            assert_eq!(
+                super::premature_end_recovery(
+                    state,
+                    Eof,
+                    "https://cdn.example/video",
+                    120.0,
+                    7200.0,
+                    true,
+                ),
+                None,
+            );
+        }
+        for reason in [Stop, Quit, Redirect] {
+            assert_eq!(
+                super::premature_end_recovery(
+                    LoadState::Loaded,
+                    reason,
+                    "https://cdn.example/video",
+                    120.0,
+                    7200.0,
+                    true,
+                ),
+                None,
+            );
+        }
+        for url in ["file:///C:/video.mp4", "rtsp://cdn.example/live", "invalid"] {
+            assert_eq!(
+                super::premature_end_recovery(LoadState::Loaded, Eof, url, 120.0, 7200.0, true,),
+                None,
+            );
+        }
+        assert_eq!(
+            super::premature_end_recovery(
+                LoadState::Loaded,
+                Eof,
+                "https://cdn.example/live",
+                120.0,
+                7200.0,
+                false,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn premature_http_end_excludes_unknown_duration_and_real_completion() {
+        use libmpv2::mpv_end_file_reason::Eof;
+
+        for (time, duration) in [
+            (120.0, 0.0),
+            (1.0, 30.0),
+            (0.0, 7200.0),
+            (-1.0, 7200.0),
+            (7190.0, 7200.0),
+            (7200.0, 7200.0),
+            (7201.0, 7200.0),
+            (f64::NAN, 7200.0),
+            (f64::INFINITY, 7200.0),
+            (120.0, f64::NAN),
+            (120.0, f64::INFINITY),
+        ] {
+            assert_eq!(
+                super::premature_end_recovery(
+                    LoadState::Loaded,
+                    Eof,
+                    "https://cdn.example/video",
+                    time,
+                    duration,
+                    true,
+                ),
+                None,
+                "time={time}, duration={duration}",
+            );
+        }
+    }
+
+    #[test]
+    fn premature_http_reload_preserves_signed_url_and_local_retry_policy() {
+        use super::PrematureEndRecovery;
+        use libmpv2::mpv_end_file_reason::{Eof, Error};
+
+        let signed_url = "https://CDN.example:443/a%2fb?token=a%2Fb+z&x=1&x=2&_reload=signed#part";
+        assert_eq!(
+            PrematureEndRecovery::DirectHttp.reload_url(signed_url),
+            signed_url
+        );
+        assert_eq!(PrematureEndRecovery::DirectHttp.retry_limit(), 3);
+        assert_eq!(PrematureEndRecovery::Local.retry_limit(), 1);
+        let local = "http://127.0.0.1:45821/hash/3";
+        assert!(PrematureEndRecovery::Local
+            .reload_url(local)
+            .starts_with(local));
+        assert!(PrematureEndRecovery::Local
+            .reload_url(local)
+            .contains("?_reload="));
+        assert_eq!(
+            super::premature_end_recovery(LoadState::Loaded, Eof, local, 120.0, 7200.0, false),
+            Some(PrematureEndRecovery::Local),
+        );
+        assert_eq!(
+            super::premature_end_recovery(LoadState::Loaded, Error, local, 120.0, 7200.0, true),
+            None,
+        );
+    }
+
+    #[test]
+    fn premature_http_recovery_budget_and_resume_survive_same_url_reload() {
+        use super::{CmdVal, PlayerController, PrematureEndRecovery};
+        use libmpv2::Mpv;
+
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vo", "null")?;
+            init.set_property("ao", "null")?;
+            init.set_property("config", "no")?;
+            Ok(())
+        })
+        .unwrap();
+        let url = "https://cdn.example/video?token=a%2fb+z&x=1&x=2";
+        let mut controller = PlayerController::new(0);
+        let (subtitle_tx, _subtitle_rx) = flume::unbounded();
+        let (rpc_tx, _rpc_rx) = flume::unbounded();
+        controller.subtitle_request_sender = Some(subtitle_tx);
+        controller.set_current_url(url.to_string());
+
+        for attempt in 1..=PrematureEndRecovery::DirectHttp.retry_limit() {
+            let position = 120.0 * f64::from(attempt);
+            assert!(controller.recover_premature_end(
+                &mpv,
+                PrematureEndRecovery::DirectHttp,
+                url,
+                position,
+            ));
+            assert_eq!(controller.premature_eof_reloads, attempt);
+            let command: CmdVal = controller.pending_media_command.take().unwrap();
+            controller.pending_subtitle_ack = None;
+            assert_eq!(super::loadfile_url(&command), Some(url));
+            controller.capture_loadfile_url(&command);
+            controller.on_end_file();
+            controller.on_start_file(0);
+            assert!(controller.on_file_loaded(&mpv, &rpc_tx));
+            assert_eq!(controller.premature_eof_reloads, attempt);
+            assert_eq!(controller.pending_reload_seek, Some(position));
+            assert_eq!(
+                controller.take_pending_reload_seek_for("https://old.example/video"),
+                None
+            );
+            assert_eq!(controller.take_pending_reload_seek_for(url), Some(position));
+            assert_eq!(controller.take_pending_reload_seek_for(url), None);
+        }
+        assert!(!controller.recover_premature_end(
+            &mpv,
+            PrematureEndRecovery::DirectHttp,
+            url,
+            600.0,
+        ));
+        assert!(controller.pending_media_command.is_none());
+        assert!(controller.pending_reload_seek.is_none());
+
+        // A provider-owned _reload parameter does not identify a shell recovery.
+        controller.capture_loadfile_url(&CmdVal::Double(
+            super::MpvCmd::Loadfile,
+            "https://cdn.example/other?_reload=signed&token=a%2Fb".to_string(),
+        ));
+        assert_eq!(controller.premature_eof_reloads, 0);
+    }
+
+    #[test]
+    fn failed_premature_http_recovery_keeps_error_visible() {
+        use super::{PlayerController, PrematureEndRecovery};
+        use libmpv2::{
+            mpv_end_file_reason::{Eof, Error},
+            Mpv,
+        };
+
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vo", "null")?;
+            init.set_property("ao", "null")?;
+            init.set_property("config", "no")?;
+            Ok(())
+        })
+        .unwrap();
+        let mut controller = PlayerController::new(0);
+        let (subtitle_tx, subtitle_rx) = flume::unbounded();
+        drop(subtitle_rx);
+        controller.subtitle_request_sender = Some(subtitle_tx);
+        assert!(!controller.recover_premature_end(
+            &mpv,
+            PrematureEndRecovery::DirectHttp,
+            "https://cdn.example/video",
+            120.0,
+        ));
+        assert_eq!(controller.premature_eof_reloads, 0);
+        assert!(controller.pending_reload_url.is_none());
+        assert!(controller.pending_reload_seek.is_none());
+        assert_eq!(
+            super::unrecovered_end_reason(Eof, Some(PrematureEndRecovery::DirectHttp)),
+            Error
+        );
+        assert_eq!(
+            super::unrecovered_end_reason(Eof, Some(PrematureEndRecovery::Local)),
+            Eof
+        );
+        assert_eq!(super::unrecovered_end_reason(Eof, None), Eof);
+    }
+
+    #[test]
+    fn premature_http_recovery_cannot_reuse_previous_files_seekable_property() {
+        super::cache_property_value("seekable", &json!(true));
+        assert_eq!(super::cached_property_value("seekable"), Some(json!(true)));
+        super::clear_file_scoped_cached_props();
+        assert_eq!(super::cached_property_value("seekable"), None);
+    }
+
+    #[test]
+    fn unavailable_mpv_properties_preserve_premature_end_recovery_state() {
+        *super::CURRENT_TIME.lock().unwrap() = 4.9;
+        *super::TOTAL_DURATION.lock().unwrap() = 40.0;
+        super::cache_property_value("seekable", &json!(true));
+
+        for name in ["time-pos", "duration", "seekable"] {
+            super::update_cached_property(name, &PropertyData::None);
+            assert_eq!(property_data_to_json(name, &PropertyData::None), None);
+        }
+        assert_eq!(*super::CURRENT_TIME.lock().unwrap(), 4.9);
+        assert_eq!(*super::TOTAL_DURATION.lock().unwrap(), 40.0);
+        assert_eq!(super::cached_property_value("seekable"), Some(json!(true)));
+        assert_eq!(
+            super::premature_end_recovery(
+                LoadState::Loaded,
+                libmpv2::mpv_end_file_reason::Eof,
+                "https://cdn.example/video",
+                *super::CURRENT_TIME.lock().unwrap(),
+                *super::TOTAL_DURATION.lock().unwrap(),
+                super::cached_property_value("seekable").and_then(|value| value.as_bool())
+                    == Some(true),
+            ),
+            Some(super::PrematureEndRecovery::DirectHttp),
+        );
+        super::clear_file_scoped_cached_props();
+    }
+
+    #[test]
+    fn raw_event_adapter_preserves_failed_http_end_reason() {
+        use super::{wait_player_event, PlayerMpvEvent};
+        use libmpv2::{mpv_end_file_reason::Error, Mpv};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vo", "null")?;
+            init.set_property("ao", "null")?;
+            init.set_property("config", "no")?;
+            Ok(())
+        })
+        .unwrap();
+        mpv.command("loadfile", &[&format!("http://{address}/video.mp4")])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match wait_player_event(&mpv, 0.01) {
+                Some(Ok(PlayerMpvEvent::EndFile(reason))) => {
+                    assert_eq!(reason, Error);
+                    return;
+                }
+                Some(Err(error)) => panic!("failed HTTP EndFile lost its reason: {}", error),
+                _ => {}
+            }
+        }
+        panic!("failed HTTP load did not emit EndFile");
+    }
+
+    #[test]
+    fn readiness_waits_for_file_load_and_emits_once() {
+        let mut ready = VideoReadyState::default();
+        let id = ready.begin_transition();
+        ready.queue_current_load(1);
+        ready.command_replied(1, Some(101));
+        assert_eq!(ready.playback_restarted(), None);
+        ready.start_file(101);
+        assert_eq!(ready.playback_restarted(), None);
+        ready.file_loaded();
+        assert_eq!(ready.playback_restarted(), Some(id));
+        assert_eq!(ready.playback_restarted(), None);
+        ready.end_file();
+        assert_eq!(ready.playback_restarted(), None);
+    }
+
+    #[test]
+    fn obsolete_playback_and_stop_cannot_report_ready_for_new_media() {
+        let mut ready = VideoReadyState::default();
+        ready.begin_transition();
+        ready.queue_current_load(1);
+        ready.command_replied(1, Some(101));
+        ready.start_file(101);
+        let replacement = ready.begin_transition();
+        ready.file_loaded();
+        assert_eq!(ready.playback_restarted(), None);
+        ready.queue_current_load(2);
+        ready.command_replied(2, Some(102));
+        ready.start_file(102);
+        ready.file_loaded();
+        assert_eq!(ready.playback_restarted(), Some(replacement));
+        ready.begin_transition();
+        assert_eq!(ready.playback_restarted(), None);
+    }
+
+    #[test]
+    fn aborted_unstarted_load_does_not_consume_the_next_files_readiness() {
+        let mut ready = VideoReadyState::default();
+        ready.begin_transition();
+        ready.queue_current_load(1);
+        ready.command_replied(1, None);
+        let replacement = ready.begin_transition();
+        ready.queue_current_load(2);
+        ready.command_replied(2, Some(102));
+        ready.start_file(102);
+        ready.file_loaded();
+        assert_eq!(ready.playback_restarted(), Some(replacement));
+    }
+
+    #[test]
+    fn raw_event_adapter_preserves_owned_scalar_properties() {
+        use super::{wait_player_event, OwnedPropertyData, PlayerMpvEvent};
+        use libmpv2::{Format, Mpv};
+        use std::time::{Duration, Instant};
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vo", "null")?;
+            init.set_property("ao", "null")?;
+            init.set_property("config", "no")?;
+            init.set_property("pause", true)?;
+            init.set_property("title", "adapter-owned-value")?;
+            init.set_property("volume", 37.5)?;
+            Ok(())
+        })
+        .unwrap();
+        for (index, (name, format)) in [
+            ("title", Format::String),
+            ("pause", Format::Flag),
+            ("volume", Format::Double),
+            ("playlist-pos", Format::Int64),
+        ]
+        .iter()
+        .enumerate()
+        {
+            mpv.observe_property(name, *format, index as u64 + 1)
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut values = HashMap::new();
+        while Instant::now() < deadline && values.len() < 4 {
+            if let Some(Ok(PlayerMpvEvent::PropertyChange(name, value))) =
+                wait_player_event(&mpv, 0.01)
+            {
+                values.insert(name, value);
+            }
+        }
+        // Values remain valid after every later MPV wait has recycled its event memory.
+        assert!(
+            matches!(values.get("title"), Some(OwnedPropertyData::Str(value)) if value == "adapter-owned-value")
+        );
+        assert!(matches!(
+            values.get("pause"),
+            Some(OwnedPropertyData::Flag(true))
+        ));
+        assert!(
+            matches!(values.get("volume"), Some(OwnedPropertyData::Double(value)) if *value == 37.5)
+        );
+        assert!(matches!(
+            values.get("playlist-pos"),
+            Some(OwnedPropertyData::Int64(-1))
+        ));
+    }
+
+    #[test]
+    fn queued_old_mpv_events_cannot_report_new_files_readiness() {
+        use super::{
+            run_mpv_command_async, wait_player_event, MpvClientHandle, PlayerController,
+            PlayerMpvEvent,
+        };
+        use libmpv2::{events::Event, Mpv};
+        use std::time::{Duration, Instant};
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vo", "null")?;
+            init.set_property("ao", "null")?;
+            init.set_property("config", "no")?;
+            init.set_property("pause", true)?;
+            Ok(())
+        })
+        .unwrap();
+        // This observer waits for A while the controller's event queue stays unread.
+        let observer = mpv.create_client(None).unwrap();
+        let mut controller = PlayerController::new(0);
+        let (rpc_sender, _) = flume::unbounded();
+        let ready = &mut controller.video_ready;
+        ready.begin_transition();
+        let handle = MpvClientHandle(mpv.ctx.as_ptr());
+        run_mpv_command_async(
+            handle,
+            11,
+            "loadfile",
+            &["av://lavfi:sine=frequency=440:duration=10".to_owned()],
+        )
+        .unwrap();
+        ready.queue_current_load(11);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut loaded = false;
+        while Instant::now() < deadline {
+            if matches!(observer.wait_event(0.01), Some(Ok(Event::FileLoaded))) {
+                loaded = true;
+                break;
+            }
+        }
+        assert!(loaded, "old file did not load");
+        let replacement = ready.begin_transition();
+        unsafe {
+            libmpv2_sys::mpv_abort_async_command(mpv.ctx.as_ptr(), 11);
+        }
+        run_mpv_command_async(
+            handle,
+            12,
+            "loadfile",
+            &["av://lavfi:sine=frequency=550:duration=10".to_owned()],
+        )
+        .unwrap();
+        ready.queue_current_load(12);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut reports = Vec::new();
+        let mut starts = 0;
+        while Instant::now() < deadline {
+            match wait_player_event(&mpv, 0.01) {
+                Some(Ok(PlayerMpvEvent::CommandReply {
+                    request_id,
+                    playlist_entry_id,
+                    ..
+                })) => controller
+                    .video_ready
+                    .command_replied(request_id, playlist_entry_id),
+                Some(Ok(PlayerMpvEvent::StartFile(entry_id))) => {
+                    starts += 1;
+                    controller.on_start_file(entry_id);
+                }
+                Some(Ok(PlayerMpvEvent::FileLoaded)) => {
+                    let current = controller.on_file_loaded(&mpv, &rpc_sender);
+                    assert_eq!(
+                        current,
+                        starts == 2,
+                        "old FileLoaded must not change the current controller state"
+                    );
+                }
+                Some(Ok(PlayerMpvEvent::EndFile(_))) => controller.on_end_file(),
+                Some(Ok(PlayerMpvEvent::PlaybackRestart)) => {
+                    if let Some(id) = controller.video_ready.playback_restarted() {
+                        reports.push(id);
+                    }
+                    if starts == 2 {
+                        break;
+                    }
+                }
+                Some(Err(error)) => panic!("MPV fixture event failed: {}", error),
+                _ => {}
+            }
+        }
+        assert_eq!(starts, 2, "both queued files must have started");
+        assert_eq!(reports, vec![replacement]);
+    }
+
+    #[test]
+    fn subtitle_worker_cancels_stalled_download_before_media_change() {
+        use super::{create_subtitle_thread, SubtitleCommand, SubtitleWorkerRequest};
+        use libmpv2::{events::Event, Mpv};
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (connected_tx, connected_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    connected_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vo", "null")?;
+            init.set_property("ao", "null")?;
+            init.set_property("config", "no")?;
+            init.set_property("pause", true)?;
+            Ok(())
+        })
+        .unwrap();
+        mpv.command("loadfile", &["av://lavfi:sine=frequency=440:duration=10"])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut loaded = false;
+        while Instant::now() < deadline {
+            if matches!(mpv.wait_event(0.01), Some(Ok(Event::FileLoaded))) {
+                loaded = true;
+                break;
+            }
+        }
+        assert!(loaded, "test audio fixture did not load");
+        let (requests_tx, requests_rx) = flume::unbounded();
+        let worker = create_subtitle_thread(mpv.create_client(None).unwrap(), requests_rx);
+        requests_tx
+            .send(SubtitleWorkerRequest::Command(SubtitleCommand {
+                name: "sub-add",
+                args: vec![
+                    "sub-add".to_string(),
+                    format!("http://{address}/stall.ass"),
+                    "auto".to_string(),
+                    "Test".to_string(),
+                    "eng".to_string(),
+                ],
+            }))
+            .unwrap();
+        connected_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("subtitle download did not start");
+        let (ack_tx, ack_rx) = flume::bounded(1);
+        requests_tx
+            .send(SubtitleWorkerRequest::BeginMediaChange(ack_tx))
+            .unwrap();
+        let acknowledgement = ack_rx.recv_timeout(Duration::from_secs(3));
+        let _ = release_tx.send(());
+        drop(requests_tx);
+        server.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            acknowledgement.is_ok(),
+            "stalled subtitle prevented media change"
+        );
+    }
 
     #[test]
     fn cache_buster_adds_query_to_plain_stream_url() {

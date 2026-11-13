@@ -263,6 +263,83 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         .build()
         .unwrap_or_else(|_| Client::new());
 
+    let lookup_config = config.clone();
+    let mut segments_cache = HashMap::new();
+    let mut kitsu_cache = HashMap::new();
+    let lookup = SegmentLookupWorker::spawn(move |video_id| {
+        resolve_media_and_segments(
+            &client,
+            &lookup_config,
+            video_id,
+            &mut kitsu_cache,
+            &mut segments_cache,
+        )
+    });
+    run_intro_skip_loop_with_lookup(config, lookup, || true);
+}
+
+type SegmentResolution = anyhow::Result<(Option<MediaKey>, Option<Vec<SkipSegment>>)>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentLookupRequest {
+    id: u64,
+    route: String,
+    file_epoch: u64,
+    video_id: String,
+}
+
+impl SegmentLookupRequest {
+    fn matches_playback(&self, route: &str, file_epoch: u64) -> bool {
+        self.route == route && self.file_epoch == file_epoch
+    }
+}
+
+struct SegmentLookupReply {
+    request: SegmentLookupRequest,
+    result: SegmentResolution,
+}
+
+struct SegmentLookupWorker {
+    requests: flume::Sender<SegmentLookupRequest>,
+    queued_requests: flume::Receiver<SegmentLookupRequest>,
+    replies: flume::Receiver<SegmentLookupReply>,
+}
+
+impl SegmentLookupWorker {
+    fn spawn(mut resolve: impl FnMut(&str) -> SegmentResolution + Send + 'static) -> Self {
+        // One active HTTP lookup and one queued request. New media replaces queued stale work.
+        let (requests, queued_requests) = flume::bounded::<SegmentLookupRequest>(1);
+        let request_receiver = queued_requests.clone();
+        let (reply_sender, replies) = flume::unbounded();
+        std::thread::spawn(move || {
+            while let Ok(request) = request_receiver.recv() {
+                let result = resolve(&request.video_id);
+                if reply_sender
+                    .send(SegmentLookupReply { request, result })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests,
+            queued_requests,
+            replies,
+        }
+    }
+
+    fn request(&self, request: SegmentLookupRequest) -> bool {
+        self.queued_requests.try_recv().ok();
+        self.requests.try_send(request).is_ok()
+    }
+}
+
+fn run_intro_skip_loop_with_lookup(
+    config: IntroSkipConfig,
+    lookup: SegmentLookupWorker,
+    mut keep_running: impl FnMut() -> bool,
+) {
     let mut last_player_route: Option<String> = None;
     let mut bound_file_epoch: Option<u64> = None;
     let mut required_file_epoch: Option<u64> = None;
@@ -271,12 +348,10 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
     let mut skip_history = SkipHistory::default();
 
     let mut next_resolve_at = Instant::now();
+    let mut next_lookup_id = 0_u64;
+    let mut pending_lookup: Option<SegmentLookupRequest> = None;
 
-    // Session caches
-    let mut segments_cache: HashMap<MediaKey, Option<Vec<SkipSegment>>> = HashMap::new();
-    let mut kitsu_cache: HashMap<String, Option<MediaKey>> = HashMap::new();
-
-    loop {
+    while keep_running() {
         std::thread::sleep(Duration::from_millis(250));
 
         if let Ok(mut state) = MANUAL_SKIP_OFFER.lock() {
@@ -301,6 +376,7 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
         }
 
         let cur_url = CURRENT_URL.lock().map(|s| s.clone()).unwrap_or_default();
+        let file_epoch = FILE_LOAD_EPOCH.load(AtomicOrdering::Acquire);
         let maybe_video_id = extract_video_id_from_url(&cur_url);
         let maybe_player_route = maybe_video_id.as_ref().map(|_| cur_url.clone());
 
@@ -309,6 +385,8 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
             last_player_route = maybe_player_route;
             current_media = None;
             current_segments = None;
+            pending_lookup = None;
+            lookup.queued_requests.try_recv().ok();
             next_resolve_at = Instant::now();
 
             required_file_epoch = maybe_video_id.as_ref().map(|_| {
@@ -325,6 +403,40 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
                     }
                 }
             });
+        }
+
+        if bound_file_epoch.is_some_and(|previous| previous != file_epoch)
+            || pending_lookup
+                .as_ref()
+                .is_some_and(|request| !request.matches_playback(&cur_url, file_epoch))
+        {
+            pending_lookup = None;
+            lookup.queued_requests.try_recv().ok();
+            current_media = None;
+            current_segments = None;
+            next_resolve_at = Instant::now();
+        }
+
+        for reply in lookup.replies.try_iter() {
+            if pending_lookup.as_ref() != Some(&reply.request) {
+                continue;
+            }
+            pending_lookup = None;
+            if !playback_is_current(&reply.request.route, reply.request.file_epoch) {
+                next_resolve_at = Instant::now();
+                continue;
+            }
+            match reply.result {
+                Ok((media, segments)) => {
+                    current_media = media;
+                    current_segments = segments;
+                    next_resolve_at = Instant::now() + Duration::from_secs(60 * 60);
+                }
+                Err(error) => {
+                    eprintln!("Intro skip: resolve failed: {}", format_error_chain(&error));
+                    next_resolve_at = Instant::now() + Duration::from_secs(15);
+                }
+            }
         }
 
         // Not in player -> nothing to do.
@@ -352,7 +464,6 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
             continue;
         }
 
-        let file_epoch = FILE_LOAD_EPOCH.load(AtomicOrdering::Acquire);
         if required_file_epoch.is_some_and(|required| file_epoch < required) {
             continue;
         }
@@ -387,6 +498,9 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
                     continue;
                 }
 
+                if !playback_is_current(&cur_url, file_epoch) {
+                    continue;
+                }
                 let skip_sent = if is_final_outro {
                     send_next_track()
                 } else {
@@ -419,30 +533,23 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
             }
         }
 
-        // Remote segment databases are a fallback for files without useful chapters. Keep this
-        // blocking lookup after chapter handling so a slow or empty response cannot suppress
-        // mpv's local chapter metadata.
+        // Never wait for remote databases here: chapters can begin while HTTP is still pending.
         if (current_media.is_none() || current_segments.is_none())
+            && pending_lookup.is_none()
             && Instant::now() >= next_resolve_at
         {
-            match resolve_media_and_segments(
-                &client,
-                &config,
-                video_id,
-                &mut kitsu_cache,
-                &mut segments_cache,
-            ) {
-                Ok((media, segments)) => {
-                    current_media = media;
-                    current_segments = segments;
-                    // No more retries needed unless we change media.
-                    next_resolve_at = Instant::now() + Duration::from_secs(60 * 60);
-                }
-                Err(e) => {
-                    eprintln!("Intro skip: resolve failed: {}", format_error_chain(&e));
-                    // Back off a bit before retrying.
-                    next_resolve_at = Instant::now() + Duration::from_secs(15);
-                }
+            next_lookup_id = next_lookup_id.wrapping_add(1);
+            let request = SegmentLookupRequest {
+                id: next_lookup_id,
+                route: cur_url.clone(),
+                file_epoch,
+                video_id: video_id.clone(),
+            };
+            if lookup.request(request.clone()) {
+                pending_lookup = Some(request);
+            } else {
+                eprintln!("Intro skip: lookup worker is unavailable");
+                next_resolve_at = Instant::now() + Duration::from_secs(15);
             }
         }
 
@@ -500,6 +607,9 @@ fn run_intro_skip_loop(config: IntroSkipConfig) {
                     continue;
                 }
 
+                if !playback_is_current(&cur_url, file_epoch) {
+                    continue;
+                }
                 let action_sent = match action {
                     SkipAction::Seek(target_sec) if target_sec <= time_pos + 0.05 => {
                         skip_history.remember_segment(video_id, seg.key());
@@ -1263,6 +1373,12 @@ fn send_manual_skip_state(visible: bool, kind: Option<SegmentKind>, offer_id: Op
     }
 }
 
+fn playback_is_current(route: &str, file_epoch: u64) -> bool {
+    IS_FILE_LOADED.lock().is_ok_and(|loaded| *loaded)
+        && CURRENT_URL.lock().is_ok_and(|current| *current == route)
+        && FILE_LOAD_EPOCH.load(AtomicOrdering::Acquire) == file_epoch
+}
+
 pub fn manual_intro_outro_enabled() -> bool {
     MANUAL_INTRO_OUTRO_ENABLED.load(AtomicOrdering::Acquire)
 }
@@ -1483,6 +1599,257 @@ mod tests {
     };
 
     static GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SavedPlaybackState {
+        route: String,
+        loaded: bool,
+        paused: bool,
+        time: f64,
+        chapter: i64,
+        chapters: i64,
+        title: String,
+        epoch: u64,
+        role: crate::stremio_app::app::LobbyRole,
+        manual: bool,
+        web_sender: Option<flume::Sender<String>>,
+        offer: Option<super::ManualSkipState>,
+    }
+
+    impl SavedPlaybackState {
+        fn take() -> Self {
+            use super::*;
+            Self {
+                route: CURRENT_URL.lock().unwrap().clone(),
+                loaded: *IS_FILE_LOADED.lock().unwrap(),
+                paused: *IS_PAUSED.lock().unwrap(),
+                time: *CURRENT_TIME.lock().unwrap(),
+                chapter: *CURRENT_CHAPTER.lock().unwrap(),
+                chapters: *CURRENT_CHAPTER_COUNT.lock().unwrap(),
+                title: CURRENT_CHAPTER_TITLE.lock().unwrap().clone(),
+                epoch: FILE_LOAD_EPOCH.load(AtomicOrdering::Acquire),
+                role: *LOBBY_ROLE.lock().unwrap(),
+                manual: manual_intro_outro_enabled(),
+                web_sender: WEB_CMD_TX.lock().unwrap().take(),
+                offer: MANUAL_SKIP_OFFER.lock().unwrap().take(),
+            }
+        }
+    }
+
+    impl Drop for SavedPlaybackState {
+        fn drop(&mut self) {
+            use super::*;
+            *CURRENT_URL.lock().unwrap() = self.route.clone();
+            *IS_FILE_LOADED.lock().unwrap() = self.loaded;
+            *IS_PAUSED.lock().unwrap() = self.paused;
+            *CURRENT_TIME.lock().unwrap() = self.time;
+            *CURRENT_CHAPTER.lock().unwrap() = self.chapter;
+            *CURRENT_CHAPTER_COUNT.lock().unwrap() = self.chapters;
+            *CURRENT_CHAPTER_TITLE.lock().unwrap() = self.title.clone();
+            FILE_LOAD_EPOCH.store(self.epoch, AtomicOrdering::Release);
+            *LOBBY_ROLE.lock().unwrap() = self.role;
+            MANUAL_INTRO_OUTRO_ENABLED.store(self.manual, AtomicOrdering::Release);
+            *WEB_CMD_TX.lock().unwrap() = self.web_sender.take();
+            *MANUAL_SKIP_OFFER.lock().unwrap() = self.offer.take();
+        }
+    }
+
+    #[test]
+    fn chapter_offer_is_published_while_segment_provider_is_blocked() {
+        use super::*;
+        use std::sync::Arc;
+
+        let _test_guard = GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let _saved_playback = SavedPlaybackState::take();
+        let (started_tx, started_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let lookup = SegmentLookupWorker::spawn(move |_| {
+            started_tx.send(()).unwrap();
+            // A bounded wait also lets cleanup finish if the regression returns.
+            release_rx.recv_timeout(Duration::from_secs(3)).ok();
+            Ok((None, None))
+        });
+        let (web_tx, web_rx) = flume::unbounded();
+        *WEB_CMD_TX.lock().unwrap() = Some(web_tx);
+        *CURRENT_URL.lock().unwrap() =
+            "https://web.stremio.com/#/player/stream/tt1234567:1:1".into();
+        *IS_FILE_LOADED.lock().unwrap() = true;
+        *IS_PAUSED.lock().unwrap() = false;
+        *CURRENT_TIME.lock().unwrap() = 0.0;
+        *CURRENT_CHAPTER.lock().unwrap() = -1;
+        *CURRENT_CHAPTER_COUNT.lock().unwrap() = 3;
+        *CURRENT_CHAPTER_TITLE.lock().unwrap() = String::new();
+        *LOBBY_ROLE.lock().unwrap() = LobbyRole::None;
+        MANUAL_INTRO_OUTRO_ENABLED.store(true, AtomicOrdering::Release);
+
+        let running = Arc::new(AtomicBool::new(true));
+        let loop_running = running.clone();
+        let detector = std::thread::spawn(move || {
+            run_intro_skip_loop_with_lookup(
+                IntroSkipConfig {
+                    enabled: true,
+                    skip_intro: true,
+                    manual_intro_outro: true,
+                    chapter_intro_words: vec!["opening".into()],
+                    ..Default::default()
+                },
+                lookup,
+                || loop_running.load(AtomicOrdering::Acquire),
+            );
+        });
+        let provider_started = started_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        *CURRENT_CHAPTER.lock().unwrap() = 1;
+        *CURRENT_CHAPTER_TITLE.lock().unwrap() = "Opening".into();
+        *CURRENT_TIME.lock().unwrap() = 15.0;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut offer = None;
+        while let Ok(message) = web_rx.recv_deadline(deadline) {
+            let message: serde_json::Value = serde_json::from_str(&message).unwrap();
+            if message["args"][0] == "shell-manual-skip-state"
+                && message["args"][1]["visible"] == true
+            {
+                offer = Some(message);
+                break;
+            }
+        }
+        // Release only after observing the offer, so a synchronous lookup fails this test.
+        running.store(false, AtomicOrdering::Release);
+        release_tx.send(()).ok();
+        let detector_stopped = detector.join().is_ok();
+
+        assert!(
+            provider_started,
+            "provider must be blocked before the chapter begins"
+        );
+        assert!(detector_stopped);
+        let offer = offer.expect("chapter offer must arrive before the provider is released");
+        assert_eq!(offer["args"][1]["kind"], "intro");
+        assert!(offer["args"][1]["offer_id"].as_str().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn segment_lookup_keeps_only_latest_queued_media_and_keys_replies() {
+        use super::*;
+        let (started_tx, started_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::bounded(1);
+        let lookup = SegmentLookupWorker::spawn(move |video_id| {
+            started_tx.send(video_id.to_owned()).unwrap();
+            if video_id == "episode-a" {
+                release_rx.recv_timeout(Duration::from_secs(3)).ok();
+            }
+            Ok((None, None))
+        });
+        let request = |id, video_id: &str, file_epoch| SegmentLookupRequest {
+            id,
+            route: format!("/player/{video_id}"),
+            file_epoch,
+            video_id: video_id.to_owned(),
+        };
+        let first = request(1, "episode-a", 4);
+        let replaced = request(2, "episode-b", 5);
+        let latest = request(3, "episode-c", 6);
+        assert!(lookup.request(first.clone()));
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "episode-a"
+        );
+        assert!(lookup.request(replaced));
+        assert!(lookup.request(latest.clone()));
+        assert_eq!(lookup.queued_requests.len(), 1);
+        release_tx.send(()).unwrap();
+        let stale = lookup.replies.recv_timeout(Duration::from_secs(1)).unwrap();
+        let current = lookup.replies.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(stale.request, first);
+        assert_eq!(current.request, latest);
+        assert_eq!(started_rx.try_iter().collect::<Vec<_>>(), ["episode-c"]);
+        assert!(!stale
+            .request
+            .matches_playback(&latest.route, latest.file_epoch));
+        assert!(!current
+            .request
+            .matches_playback(&latest.route, latest.file_epoch + 1));
+        assert!(current
+            .request
+            .matches_playback(&latest.route, latest.file_epoch));
+        let retry = SegmentLookupRequest {
+            id: 4,
+            ..latest.clone()
+        };
+        assert_ne!(
+            current.request, retry,
+            "late retry replies must not match the pending request"
+        );
+    }
+
+    #[test]
+    fn completed_lookup_for_previous_file_does_not_offer_a_segment() {
+        use super::*;
+        use std::sync::Arc;
+        let _test_guard = GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let _saved_playback = SavedPlaybackState::take();
+        let (started_tx, started_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded();
+        let lookup = SegmentLookupWorker::spawn(move |_| {
+            started_tx.send(()).ok();
+            release_rx.recv_timeout(Duration::from_secs(3)).ok();
+            Ok((
+                Some(MediaKey {
+                    imdb_id: "tt1234567".into(),
+                    season: Some(1),
+                    episode: Some(1),
+                }),
+                Some(vec![SkipSegment {
+                    api: IntroApi::IntroDbApp,
+                    kind: SegmentKind::Intro,
+                    segment: IntroSegment {
+                        start_sec: 0.0,
+                        end_sec: Some(90.0),
+                    },
+                }]),
+            ))
+        });
+        let (web_tx, web_rx) = flume::unbounded();
+        *WEB_CMD_TX.lock().unwrap() = Some(web_tx);
+        *CURRENT_URL.lock().unwrap() =
+            "https://web.stremio.com/#/player/stream/tt1234567:1:1".into();
+        *IS_FILE_LOADED.lock().unwrap() = true;
+        *IS_PAUSED.lock().unwrap() = false;
+        *CURRENT_TIME.lock().unwrap() = 15.0;
+        *CURRENT_CHAPTER.lock().unwrap() = -1;
+        *CURRENT_CHAPTER_COUNT.lock().unwrap() = 0;
+        *CURRENT_CHAPTER_TITLE.lock().unwrap() = String::new();
+        *LOBBY_ROLE.lock().unwrap() = LobbyRole::None;
+        MANUAL_INTRO_OUTRO_ENABLED.store(true, AtomicOrdering::Release);
+        let running = Arc::new(AtomicBool::new(true));
+        let loop_running = running.clone();
+        let detector = std::thread::spawn(move || {
+            run_intro_skip_loop_with_lookup(
+                IntroSkipConfig {
+                    enabled: true,
+                    skip_intro: true,
+                    manual_intro_outro: true,
+                    ..Default::default()
+                },
+                lookup,
+                || loop_running.load(AtomicOrdering::Acquire),
+            )
+        });
+        let provider_started = started_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        // MPV reloads the same player route. Hold its fresh lookup after releasing the old one.
+        FILE_LOAD_EPOCH.fetch_add(1, AtomicOrdering::Release);
+        release_tx.send(()).ok();
+        let current_provider_started = started_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let stale_offer = web_rx.recv_timeout(Duration::from_millis(700)).ok();
+        running.store(false, AtomicOrdering::Release);
+        release_tx.send(()).ok();
+        let detector_stopped = detector.join().is_ok();
+        assert!(provider_started);
+        assert!(current_provider_started, "new file must get its own lookup");
+        assert!(detector_stopped);
+        assert!(
+            stale_offer.is_none(),
+            "old-file database results must not publish a skip"
+        );
+    }
 
     #[test]
     fn auto_skip_notifications_only_include_openings_and_endings() {

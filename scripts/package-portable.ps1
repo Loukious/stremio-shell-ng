@@ -10,6 +10,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$runtimeDir = switch ($Target) {
+    "x86_64-pc-windows-msvc" { "bin" }
+    "aarch64-pc-windows-msvc" { "bin-arm64" }
+    default { throw "Unsupported portable target: $Target" }
+}
+
 $releaseDir = Join-Path -Path "target" -ChildPath "$Target\release"
 $stageDir = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "stremio-portable-$([System.Guid]::NewGuid())"
 
@@ -39,12 +45,16 @@ try {
 
     Add-PortableFile -Path (Join-Path -Path $releaseDir -ChildPath "stremio-shell-ng.exe") -Name "stremio-shell-ng.exe"
     Add-PortableFile -Path (Join-Path -Path $releaseDir -ChildPath "libmpv-2.dll") -Name "libmpv-2.dll"
+    Add-PortableFile -Path (Join-Path -Path $runtimeDir -ChildPath "stremio-runtime.exe") -Name "stremio-runtime.exe"
     Add-PortableFile -Path "RPCconfig.ini" -Name "RPCconfig.ini"
     Add-PortableFile -Path "mpv.conf" -Name "mpv.conf" -Optional
 
     if ($IncludeSteam) {
         Add-PortableFile -Path (Join-Path -Path $releaseDir -ChildPath "steam_api64.dll") -Name "steam_api64.dll"
     }
+
+    # Copy only the native desktop payload, then verify its architecture and CRT dependencies.
+    & (Join-Path $PSScriptRoot "verify-native-payload.ps1") -Target $Target -PayloadDirectory $stageDir -IncludeSteam:$IncludeSteam
 
     $outputDir = Split-Path -Parent $OutputPath
     if ($outputDir) {
@@ -59,6 +69,10 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $stageDir) {
-        Remove-Item -LiteralPath $stageDir -Recurse -Force
+        $resolvedStageDir = (Resolve-Path -LiteralPath $stageDir).Path
+        if ($resolvedStageDir -ne [IO.Path]::GetFullPath($stageDir)) {
+            throw "Unexpected portable staging path; leaving it untouched: $resolvedStageDir"
+        }
+        Remove-Item -LiteralPath $resolvedStageDir -Recurse -Force
     }
 }
