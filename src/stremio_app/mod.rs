@@ -26,3 +26,5 @@ pub mod steam_sync;
 #[path = "steam_sync_unavailable.rs"]
 pub mod steam_sync;
 pub mod sync_protocol;
+pub mod watch_party_local;
+pub mod watch_party_readiness;

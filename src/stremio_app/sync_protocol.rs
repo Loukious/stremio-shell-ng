@@ -3,9 +3,149 @@
 use serde::{Deserialize, Serialize};
 
 pub const STEAM_SYNC_APP_ID: u32 = 480;
-pub const STEAM_SYNC_PROTOCOL_VERSION: u16 = 1;
+pub const STEAM_SYNC_PROTOCOL_VERSION: u16 = 2;
 pub const STEAM_SYNC_CHANNEL: u32 = 4800;
-pub const STEAM_JOIN_PREFIX: &str = "stremio://sync/steam/v1/";
+pub const STEAM_JOIN_PREFIX: &str = "stremio://sync/steam/v2/";
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceMode {
+    #[default]
+    Shared,
+    Local,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MediaIdentity {
+    pub content_type: String,
+    pub metadata_id: String,
+    pub video_id: String,
+}
+
+impl MediaIdentity {
+    pub fn validate(&self) -> Result<(), String> {
+        let valid_type = !self.content_type.is_empty()
+            && self.content_type.len() <= 64
+            && self
+                .content_type
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+        if !valid_type {
+            return Err("Watch-party content type is invalid.".to_string());
+        }
+        for (name, id) in [("metadata", &self.metadata_id), ("video", &self.video_id)] {
+            let valid = !id.is_empty()
+                && id.len() <= 256
+                && id.bytes().any(|byte| byte.is_ascii_alphanumeric())
+                && id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-' | b'.')
+                });
+            let lower = id.to_ascii_lowercase();
+            let is_url = ["http:", "https:", "file:", "stremio:", "magnet:", "data:"]
+                .iter()
+                .any(|scheme| lower.starts_with(scheme));
+            if !valid || is_url {
+                return Err(format!("Watch-party {name} ID is invalid."));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalPlaybackState {
+    pub media: MediaIdentity,
+    pub generation: u64,
+    pub sequence: u64,
+    pub time_pos: f64,
+    pub duration: f64,
+    pub paused: bool,
+}
+
+impl LocalPlaybackState {
+    pub fn validate(&self) -> Result<(), String> {
+        self.media.validate()?;
+        if self.generation == 0 || self.sequence == 0 {
+            return Err("Watch-party media generation or sequence is invalid.".to_string());
+        }
+        // This mode is for movies and episodes, not unbounded live timelines.
+        const MAX_MEDIA_SECONDS: f64 = 31.0 * 24.0 * 60.0 * 60.0;
+        if [self.time_pos, self.duration]
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0 || *value > MAX_MEDIA_SECONDS)
+        {
+            return Err("Watch-party playback position or duration is invalid.".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessStatus {
+    Selecting,
+    Loading,
+    Ready,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GuestReadiness {
+    pub media: MediaIdentity,
+    pub generation: u64,
+    pub sequence: u64,
+    pub status: ReadinessStatus,
+}
+
+impl GuestReadiness {
+    pub fn validate(&self) -> Result<(), String> {
+        self.media.validate()?;
+        if self.generation == 0 || self.sequence == 0 {
+            return Err("Watch-party readiness generation or sequence is invalid.".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemberReadiness {
+    pub steam_id: u64,
+    // Older protocol-2 clients do not advertise readiness support.
+    pub status: Option<ReadinessStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PartyReadiness {
+    pub media: MediaIdentity,
+    pub generation: u64,
+    pub sequence: u64,
+    pub members: Vec<MemberReadiness>,
+}
+
+impl PartyReadiness {
+    pub fn validate(&self) -> Result<(), String> {
+        self.media.validate()?;
+        if self.generation == 0 || self.sequence == 0 {
+            return Err("Watch-party readiness generation or sequence is invalid.".to_string());
+        }
+        if self.members.is_empty() || self.members.len() > 16 {
+            return Err("Watch-party readiness member count is invalid.".to_string());
+        }
+        let mut seen = std::collections::HashSet::new();
+        if self
+            .members
+            .iter()
+            .any(|member| member.steam_id == 0 || !seen.insert(member.steam_id))
+        {
+            return Err("Watch-party readiness members are invalid.".to_string());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct LobbyMember {
@@ -17,6 +157,12 @@ pub struct LobbyMember {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
 pub enum HostMsg {
+    #[serde(rename = "readiness")]
+    Readiness { state: PartyReadiness },
+    #[serde(rename = "local_state")]
+    LocalState { state: LocalPlaybackState },
+    #[serde(rename = "local_waiting")]
+    LocalWaiting { generation: u64, sequence: u64 },
     #[serde(rename = "state")]
     State {
         stream_url: String,
@@ -52,7 +198,13 @@ pub enum GuestMsg {
         protocol_version: u16,
         token: String,
         name: String,
+        #[serde(default)]
+        local_sources: bool,
+        #[serde(default)]
+        readiness: bool,
     },
+    #[serde(rename = "readiness")]
+    Readiness { state: GuestReadiness },
     #[serde(rename = "request_state")]
     RequestState,
     #[serde(rename = "leave")]
@@ -69,11 +221,19 @@ pub enum SteamSyncWireMsg {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SteamJoinSecret {
+    #[serde(default = "legacy_protocol_version")]
+    pub protocol_version: u16,
+    #[serde(default)]
+    pub source_mode: SourceMode,
     pub app_id: u32,
     pub lobby_id: u64,
     pub host_steam_id: u64,
     pub party_id: String,
     pub token: String,
+}
+
+fn legacy_protocol_version() -> u16 {
+    1
 }
 
 pub fn encode_steam_join_secret(secret: &SteamJoinSecret) -> Result<String, String> {
@@ -90,6 +250,9 @@ pub fn encode_steam_join_secret(secret: &SteamJoinSecret) -> Result<String, Stri
 pub fn decode_steam_join_secret(join_url: &str) -> Result<SteamJoinSecret, String> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
+    if join_url.starts_with("stremio://sync/steam/") && !join_url.starts_with(STEAM_JOIN_PREFIX) {
+        return Err("This watch-party link uses an incompatible protocol. Update both clients and create a new invitation.".to_string());
+    }
     let payload = join_url
         .strip_prefix(STEAM_JOIN_PREFIX)
         .ok_or_else(|| "not a Steam sync join URL".to_string())?;
@@ -104,6 +267,9 @@ pub fn decode_steam_join_secret(join_url: &str) -> Result<SteamJoinSecret, Strin
 }
 
 pub fn validate_steam_join_secret(secret: &SteamJoinSecret) -> Result<(), String> {
+    if secret.protocol_version != STEAM_SYNC_PROTOCOL_VERSION {
+        return Err("This watch-party link uses an incompatible protocol. Update both clients and create a new invitation.".to_string());
+    }
     if secret.app_id != STEAM_SYNC_APP_ID {
         return Err(format!(
             "unsupported Steam app id {}; expected {STEAM_SYNC_APP_ID}",
@@ -132,6 +298,8 @@ mod tests {
 
     fn sample_secret() -> SteamJoinSecret {
         SteamJoinSecret {
+            protocol_version: STEAM_SYNC_PROTOCOL_VERSION,
+            source_mode: SourceMode::Local,
             app_id: STEAM_SYNC_APP_ID,
             lobby_id: 12,
             host_steam_id: 34,
@@ -162,6 +330,244 @@ mod tests {
         missing_token.token.clear();
         let encoded = encode_steam_join_secret(&missing_token).unwrap();
         assert!(decode_steam_join_secret(&encoded).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_links_and_missing_or_wrong_protocol_versions() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        assert!(decode_steam_join_secret("stremio://sync/steam/v1/anything")
+            .unwrap_err()
+            .contains("Update both clients"));
+        let mut incompatible = sample_secret();
+        incompatible.protocol_version = 1;
+        let encoded = encode_steam_join_secret(&incompatible).unwrap();
+        assert!(decode_steam_join_secret(&encoded)
+            .unwrap_err()
+            .contains("incompatible protocol"));
+        let mut missing_version = serde_json::to_value(sample_secret()).unwrap();
+        missing_version
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_version");
+        let encoded = format!(
+            "{STEAM_JOIN_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&missing_version).unwrap())
+        );
+        assert!(decode_steam_join_secret(&encoded)
+            .unwrap_err()
+            .contains("incompatible protocol"));
+    }
+
+    fn local_state() -> LocalPlaybackState {
+        LocalPlaybackState {
+            media: MediaIdentity {
+                content_type: "series".to_string(),
+                metadata_id: "tt1234567".to_string(),
+                video_id: "tt1234567:1:2".to_string(),
+            },
+            generation: 3,
+            sequence: 14,
+            time_pos: 240.0,
+            duration: 3200.0,
+            paused: true,
+        }
+    }
+
+    #[test]
+    fn local_wire_state_has_only_identity_and_playback_fields() {
+        let message = SteamSyncWireMsg::Host(HostMsg::LocalState {
+            state: local_state(),
+        });
+        let json = serde_json::to_value(&message).unwrap();
+        let state = json["payload"]["state"].as_object().unwrap();
+        assert_eq!(state.len(), 6);
+        assert_eq!(state["media"]["video_id"], "tt1234567:1:2");
+        assert_eq!(state["media"].as_object().unwrap().len(), 3);
+        let encoded = serde_json::to_string(&message).unwrap();
+        for excluded in [
+            "stream_url",
+            "web_url",
+            "addon",
+            "headers",
+            "deepLinks",
+            "http",
+        ] {
+            assert!(
+                !encoded.contains(excluded),
+                "unexpected local field: {}",
+                excluded
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<SteamSyncWireMsg>(&encoded).unwrap(),
+            message
+        );
+
+        let mut extra = serde_json::to_value(local_state()).unwrap();
+        extra["stream_url"] = serde_json::json!("https://private.example/video");
+        assert!(serde_json::from_value::<LocalPlaybackState>(extra).is_err());
+    }
+
+    #[test]
+    fn rejects_urls_malformed_identifiers_and_invalid_playback_values() {
+        for id in [
+            "https://private.example/video?token=secret",
+            "https:secret",
+            "tt1234567/1/2",
+            "tt1234567?api_key=secret",
+            "../encoded-player",
+            "..",
+            "::",
+            "",
+        ] {
+            let mut state = local_state();
+            state.media.video_id = id.to_string();
+            assert!(state.validate().is_err(), "accepted {}", id);
+        }
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 1e100] {
+            let mut state = local_state();
+            state.time_pos = invalid;
+            assert!(state.validate().is_err());
+            state.time_pos = 0.0;
+            state.duration = invalid;
+            assert!(state.validate().is_err());
+        }
+        let mut missing_generation = local_state();
+        missing_generation.generation = 0;
+        assert!(missing_generation.validate().is_err());
+        let mut missing_sequence = local_state();
+        missing_sequence.sequence = 0;
+        assert!(missing_sequence.validate().is_err());
+        assert!(local_state().validate().is_ok());
+    }
+
+    #[test]
+    fn absent_local_capability_is_false_and_cannot_be_assumed() {
+        let json = r#"{"type":"hello","protocol_version":2,"token":"secret","name":"Guest"}"#;
+        let hello = serde_json::from_str::<GuestMsg>(json).unwrap();
+        assert!(matches!(
+            hello,
+            GuestMsg::Hello {
+                local_sources: false,
+                readiness: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn readiness_wire_payloads_are_semantic_and_reject_extra_source_fields() {
+        let report = GuestReadiness {
+            media: local_state().media,
+            generation: 3,
+            sequence: 2,
+            status: ReadinessStatus::Ready,
+        };
+        let roster = PartyReadiness {
+            media: report.media.clone(),
+            generation: 3,
+            sequence: 8,
+            members: vec![
+                MemberReadiness {
+                    steam_id: 1,
+                    status: Some(ReadinessStatus::Ready),
+                },
+                MemberReadiness {
+                    steam_id: 2,
+                    status: None,
+                },
+            ],
+        };
+        for message in [
+            SteamSyncWireMsg::Guest(GuestMsg::Readiness {
+                state: report.clone(),
+            }),
+            SteamSyncWireMsg::Host(HostMsg::Readiness {
+                state: roster.clone(),
+            }),
+        ] {
+            let wire = serde_json::to_value(&message).unwrap();
+            assert_eq!(wire["payload"]["type"], "readiness");
+            assert_eq!(
+                wire["payload"]["state"]["media"].as_object().unwrap().len(),
+                3
+            );
+            let encoded = serde_json::to_string(&message).unwrap();
+            for excluded in [
+                "stream_url",
+                "web_url",
+                "addon",
+                "headers",
+                "deepLinks",
+                "http",
+            ] {
+                assert!(
+                    !encoded.contains(excluded),
+                    "unexpected readiness field: {}",
+                    excluded
+                );
+            }
+            assert_eq!(
+                serde_json::from_str::<SteamSyncWireMsg>(&encoded).unwrap(),
+                message
+            );
+        }
+        assert!(report.validate().is_ok());
+        assert!(roster.validate().is_ok());
+        let mut report_extra = serde_json::to_value(report).unwrap();
+        report_extra["stream_url"] = serde_json::json!("https://private.invalid/source");
+        assert!(serde_json::from_value::<GuestReadiness>(report_extra).is_err());
+        let mut roster_extra = serde_json::to_value(roster).unwrap();
+        roster_extra["members"][0]["addon"] = serde_json::json!("private-addon-secret");
+        assert!(serde_json::from_value::<PartyReadiness>(roster_extra).is_err());
+    }
+
+    #[test]
+    fn readiness_validation_rejects_invalid_identity_order_and_membership() {
+        let mut report = GuestReadiness {
+            media: local_state().media,
+            generation: 1,
+            sequence: 1,
+            status: ReadinessStatus::Loading,
+        };
+        report.sequence = 0;
+        assert!(report.validate().is_err());
+        report.sequence = 1;
+        report.generation = 0;
+        assert!(report.validate().is_err());
+        report.generation = 1;
+        report.media.video_id = "https:private-source".to_string();
+        assert!(report.validate().is_err());
+        let mut roster = PartyReadiness {
+            media: local_state().media,
+            generation: 1,
+            sequence: 1,
+            members: Vec::new(),
+        };
+        assert!(roster.validate().is_err());
+        roster.members = vec![MemberReadiness {
+            steam_id: 0,
+            status: None,
+        }];
+        assert!(roster.validate().is_err());
+        roster.members = vec![
+            MemberReadiness {
+                steam_id: 1,
+                status: None
+            };
+            2
+        ];
+        assert!(roster.validate().is_err());
+        roster.members = (1..=17)
+            .map(|steam_id| MemberReadiness {
+                steam_id,
+                status: None,
+            })
+            .collect();
+        assert!(roster.validate().is_err());
+        roster.members.truncate(16);
+        assert!(roster.validate().is_ok());
     }
 
     #[test]
@@ -201,6 +607,8 @@ mod tests {
             protocol_version: STEAM_SYNC_PROTOCOL_VERSION,
             token: "abc".to_string(),
             name: "viewer".to_string(),
+            local_sources: true,
+            readiness: true,
         });
         let json = serde_json::to_string(&guest).unwrap();
         assert_eq!(

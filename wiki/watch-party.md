@@ -4,7 +4,7 @@ Watch Party lets one person host playback and share a Discord Rich Presence join
 
 ## Requirements
 
-- Stremio Shell NG from this fork
+- An updated Windows x64 Steam-enabled Stremio Shell NG from this fork on every participant's computer (watch-party protocol 2). The ARM64 desktop build currently omits Steam networking.
 - Steam installed, running, and signed in before starting or joining a watch party
 - Discord running if you want friends to join from your Rich Presence button
 
@@ -22,6 +22,36 @@ Watch Party lets one person host playback and share a Discord Rich Presence join
 
 ![Watch Party Notification](https://i.imgur.com/U6vMdFi.png)
 
+## Let Each Viewer Choose Their Own Stream
+
+Before starting the party, select **Use each viewer's own stream** in the tray menu. This choice is saved beside the executable in `RPCconfig.ini`:
+
+```ini
+[WatchParty]
+source_mode = local
+```
+
+The host shares the movie/episode identity and playback state. Guests open that episode's normal stream selector and choose a source through their own installed addons and account. Their selected URLs stay local. Once their video has loaded, playback joins the host's current position and follows play, pause and seek changes. When the host changes episodes, guests select a source for the new episode again.
+
+If the host reloads or changes source for the same episode, guests pause while it loads, keep their chosen source, and catch up when it is ready. Delayed updates for an earlier episode cannot seek the current video.
+
+Choose the same release or edition as the host whenever possible. Different cuts can have different timings even when the episode ID matches. Each guest needs their own usable source; this mode cannot resolve an arbitrary host HTTP URL into an episode. Start the host's movie or episode through its Stremio details page so metadata is available.
+
+The choice can be changed when the party has ended. With the option unchecked (`source_mode = shared`, the default), guests use the host's shared source. Local mode does not fall back to that URL if selection or loading fails.
+
+Older watch-party clients and protocol-1 invitation links must be updated. They are rejected rather than silently using shared-source playback.
+
+## See Who Is Ready
+
+In local-source parties, move the pointer to the top center of the window to open the watch-party panel. Everyone can see each viewer's current status:
+
+- **Selecting source**: the viewer is choosing a stream for this movie or episode.
+- **Loading video**: their chosen source is opening.
+- **Ready**: their video has loaded and can follow the host.
+- **Unknown**: that viewer's client does not report readiness; update it to this version.
+
+Status changes briefly open the panel with announcements such as “Alice is ready.” The status belongs to the current episode and resets when the episode changes. When the host reloads the same episode, its status changes to **Loading video**, while guests keep the status of their own source. Playback continues to follow the host; these announcements do not add a wait-for-everyone step.
+
 ## Join A Watch Party
 
 1. Open Steam and make sure you are signed in.
@@ -29,7 +59,7 @@ Watch Party lets one person host playback and share a Discord Rich Presence join
 3. Find your friend's Stremio Rich Presence.
 4. Click the join button.
 5. Stremio Shell NG should open or focus and connect to the host.
-6. Playback will load and sync with the host once the connection is ready.
+6. In local-source mode, choose a stream on the episode's details page. In shared-source mode, playback loads the host's source. Synchronization starts when the selected video is loaded.
 
 ![Join Button](https://i.imgur.com/UzJuzFS.png)
 

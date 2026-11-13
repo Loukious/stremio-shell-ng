@@ -84,6 +84,7 @@ use crate::stremio_app::{
         Player,
     },
     stremio_wevbiew::{wevbiew::CURRENT_URL, WebView},
+    sync_protocol::{MediaIdentity, SourceMode},
     systray::SystemTray,
     updater,
     window_helper::WindowStyle,
@@ -117,6 +118,7 @@ struct Config {
     show_small_image: bool,
     swap_name_and_title: bool,
     lobby_max_size: i32,
+    watch_party_source_mode: SourceMode,
     auto_skip_enabled: bool,
     auto_skip_intro: bool,
     auto_skip_recap: bool,
@@ -319,6 +321,7 @@ pub struct MainWindow {
         (tray, MousePressLeftUp): [Self::on_show],
         (tray_exit, OnMenuItemSelected): [Self::on_exit],
         (tray_start_watch_party, OnMenuItemSelected): [Self::on_start_watch_party],
+        (tray_watch_party_local_sources, OnMenuItemSelected): [Self::on_toggle_watch_party_sources],
         (tray_end_watch_party, OnMenuItemSelected): [Self::on_end_watch_party],
         (tray_leave_watch_party, OnMenuItemSelected): [Self::on_leave_watch_party],
         (tray_show_hide, OnMenuItemSelected): [Self::on_show_hide],
@@ -390,6 +393,10 @@ fn load_or_create_config() -> Config {
         default_config
             .with_section(Some("Lobby"))
             .set("lobby_max_size", "8");
+
+        default_config
+            .with_section(Some("WatchParty"))
+            .set("source_mode", "shared");
 
         default_config
             .with_section(Some("AutoSkip"))
@@ -489,6 +496,7 @@ fn load_or_create_config() -> Config {
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(8)
         .clamp(2, 16);
+    let watch_party_source_mode = watch_party_source_mode_from(&config);
 
     // Backward-compat: older configs used [IntroDB] enabled=true as the master toggle.
     let legacy_introdb_enabled = config
@@ -565,6 +573,7 @@ fn load_or_create_config() -> Config {
         show_small_image,
         swap_name_and_title,
         lobby_max_size,
+        watch_party_source_mode,
         auto_skip_enabled,
         auto_skip_intro,
         auto_skip_recap,
@@ -585,6 +594,45 @@ fn persist_manual_intro_outro(enabled: bool) -> Result<(), String> {
         .ok_or_else(|| "Failed to get executable directory".to_string())?;
     let config_path = exe_dir.join("RPCconfig.ini");
     persist_manual_intro_outro_to(&config_path, enabled)
+}
+
+fn watch_party_source_mode_from(config: &Ini) -> SourceMode {
+    match config.get_from(Some("WatchParty"), "source_mode") {
+        Some("local") => SourceMode::Local,
+        _ => SourceMode::Shared,
+    }
+}
+
+fn persist_watch_party_source_mode(mode: SourceMode) -> Result<(), String> {
+    let exe_path = env::current_exe().map_err(|err| err.to_string())?;
+    let exe_dir = exe_path
+        .parent()
+        .ok_or_else(|| "Failed to get executable directory".to_string())?;
+    persist_watch_party_source_mode_to(&exe_dir.join("RPCconfig.ini"), mode)
+}
+
+fn persist_watch_party_source_mode_to(config_path: &Path, mode: SourceMode) -> Result<(), String> {
+    let mut config = Ini::load_from_file(config_path).map_err(|err| err.to_string())?;
+    let value = match mode {
+        SourceMode::Shared => "shared",
+        SourceMode::Local => "local",
+    };
+    config
+        .with_section(Some("WatchParty"))
+        .set("source_mode", value);
+    config
+        .write_to_file(config_path)
+        .map_err(|err| err.to_string())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WatchPartyWebMedia {
+    media: Option<MediaIdentity>,
+    selection_id: String,
+    generation: Option<u64>,
+    request_id: Option<String>,
+    load_intent: bool,
 }
 
 fn persist_manual_intro_outro_to(config_path: &Path, enabled: bool) -> Result<(), String> {
@@ -629,6 +677,46 @@ mod intro_skip_config_tests {
         std::fs::set_permissions(&path, permissions).unwrap();
         std::fs::remove_file(path).unwrap();
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod watch_party_config_tests {
+    use super::*;
+
+    #[test]
+    fn source_choice_survives_reload_and_preserves_other_settings() {
+        let path =
+            env::temp_dir().join(format!("stremio-watch-party-{}.ini", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            "[AutoSkip]\nmanual_intro_outro=true\n[IntroDB]\napi_key=example\n",
+        )
+        .unwrap();
+        let config = Ini::load_from_file(&path).unwrap();
+        assert_eq!(watch_party_source_mode_from(&config), SourceMode::Shared);
+        persist_watch_party_source_mode_to(&path, SourceMode::Local).unwrap();
+        let config = Ini::load_from_file(&path).unwrap();
+        assert_eq!(watch_party_source_mode_from(&config), SourceMode::Local);
+        assert_eq!(
+            config.get_from(Some("AutoSkip"), "manual_intro_outro"),
+            Some("true")
+        );
+        assert_eq!(config.get_from(Some("IntroDB"), "api_key"), Some("example"));
+        persist_watch_party_source_mode_to(&path, SourceMode::Shared).unwrap();
+        let config = Ini::load_from_file(&path).unwrap();
+        assert_eq!(watch_party_source_mode_from(&config), SourceMode::Shared);
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let result = persist_watch_party_source_mode_to(&path, SourceMode::Local);
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let config = Ini::load_from_file(&path).unwrap();
+        assert!(result.is_err());
+        assert_eq!(watch_party_source_mode_from(&config), SourceMode::Shared);
+        std::fs::remove_file(path).unwrap();
     }
 }
 
@@ -1725,6 +1813,8 @@ impl MainWindow {
         let set_interface_scale_sender = self.set_interface_scale_notice.sender();
         let webui_events = self.webui_events.clone();
         let webui_sender = self.webui_notice.sender();
+        let watch_party_events = self.sync_events.clone();
+        let watch_party_sender = self.sync_notice.sender();
         thread::spawn(move || loop {
             if let Some(msg) = web_rx
                 .recv()
@@ -1856,6 +1946,52 @@ impl MainWindow {
                     Some("shell-watch-party-leave") => {
                         if let Err(e) = crate::stremio_app::steam_sync::leave_lobby() {
                             eprintln!("⚠️ Failed to leave watch party: {e}");
+                        }
+                    }
+                    Some("shell-watch-party-media") => {
+                        if let Some(params) = msg.get_params() {
+                            if let Ok(media) =
+                                serde_json::from_value::<WatchPartyWebMedia>(params.clone())
+                            {
+                                if !media.selection_id.is_empty()
+                                    && media.selection_id.len() <= 128
+                                    && media
+                                        .media
+                                        .as_ref()
+                                        .is_none_or(|identity| identity.validate().is_ok())
+                                    && media
+                                        .request_id
+                                        .as_ref()
+                                        .is_none_or(|id| !id.is_empty() && id.len() <= 128)
+                                    && media.generation.is_some() == media.request_id.is_some()
+                                {
+                                    crate::stremio_app::steam_sync::update_web_media(
+                                        media.media,
+                                        media.selection_id,
+                                        media.generation,
+                                        media.request_id,
+                                        media.load_intent,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Some("shell-watch-party-local-error") => {
+                        let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
+                        if role == LobbyRole::Guest {
+                            if let Some(message) = msg
+                                .get_params()
+                                .and_then(|params| params.get("message"))
+                                .and_then(Value::as_str)
+                                .filter(|message| !message.is_empty() && message.len() <= 512)
+                            {
+                                watch_party_events.lock().unwrap().push_back(
+                                    crate::stremio_app::steam_sync::SyncUiEvent::Error {
+                                        message: message.to_string(),
+                                    },
+                                );
+                                watch_party_sender.notice();
+                            }
                         }
                     }
                     Some("shell-watch-party-kick") => {
@@ -2439,6 +2575,24 @@ impl MainWindow {
                 nwg::TrayNotificationFlags::INFO_ICON,
                 false,
             ),
+            SyncUiEvent::ReadinessUpdated {
+                announcement,
+                media,
+                generation,
+                sequence,
+            } => {
+                // Keep routine readiness changes in the shared party panel;
+                // member heartbeats should not create tray balloons or flash.
+                self.update_watch_party_menu();
+                if let (Some(message), Some(identity)) = (announcement, media) {
+                    self.update_watch_party_overlay_for_readiness(
+                        Some("Watch Party"),
+                        Some(&message),
+                        Some((&identity, generation, sequence)),
+                    );
+                }
+                return;
+            }
             SyncUiEvent::Error { message } => (
                 "Watch Party Error",
                 message,
@@ -2479,6 +2633,15 @@ impl MainWindow {
         let member_count = LOBBY_MEMBER_COUNT.lock().map(|c| *c).unwrap_or(0);
         let max_size = LOBBY_MAX_SIZE.lock().map(|m| *m).unwrap_or(8);
         let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
+        let config = load_or_create_config();
+        self.tray
+            .tray_watch_party_local_sources
+            .set_enabled(party_id.is_empty());
+        // NWG set_enabled replaces the native menu state, including its check
+        // bit. Restore the saved choice after enabling/disabling the item.
+        self.tray
+            .tray_watch_party_local_sources
+            .set_checked(config.watch_party_source_mode == SourceMode::Local);
 
         if party_id.is_empty() || member_count <= 0 {
             self.window.set_text(APP_NAME);
@@ -2520,6 +2683,7 @@ impl MainWindow {
         match crate::stremio_app::steam_sync::start_host_lobby(
             party_id.clone(),
             config.lobby_max_size,
+            config.watch_party_source_mode,
         ) {
             Ok(join_secret) => {
                 if let Ok(mut pid) = LOBBY_PARTY_ID.lock() {
@@ -2552,6 +2716,29 @@ impl MainWindow {
             }
         }
     }
+    fn on_toggle_watch_party_sources(&self) {
+        let party_id = LOBBY_PARTY_ID.lock().map(|p| p.clone()).unwrap_or_default();
+        if !party_id.is_empty() {
+            return;
+        }
+        let mode = if self.tray.tray_watch_party_local_sources.checked() {
+            SourceMode::Shared
+        } else {
+            SourceMode::Local
+        };
+        match persist_watch_party_source_mode(mode) {
+            Ok(()) => self
+                .tray
+                .tray_watch_party_local_sources
+                .set_checked(mode == SourceMode::Local),
+            Err(error) => self.tray.tray.show(
+                &format!("Could not save the watch-party source choice: {error}"),
+                Some("Watch Party Error"),
+                Some(nwg::TrayNotificationFlags::ERROR_ICON),
+                None,
+            ),
+        }
+    }
     fn on_end_watch_party(&self) {
         let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
         if role != LobbyRole::Host {
@@ -2570,10 +2757,33 @@ impl MainWindow {
         self.update_watch_party_menu();
     }
     fn update_watch_party_overlay(&self, event_title: Option<&str>, event_text: Option<&str>) {
+        self.update_watch_party_overlay_for_readiness(event_title, event_text, None);
+    }
+    fn update_watch_party_overlay_for_readiness(
+        &self,
+        event_title: Option<&str>,
+        event_text: Option<&str>,
+        announcement_context: Option<(&MediaIdentity, u64, u64)>,
+    ) {
         let party_id = LOBBY_PARTY_ID.lock().map(|p| p.clone()).unwrap_or_default();
         let member_count = LOBBY_MEMBER_COUNT.lock().map(|c| *c).unwrap_or(0);
         let max_size = LOBBY_MAX_SIZE.lock().map(|m| *m).unwrap_or(8);
         let members = LOBBY_MEMBERS.lock().map(|m| m.clone()).unwrap_or_default();
+        let readiness = crate::stremio_app::steam_sync::readiness_snapshot();
+        let (event_title, event_text) =
+            if announcement_context.is_some_and(|(media, generation, sequence)| {
+                !readiness.as_ref().is_some_and(|state| {
+                    state.media == *media
+                        && state.generation == generation
+                        && state.sequence == sequence
+                })
+            }) {
+                // The UI queue can lag behind an episode or source change. Match the event
+                // against the same current snapshot used to render this panel.
+                (None, None)
+            } else {
+                (event_title, event_text)
+            };
         let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
         let active = !party_id.is_empty() && member_count > 0;
         let role_label = match role {
@@ -2597,141 +2807,32 @@ impl MainWindow {
             "badge": badge,
             "canLeave": can_leave,
             "canKick": active && role == LobbyRole::Host,
+            "readinessKey": readiness.as_ref().map(|state| {
+                serde_json::json!([state.media, state.generation])
+            }),
+            "readinessActive": active && readiness.is_some(),
+            "readinessSequence": readiness.as_ref().map(|state| state.sequence.to_string()),
+            "eventReadinessKey": announcement_context.map(|(media, generation, _)| {
+                serde_json::json!([media, generation])
+            }),
+            "eventReadinessSequence": announcement_context.map(|(_, _, sequence)| sequence.to_string()),
             "members": members.iter().map(|member| {
+                let status = readiness.as_ref().and_then(|state| {
+                    state.members.iter().find(|entry| entry.steam_id == member.steam_id)
+                        .and_then(|entry| entry.status)
+                });
                 serde_json::json!({
                     "steamId": member.steam_id.to_string(),
                     "name": member.name,
                     "isHost": member.is_host,
+                    "readiness": status,
                 })
             }).collect::<Vec<_>>(),
             "eventTitle": event_title,
             "eventText": event_text,
         });
-        let script = r##"(function() {
-                const state = __STREMIO_WATCH_PARTY_STATE__;
-                const id = "stremio-shell-watch-party";
-                let el = document.getElementById(id);
-                if (!state.visible) {
-                    if (el) el.remove();
-                    return;
-                }
-                if (!el) {
-                    el = document.createElement("div");
-                    el.id = id;
-                    document.documentElement.appendChild(el);
-                }
-                if (!el.querySelector('[data-role="panel"]')) {
-                    el.style.cssText = [
-                        "position:fixed",
-                        "left:50%",
-                        "top:0",
-                        "transform:translateX(-50%)",
-                        "z-index:2147483647",
-                        "width:min(420px,calc(100vw - 40px))",
-                        "height:142px",
-                        "pointer-events:none"
-                    ].join(";");
-                    el.innerHTML = `
-                        <div data-role="hotspot" style="position:absolute;left:50%;top:0;transform:translateX(-50%);width:270px;height:30px;pointer-events:auto"></div>
-                        <div data-role="panel" style="
-                            position:absolute;
-                            left:50%;
-                            top:12px;
-                            transform:translate(-50%,-10px);
-                            width:100%;
-                            box-sizing:border-box;
-                            opacity:0;
-                            transition:opacity .16s ease,transform .16s ease;
-                            pointer-events:none;
-                            font:13px/1.35 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
-                            color:#f5f7fb;
-                            background:linear-gradient(135deg,rgba(19,22,34,.82),rgba(30,22,52,.74));
-                            border:1px solid rgba(142,105,255,.28);
-                            box-shadow:0 18px 60px rgba(0,0,0,.34),0 0 28px rgba(126,87,255,.12) inset;
-                            backdrop-filter:blur(18px);
-                            border-radius:8px;
-                            padding:11px 12px;
-                            overflow:hidden">
-                            <div style="display:flex;gap:10px;align-items:flex-start">
-                                <div style="width:9px;height:9px;border-radius:50%;background:#8b5cf6;box-shadow:0 0 12px rgba(139,92,246,.9);margin-top:5px;flex:0 0 auto"></div>
-                                <div style="min-width:0;flex:1">
-                                    <div data-role="badge" style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
-                                    <div data-role="event" style="margin-top:3px;color:rgba(226,232,240,.78);overflow-wrap:anywhere"></div>
-                                </div>
-                                <button data-role="leave" style="display:none;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(255,255,255,.08);color:#f8fafc;padding:6px 9px;font:inherit;cursor:pointer;flex:0 0 auto">Leave</button>
-                            </div>
-                            <div data-role="members" style="display:grid;grid-template-columns:1fr;gap:5px;margin-top:10px;max-height:86px;overflow:auto"></div>
-                        </div>
-                    `;
-                    const panel = el.querySelector('[data-role="panel"]');
-                    const show = () => {
-                        panel.style.opacity = "1";
-                        panel.style.transform = "translate(-50%,0)";
-                        panel.style.pointerEvents = "auto";
-                    };
-                    const hide = () => {
-                        if (el.matches(":hover")) return;
-                        panel.style.opacity = "0";
-                        panel.style.transform = "translate(-50%,-10px)";
-                        panel.style.pointerEvents = "none";
-                    };
-                    el.querySelector('[data-role="hotspot"]').addEventListener("mouseenter", show);
-                    panel.addEventListener("mouseenter", show);
-                    el.addEventListener("mouseleave", () => setTimeout(hide, 120));
-                    el.__stremioWatchPartyShow = show;
-                    el.__stremioWatchPartyHide = hide;
-                    el.querySelector('[data-role="leave"]').addEventListener("click", () => {
-                        try {
-                            window.chrome.webview.postMessage(JSON.stringify({
-                                id: 1,
-                                args: ["shell-watch-party-leave"]
-                            }));
-                        } catch (_) {}
-                    });
-                }
-                el.querySelector('[data-role="badge"]').textContent = state.badge || "Watch Party";
-                const event = el.querySelector('[data-role="event"]');
-                const message = [state.eventTitle, state.eventText].filter(Boolean).join(": ");
-                event.textContent = message || (state.active ? "Playback sync is active." : "");
-                const leave = el.querySelector('[data-role="leave"]');
-                leave.style.display = state.canLeave ? "block" : "none";
-                const members = el.querySelector('[data-role="members"]');
-                members.innerHTML = "";
-                (state.members || []).forEach((member) => {
-                    const row = document.createElement("div");
-                    row.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;color:rgba(241,245,249,.9)";
-                    const dot = document.createElement("div");
-                    dot.style.cssText = `width:6px;height:6px;border-radius:50%;flex:0 0 auto;background:${member.isHost ? "#8b5cf6" : "#38bdf8"}`;
-                    const name = document.createElement("div");
-                    name.textContent = `${member.name || "Unknown"}${member.isHost ? " - Host" : ""}`;
-                    name.style.cssText = "min-width:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
-                    row.appendChild(dot);
-                    row.appendChild(name);
-                    if (state.canKick && !member.isHost) {
-                        const kick = document.createElement("button");
-                        kick.textContent = "Remove";
-                        kick.style.cssText = "border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(239,68,68,.16);color:#fecaca;padding:4px 7px;font:inherit;cursor:pointer;flex:0 0 auto";
-                        kick.addEventListener("click", () => {
-                            try {
-                                window.chrome.webview.postMessage(JSON.stringify({
-                                    id: 1,
-                                    args: ["shell-watch-party-kick", { steamId: String(member.steamId) }]
-                                }));
-                            } catch (_) {}
-                        });
-                        row.appendChild(kick);
-                    }
-                    members.appendChild(row);
-                });
-                if (message && el.__stremioWatchPartyShow) {
-                    el.__stremioWatchPartyShow();
-                    clearTimeout(el.__stremioWatchPartyTimer);
-                    el.__stremioWatchPartyTimer = setTimeout(() => {
-                        if (el.__stremioWatchPartyHide) el.__stremioWatchPartyHide();
-                    }, 4200);
-                }
-            })();"##
-        .replace("__STREMIO_WATCH_PARTY_STATE__", &payload.to_string());
+        let script = include_str!("stremio_wevbiew/watch_party_overlay.js")
+            .replace("__STREMIO_WATCH_PARTY_STATE__", &payload.to_string());
 
         send_webview_script(&script);
     }

@@ -2,6 +2,7 @@ use crate::stremio_app::ipc;
 use crate::stremio_app::mpv_hwnd::find_exact_mpv_child_hwnd;
 use crate::stremio_app::shell_state;
 use crate::stremio_app::stremio_wevbiew::wevbiew::set_bound_mpv_keys;
+use crate::stremio_app::watch_party_local::{current_local_sync_revision, LocalSyncCommand};
 use crate::stremio_app::RPCResponse;
 use flume::{Receiver, Sender};
 use libmpv2::events::PropertyData;
@@ -54,8 +55,9 @@ pub static CACHED_PLAYER_PROPS: Lazy<Mutex<HashMap<String, Value>>> =
 
 pub static IS_FILE_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
-/// Monotonically increases after mpv finishes loading a new file.
-/// Consumers use this to avoid applying route-scoped actions to the previous file.
+/// Monotonically increases when a new file load is accepted, including reloads.
+/// The epoch is retained through FileLoaded so consumers can reject old-file actions
+/// throughout the transition as well as after playback begins.
 pub static FILE_LOAD_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 pub static STOP_COMMAND_IN_FLIGHT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
@@ -167,6 +169,9 @@ impl PrematureEndRecovery {
 struct PlayerController {
     observed_properties: HashSet<String>,
     state: LoadState,
+    file_epoch: u64,
+    loaded_file_epoch: Option<u64>,
+    load_epoch_reserved: bool,
     current_url: String,
     pending_loadfile: Option<CmdVal>,
     active_loadfile: Option<ActiveLoadfile>,
@@ -652,6 +657,9 @@ impl PlayerController {
         Self {
             observed_properties: HashSet::new(),
             state: LoadState::Idle,
+            file_epoch: 0,
+            loaded_file_epoch: None,
+            load_epoch_reserved: false,
             current_url: String::new(),
             pending_loadfile: None,
             active_loadfile: None,
@@ -1173,7 +1181,7 @@ fn create_event_thread(
                     continue;
                 }
                 PlayerMpvEvent::PlaybackRestart => {
-                    if let Some(load_id) = controller.video_ready.playback_restarted() {
+                    if let Some(load_id) = controller.on_playback_restarted() {
                         send_video_ready(&rpc_response_sender, load_id, true);
                     }
                     continue;
@@ -1258,6 +1266,7 @@ fn create_event_thread(
                     )
                 }
                 PlayerMpvEvent::Shutdown => {
+                    crate::stremio_app::steam_sync::notify_player_unloaded(controller.file_epoch);
                     break;
                 }
                 PlayerMpvEvent::CommandReply {
@@ -1576,6 +1585,21 @@ fn mpv_error_string(error: i32) -> String {
 impl PlayerController {
     fn handle_in_msg(&mut self, mpv: &Mpv, msg: String, rpc_response_sender: &Sender<String>) {
         println!("[PLAYER] incoming raw message: {msg}");
+        if let Ok(Value::Array(parts)) = serde_json::from_str::<Value>(&msg) {
+            if parts.first().and_then(Value::as_str) == Some("shell-watch-party-sync") {
+                if parts.len() != 2 {
+                    eprintln!("[PLAYER] malformed local watch-party synchronization message");
+                    return;
+                }
+                match serde_json::from_value::<LocalSyncCommand>(parts[1].clone()) {
+                    Ok(command) => self.apply_local_sync(mpv, command),
+                    Err(error) => {
+                        eprintln!("[PLAYER] invalid local watch-party synchronization: {error}");
+                    }
+                }
+                return;
+            }
+        }
         let in_msg: InMsg = match serde_json::from_str(&msg) {
             Ok(in_msg) => in_msg,
             Err(error) => {
@@ -1662,6 +1686,75 @@ impl PlayerController {
         }
     }
 
+    fn ready_file_epoch(&self, current_file_epoch: u64) -> Option<u64> {
+        (self.state == LoadState::Loaded
+            && self.pending_media_command.is_none()
+            && self.pending_loadfile.is_none()
+            && self.loaded_file_epoch == Some(self.file_epoch)
+            && self.file_epoch != 0
+            && self.file_epoch == current_file_epoch)
+            .then_some(self.file_epoch)
+    }
+
+    fn on_playback_restarted(&mut self) -> Option<u64> {
+        let load_id = self.video_ready.playback_restarted()?;
+        // FileLoaded permits synchronization, while PlaybackRestart confirms
+        // the current video can render/play, including while it is paused.
+        // Retain this native signal even before a Steam party is initialized.
+        if let Some(file_epoch) = self.ready_file_epoch(FILE_LOAD_EPOCH.load(Ordering::Acquire)) {
+            crate::stremio_app::steam_sync::notify_player_ready(file_epoch);
+        }
+        Some(load_id)
+    }
+
+    fn can_apply_local_sync(
+        &self,
+        command: &LocalSyncCommand,
+        current_revision: u64,
+        current_file_epoch: u64,
+    ) -> bool {
+        self.ready_file_epoch(current_file_epoch) == Some(command.file_epoch)
+            && command.revision == current_revision
+            && command
+                .seek_to
+                .is_none_or(|position| position.is_finite() && position >= 0.0)
+    }
+
+    fn apply_local_sync(&mut self, mpv: &Mpv, command: LocalSyncCommand) {
+        if !self.can_apply_local_sync(
+            &command,
+            current_local_sync_revision(),
+            FILE_LOAD_EPOCH.load(Ordering::Acquire),
+        ) {
+            return;
+        }
+        let _ = set_property_async("pause", &PropVal::Bool(command.paused), mpv);
+        if let Some(position) = command.seek_to {
+            // Check again after submitting pause: a new host selection can invalidate
+            // this command while the player thread is handling it.
+            if self.can_apply_local_sync(
+                &command,
+                current_local_sync_revision(),
+                FILE_LOAD_EPOCH.load(Ordering::Acquire),
+            ) {
+                let _ = send_command(
+                    mpv,
+                    CmdVal::Tripple(MpvCmd::Seek, position.to_string(), "absolute".to_string()),
+                );
+            }
+        }
+    }
+
+    fn reserve_file_epoch(&mut self) {
+        self.file_epoch = FILE_LOAD_EPOCH
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.loaded_file_epoch = None;
+        self.load_epoch_reserved = true;
+        *IS_FILE_LOADED.lock().unwrap() = false;
+        crate::stremio_app::steam_sync::notify_player_load_started(self.file_epoch);
+    }
+
     fn handle_command(&mut self, mpv: &Mpv, cmd: CmdVal) {
         let cmd = match SubtitleCommand::from_command(cmd) {
             Ok(command) => {
@@ -1676,6 +1769,14 @@ impl PlayerController {
         };
         if is_loadfile_command(&cmd) || is_stop_command(&cmd) {
             let load_id = self.video_ready.begin_transition();
+            if is_loadfile_command(&cmd) {
+                self.reserve_file_epoch();
+            } else {
+                self.loaded_file_epoch = None;
+                self.load_epoch_reserved = false;
+                *IS_FILE_LOADED.lock().unwrap() = false;
+                crate::stremio_app::steam_sync::notify_player_unloaded(self.file_epoch);
+            }
             if let Some(sender) = &self.rpc_response_sender {
                 send_video_ready(sender, load_id, false);
             }
@@ -1697,6 +1798,8 @@ impl PlayerController {
                     } else {
                         eprintln!("mpv: subtitle worker stopped before media change");
                         self.pending_media_command = None;
+                        self.load_epoch_reserved = false;
+                        crate::stremio_app::steam_sync::notify_player_unloaded(self.file_epoch);
                     }
                 }
                 return;
@@ -1715,6 +1818,8 @@ impl PlayerController {
                 eprintln!("mpv: subtitle worker stopped before media change");
                 self.pending_subtitle_ack = None;
                 self.pending_media_command = None;
+                self.load_epoch_reserved = false;
+                crate::stremio_app::steam_sync::notify_player_unloaded(self.file_epoch);
                 return;
             }
             Ok(()) => {}
@@ -1884,6 +1989,11 @@ impl PlayerController {
         {
             return;
         }
+        if !self.load_epoch_reserved {
+            // MPV can start another playlist item without a new shell load command.
+            self.reserve_file_epoch();
+        }
+        self.load_epoch_reserved = false;
         self.state = LoadState::Loading;
         self.stop_started_at = None;
         if let Some(active) = self.active_loadfile.as_mut() {
@@ -1906,6 +2016,10 @@ impl PlayerController {
         {
             return false;
         }
+        if self.file_epoch == 0 {
+            self.reserve_file_epoch();
+        }
+        self.load_epoch_reserved = false;
         self.state = LoadState::Loaded;
         self.stop_started_at = None;
         self.stop_command_request_id = None;
@@ -1915,15 +2029,19 @@ impl PlayerController {
         }
         self.pending_startup_retry = None;
         self.startup_retry_attempts = 0;
-        FILE_LOAD_EPOCH.fetch_add(1, Ordering::Release);
+        self.loaded_file_epoch = Some(self.file_epoch);
         *IS_FILE_LOADED.lock().unwrap() = true;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
         self.apply_pending_file_properties(mpv, rpc_response_sender);
         self.invalidate_display_output();
+        crate::stremio_app::steam_sync::notify_player_loaded(self.file_epoch);
         true
     }
 
     fn on_end_file(&mut self) {
+        let ended_current_file = self.file_epoch != 0
+            && !self.load_epoch_reserved
+            && self.video_ready.active_load_id == self.video_ready.current_load_id;
         self.video_ready.end_file();
         let replacement_is_loading = self
             .active_loadfile
@@ -1940,12 +2058,17 @@ impl PlayerController {
         }
         self.stop_started_at = None;
         self.stop_command_request_id = None;
+        self.loaded_file_epoch = None;
         *IS_FILE_LOADED.lock().unwrap() = false;
         *STOP_COMMAND_IN_FLIGHT.lock().unwrap() = false;
+        if ended_current_file {
+            crate::stremio_app::steam_sync::notify_player_unloaded(self.file_epoch);
+        }
     }
 
     fn release_queued_transition_after_stop(&mut self, mpv: &Mpv) {
         self.state = LoadState::Idle;
+        self.loaded_file_epoch = None;
         self.stop_started_at = None;
         self.stop_command_request_id = None;
         *IS_FILE_LOADED.lock().unwrap() = false;
@@ -2084,6 +2207,8 @@ impl PlayerController {
             });
         } else {
             self.state = LoadState::Idle;
+            self.load_epoch_reserved = false;
+            crate::stremio_app::steam_sync::notify_player_unloaded(self.file_epoch);
         }
     }
 
@@ -3014,6 +3139,86 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn local_watch_sync_requires_the_current_loaded_file() {
+        use super::{CmdVal, LocalSyncCommand, MpvCmd, PlayerController};
+
+        let mut controller = PlayerController::new(0);
+        controller.file_epoch = 41;
+        let command = LocalSyncCommand {
+            revision: 17,
+            file_epoch: 41,
+            paused: true,
+            seek_to: Some(120.0),
+        };
+        assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
+        controller.state = LoadState::Loading;
+        assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
+        controller.state = LoadState::Loaded;
+        assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
+        controller.loaded_file_epoch = Some(41);
+        assert!(controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), Some(41));
+        assert_eq!(controller.ready_file_epoch(42), None);
+
+        controller.pending_media_command = Some(CmdVal::Double(
+            MpvCmd::Loadfile,
+            "https://guest.example/new-source".to_string(),
+        ));
+        assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
+        controller.pending_media_command = None;
+        controller.pending_loadfile = Some(CmdVal::Double(
+            MpvCmd::Loadfile,
+            "https://guest.example/new-source".to_string(),
+        ));
+        assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
+        controller.pending_loadfile = None;
+        controller.state = LoadState::Stopping;
+        assert!(!controller.can_apply_local_sync(&command, 17, 41));
+        assert_eq!(controller.ready_file_epoch(41), None);
+    }
+
+    #[test]
+    fn local_watch_sync_rejects_obsolete_revisions_epochs_and_invalid_seeks() {
+        use super::{LocalSyncCommand, PlayerController};
+
+        let mut controller = PlayerController::new(0);
+        controller.state = LoadState::Loaded;
+        controller.file_epoch = 52;
+        controller.loaded_file_epoch = Some(52);
+        let mut command = LocalSyncCommand {
+            revision: 29,
+            file_epoch: 52,
+            paused: false,
+            seek_to: None,
+        };
+        assert!(controller.can_apply_local_sync(&command, 29, 52));
+        assert!(!controller.can_apply_local_sync(&command, 30, 52));
+        assert!(!controller.can_apply_local_sync(&command, 29, 53));
+        command.file_epoch = 51;
+        assert!(!controller.can_apply_local_sync(&command, 29, 52));
+        command.file_epoch = 52;
+        for position in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            command.seek_to = Some(position);
+            assert!(!controller.can_apply_local_sync(&command, 29, 52));
+        }
+        command.seek_to = Some(0.0);
+        assert!(controller.can_apply_local_sync(&command, 29, 52));
+
+        // A same-URL reload belongs to a new file epoch even when the route and
+        // URL stay unchanged. Commands waiting for the previous file must expire.
+        controller.file_epoch = 53;
+        controller.loaded_file_epoch = None;
+        assert!(!controller.can_apply_local_sync(&command, 29, 53));
+        controller.loaded_file_epoch = Some(53);
+        assert!(!controller.can_apply_local_sync(&command, 29, 53));
+    }
+
+    #[test]
     fn local_stream_recovery_accepts_random_runtime_ports() {
         for url in [
             "http://127.0.0.1:45821/stream",
@@ -3433,8 +3638,8 @@ mod tests {
     #[test]
     fn queued_old_mpv_events_cannot_report_new_files_readiness() {
         use super::{
-            run_mpv_command_async, wait_player_event, MpvClientHandle, PlayerController,
-            PlayerMpvEvent,
+            run_mpv_command_async, wait_player_event, LocalSyncCommand, MpvClientHandle,
+            PlayerController, PlayerMpvEvent,
         };
         use libmpv2::{events::Event, Mpv};
         use std::time::{Duration, Instant};
@@ -3484,6 +3689,7 @@ mod tests {
         ready.queue_current_load(12);
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut reports = Vec::new();
+        let mut ready_epochs = Vec::new();
         let mut starts = 0;
         while Instant::now() < deadline {
             match wait_player_event(&mpv, 0.01) {
@@ -3505,11 +3711,46 @@ mod tests {
                         starts == 2,
                         "old FileLoaded must not change the current controller state"
                     );
+                    assert!(
+                        ready_epochs.is_empty(),
+                        "FileLoaded cannot announce playable readiness before PlaybackRestart"
+                    );
+                    let current_command = LocalSyncCommand {
+                        revision: 73,
+                        file_epoch: controller.file_epoch,
+                        paused: true,
+                        seek_to: Some(2.0),
+                    };
+                    assert_eq!(
+                        controller.can_apply_local_sync(
+                            &current_command,
+                            73,
+                            controller.file_epoch,
+                        ),
+                        current,
+                        "queued old FileLoaded cannot authorize guest synchronization",
+                    );
+                    if current {
+                        let stale_command = LocalSyncCommand {
+                            file_epoch: controller.file_epoch - 1,
+                            ..current_command
+                        };
+                        assert!(!controller.can_apply_local_sync(
+                            &stale_command,
+                            73,
+                            controller.file_epoch,
+                        ));
+                    }
                 }
                 Some(Ok(PlayerMpvEvent::EndFile(_))) => controller.on_end_file(),
                 Some(Ok(PlayerMpvEvent::PlaybackRestart)) => {
-                    if let Some(id) = controller.video_ready.playback_restarted() {
+                    if let Some(id) = controller.on_playback_restarted() {
                         reports.push(id);
+                        if let Some(epoch) = controller.ready_file_epoch(
+                            super::FILE_LOAD_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+                        ) {
+                            ready_epochs.push(epoch);
+                        }
                     }
                     if starts == 2 {
                         break;
@@ -3521,6 +3762,11 @@ mod tests {
         }
         assert_eq!(starts, 2, "both queued files must have started");
         assert_eq!(reports, vec![replacement]);
+        assert_eq!(ready_epochs, vec![controller.file_epoch]);
+        assert!(
+            controller.on_playback_restarted().is_none(),
+            "repeated playback restarts must not announce readiness again"
+        );
     }
 
     #[test]
