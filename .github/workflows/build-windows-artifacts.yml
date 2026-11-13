@@ -15,8 +15,9 @@ concurrency:
 
 env:
   RUNTIME_REPOSITORY: Loukious/stremio-runtime
-  # Pin the tested native runtime, including server ports and bounded media probing.
-  RUNTIME_REVISION: 7e4b6cacedfd272490c5cc8d3d7622fd4e8da7e9
+  # Build only the tested runtime executable; media tools belong to standalone runtime bundles.
+  RUNTIME_REVISION: 846b2443167b19f026bcb15c735d35f18d78dcb6
+  RUST_VERSION: "1.99.1"
 
 jobs:
   prepare:
@@ -130,7 +131,7 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           target: ${{ matrix.target }}
 
       - name: Configure MSVC
@@ -138,14 +139,43 @@ jobs:
         with:
           arch: ${{ matrix.msvc_arch }}
 
+      - name: Configure ARM64 C compiler
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $clangCompiler = Join-Path $env:ProgramFiles "LLVM\bin\clang-cl.exe"
+          if (-not (Test-Path -LiteralPath $clangCompiler)) {
+            choco install llvm --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "LLVM installation failed" }
+          }
+          if (-not (Test-Path -LiteralPath $clangCompiler)) {
+            throw "clang-cl is required to cross-build the runtime's ARM64 crypto dependencies"
+          }
+          "CC_aarch64_pc_windows_msvc=$clangCompiler" >> $env:GITHUB_ENV
+          "CXX_aarch64_pc_windows_msvc=$clangCompiler" >> $env:GITHUB_ENV
+
       - name: Install Inno Setup
         shell: pwsh
-        run: choco install innosetup --yes --no-progress
+        run: |
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed" }
+          $candidates = @(
+            (Join-Path $env:ProgramFiles "Inno Setup 7"),
+            (Join-Path "${env:ProgramFiles(x86)}" "Inno Setup 7"),
+            (Join-Path "${env:ProgramFiles(x86)}" "Inno Setup 6"),
+            (Join-Path $env:ProgramFiles "Inno Setup 6")
+          )
+          $innoDirectory = $candidates | Where-Object {
+            Test-Path -LiteralPath (Join-Path $_ "ISCC.exe")
+          } | Select-Object -First 1
+          if (-not $innoDirectory) { throw "Could not locate the installed Inno Setup compiler" }
+          "INNO_SETUP_DIRECTORY=$innoDirectory" >> $env:GITHUB_ENV
+          Write-Host "Using Inno Setup compiler in $innoDirectory"
 
       - name: Install Inno Setup translations
         shell: pwsh
         run: |
-          $languageDir = Join-Path "${env:ProgramFiles(x86)}" "Inno Setup 6\Languages"
+          $languageDir = Join-Path $env:INNO_SETUP_DIRECTORY "Languages"
           $languages = @(
             "Armenian",
             "BrazilianPortuguese",
@@ -173,14 +203,23 @@ jobs:
             "Ukrainian"
           )
 
+          # A missing official translation must allow the unofficial fallback to run.
+          $PSNativeCommandUseErrorActionPreference = $false
           foreach ($language in $languages) {
             $target = Join-Path $languageDir "$language.isl"
             if (Test-Path -LiteralPath $target) {
               continue
             }
 
-            $url = "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/$language.isl"
+            $url = "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/$language.isl"
             curl.exe --fail --location --silent --show-error --output $target $url
+            if ($LASTEXITCODE -ne 0) {
+              $url = "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/$language.isl"
+              curl.exe --fail --location --silent --show-error --output $target $url
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not download Inno Setup translation: $language"
+              }
+            }
           }
 
       - name: Embed release candidate version
@@ -216,7 +255,12 @@ jobs:
 
       - name: Build shell
         shell: pwsh
-        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
+        run: |
+          $env:RUSTFLAGS = "$env:RUSTFLAGS -C target-feature=+crt-static"
+          cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
+          if ($LASTEXITCODE -ne 0) {
+            throw "Shell source build failed for ${{ matrix.target }}"
+          }
 
       - name: Build runtime from source
         shell: pwsh
@@ -266,10 +310,21 @@ jobs:
           SHA-256: $sha256
           "@ >> $env:GITHUB_STEP_SUMMARY
 
+      - name: Verify desktop executable dependencies
+        shell: pwsh
+        run: |
+          $includeSteam = "${{ matrix.include_steam }}" -eq "true"
+          .\scripts\verify-native-payload.ps1 `
+            -Target "${{ matrix.target }}" `
+            -ShellDirectory "target\${{ matrix.target }}\release" `
+            -RuntimePath "${{ matrix.runtime_dir }}\stremio-runtime.exe" `
+            -IncludeSteam:$includeSteam
+
       - name: Build setup
         shell: pwsh
         run: |
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "${{ matrix.setup_script }}"
+          & (Join-Path $env:INNO_SETUP_DIRECTORY "ISCC.exe") "${{ matrix.setup_script }}"
+          if ($LASTEXITCODE -ne 0) { throw "Installer compilation failed for ${{ matrix.arch }}" }
 
       - name: Package portable zip
         shell: pwsh

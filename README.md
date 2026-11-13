@@ -31,6 +31,8 @@
 
 The [upstream port notes](wiki/upstream-ports-2026-11.md) describe the imported changes and validation.
 
+Windows installers and portable ZIPs include the native runtime built from pinned source for x64 and ARM64. Desktop playback uses MPV; these packages omit FFmpeg, FFprobe and VC runtime DLLs. Installer updates preserve an existing `RPCconfig.ini`, including your saved intro-skip mode. For browser playback that needs probing or conversion, use the separate [standalone runtime bundle](https://github.com/Loukious/stremio-runtime), which includes the media tools.
+
 
 
 ## Support the fork developer

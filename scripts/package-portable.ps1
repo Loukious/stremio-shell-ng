@@ -53,6 +53,9 @@ try {
         Add-PortableFile -Path (Join-Path -Path $releaseDir -ChildPath "steam_api64.dll") -Name "steam_api64.dll"
     }
 
+    # Copy only the native desktop payload, then verify its architecture and CRT dependencies.
+    & (Join-Path $PSScriptRoot "verify-native-payload.ps1") -Target $Target -PayloadDirectory $stageDir -IncludeSteam:$IncludeSteam
+
     $outputDir = Split-Path -Parent $OutputPath
     if ($outputDir) {
         New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
@@ -66,6 +69,10 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $stageDir) {
-        Remove-Item -LiteralPath $stageDir -Recurse -Force
+        $resolvedStageDir = (Resolve-Path -LiteralPath $stageDir).Path
+        if ($resolvedStageDir -ne [IO.Path]::GetFullPath($stageDir)) {
+            throw "Unexpected portable staging path; leaving it untouched: $resolvedStageDir"
+        }
+        Remove-Item -LiteralPath $resolvedStageDir -Recurse -Force
     }
 }

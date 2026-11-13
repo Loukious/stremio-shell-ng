@@ -180,7 +180,7 @@ Name: "assoctorrent"; Description: "Open torrent files and magnet links with Str
 Source: "{#MyAppExeLocation}"; DestDir: "{app}"; Flags: ignoreversion signonce
 Source: "{#SourcePath}..\target\aarch64-pc-windows-msvc\release\libmpv-2.dll"; DestDir: "{app}"; Flags: ignoreversion signonce
 Source: "{#SourcePath}..\bin-arm64\stremio-runtime.exe"; DestDir: "{app}"; Flags: ignoreversion signonce
-Source: "{#SourcePath}..\RPCconfig.ini"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}..\RPCconfig.ini"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
 
 [Registry]
 Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".avi"; ValueData: ""; Flags: uninsdeletekey
