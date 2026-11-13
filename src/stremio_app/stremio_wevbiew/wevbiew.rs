@@ -273,6 +273,7 @@ const PIP_BUTTON_SCRIPT: &str = r##"
 "##;
 
 const INTRO_SKIP_CONTROLS_SCRIPT: &str = include_str!("intro_skip.js");
+const WATCH_PARTY_LOCAL_SCRIPT: &str = include_str!("watch_party_local.js");
 
 /// Build the JavaScript that translates layout-aware `keydown` events into
 /// mpv key names. It forwards active bindings and, when sequences exist, the
@@ -544,6 +545,8 @@ impl PartialUi for WebView {
                             .get_webview()
                             .expect("Cannot obtain webview from controller");
                     let settings = webview.get_settings().unwrap();
+                    webview.add_script_to_execute_on_document_created(WATCH_PARTY_LOCAL_SCRIPT, |_| Ok(()))
+                        .expect("Cannot register local watch-party bridge");
                     settings.put_is_status_bar_enabled(false).ok();
                     settings.put_are_dev_tools_enabled(*dev_tools.get().unwrap()).ok();
                     settings.put_is_zoom_control_enabled(false).ok();
@@ -618,6 +621,8 @@ impl PartialUi for WebView {
                             if !same_origin(&trusted_origin(&content_endpoint), &wv.get_source()?) {
                                 return Ok(());
                             }
+                            wv.execute_script(WATCH_PARTY_LOCAL_SCRIPT, |_| Ok(()))
+                                .expect("Cannot add local watch-party bridge");
                             wv.execute_script(format!(
                                     "window.stremio_server_ipc_key={}",
                                     json!(std::env::var(SERVER_IPC_KEY).unwrap_or_default())

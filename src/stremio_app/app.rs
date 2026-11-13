@@ -84,6 +84,7 @@ use crate::stremio_app::{
         Player,
     },
     stremio_wevbiew::{wevbiew::CURRENT_URL, WebView},
+    sync_protocol::{MediaIdentity, SourceMode},
     systray::SystemTray,
     updater,
     window_helper::WindowStyle,
@@ -117,6 +118,7 @@ struct Config {
     show_small_image: bool,
     swap_name_and_title: bool,
     lobby_max_size: i32,
+    watch_party_source_mode: SourceMode,
     auto_skip_enabled: bool,
     auto_skip_intro: bool,
     auto_skip_recap: bool,
@@ -319,6 +321,7 @@ pub struct MainWindow {
         (tray, MousePressLeftUp): [Self::on_show],
         (tray_exit, OnMenuItemSelected): [Self::on_exit],
         (tray_start_watch_party, OnMenuItemSelected): [Self::on_start_watch_party],
+        (tray_watch_party_local_sources, OnMenuItemSelected): [Self::on_toggle_watch_party_sources],
         (tray_end_watch_party, OnMenuItemSelected): [Self::on_end_watch_party],
         (tray_leave_watch_party, OnMenuItemSelected): [Self::on_leave_watch_party],
         (tray_show_hide, OnMenuItemSelected): [Self::on_show_hide],
@@ -390,6 +393,10 @@ fn load_or_create_config() -> Config {
         default_config
             .with_section(Some("Lobby"))
             .set("lobby_max_size", "8");
+
+        default_config
+            .with_section(Some("WatchParty"))
+            .set("source_mode", "shared");
 
         default_config
             .with_section(Some("AutoSkip"))
@@ -489,6 +496,7 @@ fn load_or_create_config() -> Config {
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(8)
         .clamp(2, 16);
+    let watch_party_source_mode = watch_party_source_mode_from(&config);
 
     // Backward-compat: older configs used [IntroDB] enabled=true as the master toggle.
     let legacy_introdb_enabled = config
@@ -565,6 +573,7 @@ fn load_or_create_config() -> Config {
         show_small_image,
         swap_name_and_title,
         lobby_max_size,
+        watch_party_source_mode,
         auto_skip_enabled,
         auto_skip_intro,
         auto_skip_recap,
@@ -585,6 +594,45 @@ fn persist_manual_intro_outro(enabled: bool) -> Result<(), String> {
         .ok_or_else(|| "Failed to get executable directory".to_string())?;
     let config_path = exe_dir.join("RPCconfig.ini");
     persist_manual_intro_outro_to(&config_path, enabled)
+}
+
+fn watch_party_source_mode_from(config: &Ini) -> SourceMode {
+    match config.get_from(Some("WatchParty"), "source_mode") {
+        Some("local") => SourceMode::Local,
+        _ => SourceMode::Shared,
+    }
+}
+
+fn persist_watch_party_source_mode(mode: SourceMode) -> Result<(), String> {
+    let exe_path = env::current_exe().map_err(|err| err.to_string())?;
+    let exe_dir = exe_path
+        .parent()
+        .ok_or_else(|| "Failed to get executable directory".to_string())?;
+    persist_watch_party_source_mode_to(&exe_dir.join("RPCconfig.ini"), mode)
+}
+
+fn persist_watch_party_source_mode_to(config_path: &Path, mode: SourceMode) -> Result<(), String> {
+    let mut config = Ini::load_from_file(config_path).map_err(|err| err.to_string())?;
+    let value = match mode {
+        SourceMode::Shared => "shared",
+        SourceMode::Local => "local",
+    };
+    config
+        .with_section(Some("WatchParty"))
+        .set("source_mode", value);
+    config
+        .write_to_file(config_path)
+        .map_err(|err| err.to_string())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WatchPartyWebMedia {
+    media: Option<MediaIdentity>,
+    selection_id: String,
+    generation: Option<u64>,
+    request_id: Option<String>,
+    load_intent: bool,
 }
 
 fn persist_manual_intro_outro_to(config_path: &Path, enabled: bool) -> Result<(), String> {
@@ -629,6 +677,46 @@ mod intro_skip_config_tests {
         std::fs::set_permissions(&path, permissions).unwrap();
         std::fs::remove_file(path).unwrap();
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod watch_party_config_tests {
+    use super::*;
+
+    #[test]
+    fn source_choice_survives_reload_and_preserves_other_settings() {
+        let path =
+            env::temp_dir().join(format!("stremio-watch-party-{}.ini", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            "[AutoSkip]\nmanual_intro_outro=true\n[IntroDB]\napi_key=example\n",
+        )
+        .unwrap();
+        let config = Ini::load_from_file(&path).unwrap();
+        assert_eq!(watch_party_source_mode_from(&config), SourceMode::Shared);
+        persist_watch_party_source_mode_to(&path, SourceMode::Local).unwrap();
+        let config = Ini::load_from_file(&path).unwrap();
+        assert_eq!(watch_party_source_mode_from(&config), SourceMode::Local);
+        assert_eq!(
+            config.get_from(Some("AutoSkip"), "manual_intro_outro"),
+            Some("true")
+        );
+        assert_eq!(config.get_from(Some("IntroDB"), "api_key"), Some("example"));
+        persist_watch_party_source_mode_to(&path, SourceMode::Shared).unwrap();
+        let config = Ini::load_from_file(&path).unwrap();
+        assert_eq!(watch_party_source_mode_from(&config), SourceMode::Shared);
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let result = persist_watch_party_source_mode_to(&path, SourceMode::Local);
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let config = Ini::load_from_file(&path).unwrap();
+        assert!(result.is_err());
+        assert_eq!(watch_party_source_mode_from(&config), SourceMode::Shared);
+        std::fs::remove_file(path).unwrap();
     }
 }
 
@@ -1725,6 +1813,8 @@ impl MainWindow {
         let set_interface_scale_sender = self.set_interface_scale_notice.sender();
         let webui_events = self.webui_events.clone();
         let webui_sender = self.webui_notice.sender();
+        let watch_party_events = self.sync_events.clone();
+        let watch_party_sender = self.sync_notice.sender();
         thread::spawn(move || loop {
             if let Some(msg) = web_rx
                 .recv()
@@ -1856,6 +1946,52 @@ impl MainWindow {
                     Some("shell-watch-party-leave") => {
                         if let Err(e) = crate::stremio_app::steam_sync::leave_lobby() {
                             eprintln!("⚠️ Failed to leave watch party: {e}");
+                        }
+                    }
+                    Some("shell-watch-party-media") => {
+                        if let Some(params) = msg.get_params() {
+                            if let Ok(media) =
+                                serde_json::from_value::<WatchPartyWebMedia>(params.clone())
+                            {
+                                if !media.selection_id.is_empty()
+                                    && media.selection_id.len() <= 128
+                                    && media
+                                        .media
+                                        .as_ref()
+                                        .is_none_or(|identity| identity.validate().is_ok())
+                                    && media
+                                        .request_id
+                                        .as_ref()
+                                        .is_none_or(|id| !id.is_empty() && id.len() <= 128)
+                                    && media.generation.is_some() == media.request_id.is_some()
+                                {
+                                    crate::stremio_app::steam_sync::update_web_media(
+                                        media.media,
+                                        media.selection_id,
+                                        media.generation,
+                                        media.request_id,
+                                        media.load_intent,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Some("shell-watch-party-local-error") => {
+                        let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
+                        if role == LobbyRole::Guest {
+                            if let Some(message) = msg
+                                .get_params()
+                                .and_then(|params| params.get("message"))
+                                .and_then(Value::as_str)
+                                .filter(|message| !message.is_empty() && message.len() <= 512)
+                            {
+                                watch_party_events.lock().unwrap().push_back(
+                                    crate::stremio_app::steam_sync::SyncUiEvent::Error {
+                                        message: message.to_string(),
+                                    },
+                                );
+                                watch_party_sender.notice();
+                            }
                         }
                     }
                     Some("shell-watch-party-kick") => {
@@ -2479,6 +2615,13 @@ impl MainWindow {
         let member_count = LOBBY_MEMBER_COUNT.lock().map(|c| *c).unwrap_or(0);
         let max_size = LOBBY_MAX_SIZE.lock().map(|m| *m).unwrap_or(8);
         let role = LOBBY_ROLE.lock().map(|r| *r).unwrap_or(LobbyRole::None);
+        let config = load_or_create_config();
+        self.tray
+            .tray_watch_party_local_sources
+            .set_checked(config.watch_party_source_mode == SourceMode::Local);
+        self.tray
+            .tray_watch_party_local_sources
+            .set_enabled(party_id.is_empty());
 
         if party_id.is_empty() || member_count <= 0 {
             self.window.set_text(APP_NAME);
@@ -2520,6 +2663,7 @@ impl MainWindow {
         match crate::stremio_app::steam_sync::start_host_lobby(
             party_id.clone(),
             config.lobby_max_size,
+            config.watch_party_source_mode,
         ) {
             Ok(join_secret) => {
                 if let Ok(mut pid) = LOBBY_PARTY_ID.lock() {
@@ -2550,6 +2694,29 @@ impl MainWindow {
                 self.update_watch_party_overlay(Some("Watch Party Error"), Some(&e));
                 self.update_watch_party_menu();
             }
+        }
+    }
+    fn on_toggle_watch_party_sources(&self) {
+        let party_id = LOBBY_PARTY_ID.lock().map(|p| p.clone()).unwrap_or_default();
+        if !party_id.is_empty() {
+            return;
+        }
+        let mode = if self.tray.tray_watch_party_local_sources.checked() {
+            SourceMode::Shared
+        } else {
+            SourceMode::Local
+        };
+        match persist_watch_party_source_mode(mode) {
+            Ok(()) => self
+                .tray
+                .tray_watch_party_local_sources
+                .set_checked(mode == SourceMode::Local),
+            Err(error) => self.tray.tray.show(
+                &format!("Could not save the watch-party source choice: {error}"),
+                Some("Watch Party Error"),
+                Some(nwg::TrayNotificationFlags::ERROR_ICON),
+                None,
+            ),
         }
     }
     fn on_end_watch_party(&self) {

@@ -1,3 +1,4 @@
+use crate::stremio_app::sync_protocol::{MediaIdentity, SourceMode};
 use flume::Sender;
 
 #[derive(Debug, Clone)]
@@ -23,9 +24,25 @@ pub fn kick_member(_steam_id: u64) -> Result<(), String> {
     Err(unavailable_message())
 }
 
-pub fn start_host_lobby(_party_id: String, _max_size: i32) -> Result<String, String> {
+pub fn start_host_lobby(
+    _party_id: String,
+    _max_size: i32,
+    _source_mode: SourceMode,
+) -> Result<String, String> {
     Err(unavailable_message())
 }
+
+pub fn update_web_media(
+    _media: Option<MediaIdentity>,
+    _selection_id: String,
+    _generation: Option<u64>,
+    _request_id: Option<String>,
+    _load_intent: bool,
+) {
+}
+pub fn notify_player_load_started(_file_epoch: u64) {}
+pub fn notify_player_loaded(_file_epoch: u64) {}
+pub fn notify_player_unloaded(_file_epoch: u64) {}
 
 pub fn connect_to_host(_join_secret: &str) -> Result<(), String> {
     Err(unavailable_message())

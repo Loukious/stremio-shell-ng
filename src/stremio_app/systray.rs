@@ -20,6 +20,8 @@ pub struct SystemTray {
     pub tray_pip: nwg::MenuItem,
     #[nwg_control(parent: tray_menu, text: "Start watch party")]
     pub tray_start_watch_party: nwg::MenuItem,
+    #[nwg_control(parent: tray_menu, text: "Use each viewer's own stream")]
+    pub tray_watch_party_local_sources: nwg::MenuItem,
     #[nwg_control(parent: tray_menu, text: "End watch party", disabled: true)]
     pub tray_end_watch_party: nwg::MenuItem,
     #[nwg_control(parent: tray_menu, text: "&Leave watch party")]
