@@ -2003,7 +2003,7 @@ checksum = "ae139f051204a4af015d4f0ed3a1f7a51020d03a44c7cf249168c543d88131e9"
 
 [[package]]
 name = "stremio-shell-ng"
-version = "5.0.23"
+version = "5.0.27"
 dependencies = [
  "anyhow",
  "base64",
