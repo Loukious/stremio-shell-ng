@@ -112,14 +112,16 @@ const leave = el.querySelector('[data-role="leave"]');
 leave.style.display = state.canLeave ? "block" : "none";
 const members = el.querySelector('[data-role="members"]');
 members.innerHTML = "";
+const memberColumns = "6px minmax(0,1fr)" + (state.readinessActive ? " 96px" : "")
+    + (state.canKick ? " 24px" : "");
 (state.members || []).forEach((member) => {
     const row = document.createElement("div");
-    row.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;color:rgba(241,245,249,.9)";
+    row.style.cssText = `display:grid;grid-template-columns:${memberColumns};align-items:center;gap:8px;min-width:0;color:rgba(241,245,249,.9)`;
     const dot = document.createElement("div");
     dot.style.cssText = `width:6px;height:6px;border-radius:50%;flex:0 0 auto;background:${member.isHost ? "#8b5cf6" : "#38bdf8"}`;
     const name = document.createElement("div");
     name.textContent = `${member.name || "Unknown"}${member.isHost ? " - Host" : ""}`;
-    name.style.cssText = "min-width:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+    name.style.cssText = "min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
     row.appendChild(dot);
     row.appendChild(name);
     if (state.readinessActive) {
@@ -131,13 +133,17 @@ members.innerHTML = "";
         const status = document.createElement("span");
         status.setAttribute("data-readiness", member.readiness || "unknown");
         status.textContent = readiness[0];
-        status.style.cssText = `white-space:nowrap;font-size:11px;font-weight:600;flex:0 0 auto;color:${readiness[1]}`;
+        status.style.cssText = `grid-column:3;justify-self:start;white-space:nowrap;font-size:11px;font-weight:600;color:${readiness[1]}`;
         row.appendChild(status);
     }
     if (state.canKick && !member.isHost) {
         const kick = document.createElement("button");
-        kick.textContent = "Remove";
-        kick.style.cssText = "border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(239,68,68,.16);color:#fecaca;padding:4px 7px;font:inherit;cursor:pointer;flex:0 0 auto";
+        kick.type = "button";
+        kick.textContent = "×";
+        const removeLabel = `Remove ${member.name || "viewer"} from watch party`;
+        kick.setAttribute("title", removeLabel);
+        kick.setAttribute("aria-label", removeLabel);
+        kick.style.cssText = `grid-column:${state.readinessActive ? 4 : 3};display:grid;place-items:center;width:24px;height:24px;padding:0;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(239,68,68,.12);color:#fecaca;font:20px/1 system-ui,sans-serif;cursor:pointer;outline-offset:2px`;
         kick.addEventListener("click", () => {
             try {
                 window.chrome.webview.postMessage(JSON.stringify({

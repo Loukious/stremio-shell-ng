@@ -202,6 +202,9 @@ test('participant text stays literal and existing leave and remove controls pres
     const row = view.role('members').children[0];
     assert.equal(row.children[1].textContent, '<img src=x onerror=bad()>');
     assert.equal(row.children[1].children.length, 0);
+    assert.equal(row.children[3].textContent, '×');
+    assert.equal(row.children[3].getAttribute('title'), 'Remove <img src=x onerror=bad()> from watch party');
+    assert.equal(row.children[3].getAttribute('aria-label'), 'Remove <img src=x onerror=bad()> from watch party');
     row.children[3].fire('click');
     view.role('leave').fire('click');
     assert.deepEqual(view.posts.map(post => post.args), [
